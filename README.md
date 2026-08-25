@@ -49,8 +49,48 @@ Nodes cluster by type. A shared resolved ID becomes a typed edge.
 - **Dead-end ledger** — walks that ended nowhere (no typed edge, unresolved entity, wrong node type, pruned too early)
 - Graph health signals: unresolved entities, missing relationships, stale paths
 
+---
+
+## Assumption-Aware Control Layer
+
+In addition to the typed knowledge graph above, this repository contains an experimental **control plane** (`context_mesh.py`) that can sit on top of a Context Mesh graph.
+
+It treats **assumptions as first-class, versioned objects**, attaches them to edges, and performs **selective invalidation**: when an assumption is broken, only the downstream work that depended on it is re-executed. Unrelated branches are left untouched.
+
+### Key properties
+
+- Assumptions are objects with IDs, status (`ACTIVE` / `SUPERSEDED` / `REJECTED`), and lineage
+- Edges carry the assumption that justifies them
+- Blast radius is computed from a failed assumption → the edges it justified → the dependent nodes
+- Logging an event never silently activates an assumption for the logging node
+- Multi-branch topology with an explicit preservation proof for unrelated work
+
+### Node roles in the demonstration
+
+```
+INTENT → DECOMPOSE → WORKER → AUDIT → DRIFT → LEDGER → ROOT
+                 ↘
+                  BRANCH_C1 → BRANCH_C2   (unrelated, must survive)
+```
+
+### Run the demo
+
+```bash
+python context_mesh.py
+```
+
+The script executes a full acceptance suite and ends with:
+
+```
+OVERALL: ALL ACCEPTANCE CHECKS PASSED
+```
+
+---
+
 ## Design goal
 
 Context Mesh complements document retrieval and agent memory. Retrieval systems supply source material; Context Mesh supplies the structured, typed relationships and the walkable paths that make answers auditable and efficient.
 
-The graph remembers not only what is connected, but the typed relations that justify those connections.
+The control layer adds the ability to remember **why** a path was taken and to revise only the work that rested on a broken assumption.
+
+> The graph should remember not only what is connected, but why it is connected.
