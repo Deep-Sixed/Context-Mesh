@@ -1,22 +1,56 @@
-**ContextMesh** is an independent graph-based context and reasoning system for AI agents. Its goal is to preserve not only **what an agent knows**, but also **where that information came from, why decisions were made, what assumptions supported them, and what becomes invalid when those assumptions change**.
+# Context Mesh
 
-ContextMesh organizes knowledge into typed graph structures such as **Entities, Claims, Sources, Decisions, Assumptions, and Evidence**. Relationships between them are represented with explicit typed edges rather than relying only on similarity search or flat retrieval.
+**Claude Graph Engineering · Context Mesh**
 
-The system is designed around several core capabilities:
+> One graph · Four node types · Every answer walks a path you can read
 
-* **Entity resolution** — normalize multiple references to the same real-world concept or object.
-* **Typed relationships** — represent connections such as `supports`, `contradicts`, `cites`, `depends_on`, `produces`, `supersedes`, and `justified_by`.
-* **Evidence provenance** — preserve the source, execution event, artifact, or validation check supporting a claim or decision.
-* **Graph traversal** — answer questions by walking readable evidence paths rather than retrieving an opaque Top-K list of chunks.
-* **Assumption tracking** — treat assumptions as first-class, versioned graph entities.
-* **Selective invalidation** — when an assumption is disproven, identify the exact downstream work that depended on it while preserving unrelated work.
-* **Decision history** — maintain an append-only record of why decisions were made and how they changed.
-* **Graph health** — expose unresolved entities, missing relationships, dead ends, stale evidence, and other conditions that reduce graph usefulness.
+Context Mesh is a typed context graph built from documents. It turns raw spans into a walkable knowledge structure so that answers are produced by following explicit, readable paths instead of opaque top-k retrieval.
 
-ContextMesh is intended to complement document retrieval and agent memory rather than replace them. Retrieval systems can provide source material, memory systems can provide historical context, while ContextMesh provides the **structured relationships and provenance layer connecting evidence, reasoning, and decisions**.
+## How a node earns a place in the graph
 
-The central design principle is:
+```
+CHUNK → EXTRACT → RESOLVE → LINK → EMBED → PRUNE
+```
 
-> **The graph should remember not only what is connected, but why it is connected.**
+| Stage | What happens |
+|-------|--------------|
+| **CHUNK** | Ingest spans from source material |
+| **EXTRACT** | Pull entities and claims |
+| **RESOLVE** | One ID per real-world thing |
+| **LINK** | Create typed edges only |
+| **EMBED** | Attach a vector to the node |
+| **PRUNE** | Drop anything nobody walked |
 
-This makes ContextMesh suitable for long-running AI agents where auditability, explainability, changing information, and controlled re-execution matter as much as retrieving the right context.
+Only nodes and edges that survive the pipeline (and are actually walked) remain in the live graph.
+
+## Four node types
+
+| Type | Role |
+|------|------|
+| **Entities** | Resolved real-world objects / concepts |
+| **Claims** | Statements extracted from sources |
+| **Sources** | Origin documents or spans |
+| **Decisions** | Higher-level conclusions or choices |
+
+Nodes cluster by type. A shared resolved ID becomes a typed edge.
+
+## Core principles
+
+- **A typed edge beats a top-k guess.**  
+- **The graph is what survives into the next question.**  
+- Answers are produced by walking readable paths, not by retrieving an unordered bag of chunks.
+
+## What the live dashboard tracks
+
+- **Hop budget** — depth required before an answer (median typically 4–6 hops)
+- **Edge ledger** — traffic carried by Mentions, Derived-from, Cites, Contradicts
+- **Walk vs Flat** — token cost of typed walks versus flat top-k retrieval (typically 91–97% reduction)
+- **Traversal grid** — every walk recorded since the graph was built
+- **Dead-end ledger** — walks that ended nowhere (no typed edge, unresolved entity, wrong node type, pruned too early)
+- Graph health signals: unresolved entities, missing relationships, stale paths
+
+## Design goal
+
+Context Mesh complements document retrieval and agent memory. Retrieval systems supply source material; Context Mesh supplies the structured, typed relationships and the walkable paths that make answers auditable and efficient.
+
+The graph remembers not only what is connected, but the typed relations that justify those connections.
