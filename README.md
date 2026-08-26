@@ -37,7 +37,7 @@ python -m contextmesh export --inline # regenerate the dashboard's data
 ```
 
 No dependencies. Python 3.9+. `python -m unittest discover -s tests` runs the
-suite (150 tests). CI runs it on 3.9 through 3.13, plus ruff and a set of
+suite (175 tests). CI runs it on 3.9 through 3.13, plus ruff and a set of
 end-to-end smoke checks — including that a build is byte-identical across
 `PYTHONHASHSEED`, and that `dashboard/data/mesh.json` still matches what the
 engine produces.
@@ -269,6 +269,53 @@ every panel to the call that produces it and is explicit about what is a live
 stream and what is a snapshot. [`docs/DASHBOARD_SPEC.md`](docs/DASHBOARD_SPEC.md)
 is the frame-by-frame record of the original capture.
 
+## MCP — read-only, experimental
+
+```bash
+pip install 'contextmesh[mcp]'
+contextmesh-mcp
+```
+
+An MCP server over the graph, so an agent can query it as memory instead of
+being handed chunks. Five tools — `mesh_ask`, `mesh_get_node`, `mesh_health`,
+`mesh_lineage`, `mesh_blast_radius` — plus `contextmesh://schema`, `health`,
+`session`, `assumptions`, and templates for `node/{id}` and `assumption/{id}`.
+
+```json
+{
+  "mcpServers": {
+    "context-mesh": { "command": "contextmesh-mcp" }
+  }
+}
+```
+
+**It is read-only, and that is a design position rather than a phase.**
+`mesh_blast_radius` answers *what would fall if this assumption were false* —
+the closure, the reason chain for each node, and the preserved complement —
+without rejecting anything. Deciding an assumption **is** false is not offered:
+under GRAPH.md rule 7 that takes evidence contradicting it, produced by an
+auditor that looked at the world. A tool letting a client name an assumption and
+have it rejected would turn that rule into a convention. No tool here adds a
+node, adds an edge, rejects, repairs or executes.
+
+**The read boundary is not "the graph is unchanged".** Asking a question moves
+walk telemetry — `node.walks`, `edge.traversals` — and PRUNE later drops what
+nothing walked, so a walk is a write by design. The invariant tested instead is
+that no read changes graph structure, ontology state, assumptions, supersession
+or invalidation, while telemetry is free to move. `tests/test_mcp.py` asserts
+both halves separately.
+
+**It does not persist.** The server builds the bundled demo graph per process,
+because `ContextGraph` serialises but has no `from_dict`. This version is worth
+having to prove the protocol surface and how an agent consumes evidence paths;
+it is not agent memory yet. Lossless graph persistence is the next core
+milestone, and it is what makes an MCP server that loads real state possible.
+
+The core stays untouched by all of this: `contextmesh` remains Python 3.9+ with
+zero dependencies, the MCP SDK arrives only through the `[mcp]` extra, and
+`contextmesh_mcp.server` is the only module that imports it — which is why the
+safety tests above run on the whole 3.9–3.13 matrix with nothing installed.
+
 ## Layout
 
 ```
@@ -285,10 +332,13 @@ contextmesh/
   health.py                  the signals that make a graph quietly useless
   metrics.py                 the dashboard payload
   corpus.py  demo.py  cli.py the worked example
+contextmesh_mcp/             read-only MCP server (optional extra, 3.10+)
+  session.py  tools.py       plain Python over the engine; no SDK import
+  resources.py  server.py    server.py is the only file that needs the SDK
 dashboard/                   the rebuilt dashboard
 docs/                        the capture spec and the architecture notes
 examples/                    the original standalone control-layer sketch
-tests/                       150 tests over the invariants above
+tests/                       175 tests over the invariants above
 ```
 
 ## Staying publishable

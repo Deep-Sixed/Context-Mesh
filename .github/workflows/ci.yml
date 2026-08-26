@@ -29,6 +29,10 @@ jobs:
       # contextmesh has no dependencies; if that ever stops being true this
       # step is where it will show up, as an ImportError rather than a surprise.
       - name: Run the suite
+        # The MCP SDK is deliberately absent here: the read-boundary tests
+        # import contextmesh_mcp.tools, which does not depend on it, so the
+        # safety cases run on every version the core supports. The two
+        # server-registration tests skip and are covered by the mcp job.
         run: python -m unittest discover -s tests -v
 
   lint:
@@ -40,7 +44,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pipx install ruff
-      - run: ruff check contextmesh tests dashboard/bundle.py
+      - run: ruff check contextmesh contextmesh_mcp tests dashboard/bundle.py
 
   leaks:
     name: no private data
@@ -57,6 +61,55 @@ jobs:
         # FETCH_HEAD, so origin/<branch> need not exist in the runner's checkout
         # and the range would silently cover the wrong commits.
         run: ops/leak-check.sh "${{ github.event.pull_request.base.sha }}"
+
+  mcp:
+    name: mcp · read-only server
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install with the optional MCP extra
+        run: pip install -e '.[mcp]'
+
+      - name: Installing the core alone pulls no dependencies
+        run: |
+          python - <<'EOF'
+          import subprocess, sys, tomllib, pathlib
+          data = tomllib.loads(pathlib.Path("pyproject.toml").read_text())
+          deps = data["project"]["dependencies"]
+          assert deps == [], f"contextmesh must stay dependency-free, found {deps}"
+          assert data["project"]["requires-python"] == ">=3.9"
+          print("core: 0 dependencies, requires-python >=3.9")
+          EOF
+
+      - name: The server registers exactly five read tools
+        run: |
+          python - <<'EOF' | tee /tmp/mcp.txt
+          import asyncio
+          from contextmesh_mcp import server, tools
+          names = sorted(t.name for t in asyncio.run(server.mcp.list_tools()))
+          print("tools:", names)
+          assert names == tools.names(), names
+          for forbidden in ("invalidate", "reject", "repair", "execute", "add_"):
+              assert not any(forbidden in n for n in names), forbidden
+          uris = sorted(str(r.uri) for r in asyncio.run(server.mcp.list_resources()))
+          print("resources:", uris)
+          templates = sorted(
+              t.uri_template for t in asyncio.run(server.mcp.list_resource_templates())
+          )
+          print("templates:", templates)
+          assert "contextmesh://node/{node_id}" in templates
+          print("READ-ONLY SURFACE OK")
+          EOF
+          grep -q "READ-ONLY SURFACE OK" /tmp/mcp.txt
+
+      - name: The full suite, with the SDK present so nothing skips
+        run: |
+          python -m unittest discover -s tests 2>&1 | tee /tmp/suite.txt
+          # If the server tests skipped here, the mcp job is not testing the SDK.
+          ! grep -qi "skipped" /tmp/suite.txt
 
   smoke:
     name: cli · demo · export
