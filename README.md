@@ -37,7 +37,7 @@ python -m contextmesh export --inline # regenerate the dashboard's data
 ```
 
 No dependencies. Python 3.9+. `python -m unittest discover -s tests` runs the
-suite (175 tests). CI runs it on 3.9 through 3.13, plus ruff and a set of
+suite (183 tests). CI runs it on 3.9 through 3.13, plus ruff and a set of
 end-to-end smoke checks — including that a build is byte-identical across
 `PYTHONHASHSEED`, and that `dashboard/data/mesh.json` still matches what the
 engine produces.
@@ -289,14 +289,21 @@ being handed chunks. Five tools — `mesh_ask`, `mesh_get_node`, `mesh_health`,
 }
 ```
 
-**It is read-only, and that is a design position rather than a phase.**
-`mesh_blast_radius` answers *what would fall if this assumption were false* —
-the closure, the reason chain for each node, and the preserved complement —
-without rejecting anything. Deciding an assumption **is** false is not offered:
-under GRAPH.md rule 7 that takes evidence contradicting it, produced by an
-auditor that looked at the world. A tool letting a client name an assumption and
-have it rejected would turn that rule into a convention. No tool here adds a
-node, adds an edge, rejects, repairs or executes.
+**v0.1 is deliberately read-only — and one part of that is permanent.**
+
+Those are two different statements and it is worth keeping them apart. *No
+writes at all* is a property of this version; a later one may accept evidence,
+trigger a recheck, or drive a repair. *No rejection by client fiat* is not a
+phase: under GRAPH.md rule 7 an assumption falls only to evidence contradicting
+it, produced by an auditor that looked at the world. A tool letting a caller
+name an assumption and have it rejected would turn that rule into a convention,
+so it will not be added — what a future version could offer is submitting
+evidence and letting Context Mesh decide, which is a different thing.
+
+`mesh_blast_radius` sits exactly on that line. It answers *what would fall if
+this assumption were false* — the closure, the reason chain for each node, and
+the preserved complement — and rejects nothing. No tool here adds a node, adds
+an edge, rejects, repairs or executes.
 
 **The read boundary is not "the graph is unchanged".** Asking a question moves
 walk telemetry — `node.walks`, `edge.traversals` — and PRUNE later drops what
@@ -338,7 +345,7 @@ contextmesh_mcp/             read-only MCP server (optional extra, 3.10+)
 dashboard/                   the rebuilt dashboard
 docs/                        the capture spec and the architecture notes
 examples/                    the original standalone control-layer sketch
-tests/                       175 tests over the invariants above
+tests/                       183 tests over the invariants above
 ```
 
 ## Staying publishable

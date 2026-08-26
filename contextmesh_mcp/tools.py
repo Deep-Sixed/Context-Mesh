@@ -192,8 +192,11 @@ def mesh_blast_radius(session: Session, assumption_id: str) -> Dict[str, Any]:
     }
 
 
-#: Name -> (callable, description, JSON schema for arguments). The server reads
-#: this rather than repeating the surface, so there is one list of tools.
+#: Name -> callable and description. No JSON schema here on purpose: the server
+#: registers each tool as a typed function and the SDK derives the published
+#: schema from that signature, so a hand-written copy alongside it would be
+#: documentation shaped like a contract and free to drift from the real one.
+#: ``tests/test_mcp.py`` asserts the published schema against these signatures.
 TOOLS: Dict[str, Dict[str, Any]] = {
     "mesh_ask": {
         "fn": mesh_ask,
@@ -202,11 +205,6 @@ TOOLS: Dict[str, Dict[str, Any]] = {
             "hop count, and token cost against flat top-k retrieval — or one of "
             "four typed dead-end reasons rather than a guess."
         ),
-        "schema": {
-            "type": "object",
-            "properties": {"question": {"type": "string"}},
-            "required": ["question"],
-        },
     },
     "mesh_get_node": {
         "fn": mesh_get_node,
@@ -214,11 +212,6 @@ TOOLS: Dict[str, Dict[str, Any]] = {
             "Fetch one node with its typed in and out edges, including "
             "invalidated ones."
         ),
-        "schema": {
-            "type": "object",
-            "properties": {"node_id": {"type": "string"}},
-            "required": ["node_id"],
-        },
     },
     "mesh_health": {
         "fn": mesh_health,
@@ -226,7 +219,6 @@ TOOLS: Dict[str, Dict[str, Any]] = {
             "Graph health signals: untyped edges, unresolved entities, missing "
             "relationships, open contradictions, dead ends, invalidated work."
         ),
-        "schema": {"type": "object", "properties": {}},
     },
     "mesh_lineage": {
         "fn": mesh_lineage,
@@ -234,11 +226,6 @@ TOOLS: Dict[str, Dict[str, Any]] = {
             "The version history of an assumption, oldest first: what the graph "
             "used to believe and what replaced it."
         ),
-        "schema": {
-            "type": "object",
-            "properties": {"assumption_id": {"type": "string"}},
-            "required": ["assumption_id"],
-        },
     },
     "mesh_blast_radius": {
         "fn": mesh_blast_radius,
@@ -246,11 +233,6 @@ TOOLS: Dict[str, Dict[str, Any]] = {
             "Dry run: what would be invalidated, and what would be preserved, if "
             "this assumption turned out to be false. Changes nothing."
         ),
-        "schema": {
-            "type": "object",
-            "properties": {"assumption_id": {"type": "string"}},
-            "required": ["assumption_id"],
-        },
     },
 }
 

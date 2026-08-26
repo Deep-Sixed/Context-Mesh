@@ -31,7 +31,7 @@ except ImportError as exc:  # pragma: no cover - depends on the optional extra
     ) from exc
 
 from . import resources, tools
-from .session import DEFAULT_ROUNDS, Session, session
+from .session import DEFAULT_ROUNDS, session
 
 SERVER_NAME = "context-mesh"
 INSTRUCTIONS = """\
@@ -146,10 +146,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     # Build before serving so the first tool call is not the slow one.
-    built: Session = session(rounds=args.rounds)
+    described = session(rounds=args.rounds).describe()
     print(
-        f"context-mesh MCP: {built.describe()['nodes']} nodes, "
-        f"{built.describe()['edges']} edges, read-only, not persistent",
+        f"context-mesh MCP: {described['nodes_live']}/{described['nodes_total']} nodes live, "
+        f"{described['edges_live']}/{described['edges_total']} edges live, "
+        "read-only, not persistent",
         file=sys.stderr,
     )
     mcp.run(transport="stdio")

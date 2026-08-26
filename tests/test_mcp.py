@@ -12,6 +12,7 @@ dependencies installed. The SDK-dependent server module is covered separately
 and skips when the extra is absent.
 """
 
+import hashlib
 import json
 import unittest
 
@@ -19,24 +20,49 @@ from contextmesh.model import AssumptionStatus, EdgeType, NodeType
 from contextmesh_mcp import resources, tools
 from contextmesh_mcp.session import Session
 
+#: The only two fields a read is permitted to move. Everything else in the
+#: record is frozen — including provenance, build numbers and the embedding.
+TELEMETRY = {"node": {"walks"}, "edge": {"traversals"}}
+
+
+def _without(payload, drop):
+    return {k: v for k, v in payload.items() if k not in drop}
+
 
 def structure(graph):
-    """Everything a read must not touch. Deliberately excludes walk telemetry."""
+    """Everything a read must not touch.
+
+    Built by *subtraction* from the full record rather than by listing fields:
+    enumerating what to freeze means a field added later is unprotected until
+    somebody remembers to add it here, and the first version of this helper
+    made exactly that mistake — an embedding could be zeroed and provenance
+    rewritten with the test still passing.
+
+    ``Node.to_dict`` currently reports ``embedded`` as a bool rather than the
+    vector, so the embedding is digested in separately. When lossless
+    persistence lands and the vector is in the record, this stays correct and
+    the extra digest becomes redundant rather than wrong.
+    """
+    def node_state(n):
+        payload = _without(n.to_dict(), TELEMETRY["node"])
+        payload["embedding_digest"] = (
+            hashlib.sha256(
+                json.dumps(list(n.embedding), sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            if n.embedding is not None
+            else None
+        )
+        return json.dumps(payload, sort_keys=True)
+
     return {
         "build": graph.build,
-        "nodes": sorted(
-            (n.id, n.type.value, n.label, json.dumps(n.attrs, sort_keys=True),
-             n.pruned, n.invalidated)
-            for n in graph.nodes.values()
-        ),
+        "nodes": sorted(node_state(n) for n in graph.nodes.values()),
         "edges": sorted(
-            (e.id, e.src, e.dst, e.type.value, e.assumption_id, e.weight,
-             tuple(e.evidence_ids), e.invalidated)
+            json.dumps(_without(e.to_dict(), TELEMETRY["edge"]), sort_keys=True)
             for e in graph.edges.values()
         ),
         "assumptions": sorted(
-            (a.id, a.statement, a.status.value, a.version, a.supersedes,
-             a.superseded_by, a.rejected_at_build, tuple(a.evidence_ids))
+            json.dumps(a.to_dict(), sort_keys=True)
             for a in graph.assumptions.values()
         ),
     }
@@ -118,6 +144,42 @@ class ReadBoundaryTest(unittest.TestCase):
         resources.read(self.session, f"contextmesh://node/{node_id}")
         resources.read(self.session, f"contextmesh://assumption/{assumption_id}")
         self.assertStructureUnchanged()
+
+
+class FrozenStateTest(unittest.TestCase):
+    """The snapshot has to notice these, or the read-boundary test proves nothing."""
+
+    def setUp(self):
+        self.graph = Session.build(rounds=2).graph
+        self.before = structure(self.graph)
+
+    def test_a_zeroed_embedding_is_caught(self):
+        node = next(n for n in self.graph.nodes.values() if n.embedding is not None)
+        node.embedding = [0.0] * len(node.embedding)
+        self.assertNotEqual(structure(self.graph), self.before)
+
+    def test_rewritten_provenance_is_caught(self):
+        node = next(n for n in self.graph.nodes.values() if n.provenance is not None)
+        node.provenance.source_id = "source:forged"
+        self.assertNotEqual(structure(self.graph), self.before)
+
+    def test_a_changed_node_build_is_caught(self):
+        next(iter(self.graph.nodes.values())).build = 999
+        self.assertNotEqual(structure(self.graph), self.before)
+
+    def test_a_changed_edge_build_is_caught(self):
+        next(iter(self.graph.edges.values())).build = 999
+        self.assertNotEqual(structure(self.graph), self.before)
+
+    def test_a_changed_label_is_caught(self):
+        next(iter(self.graph.nodes.values())).label = "forged"
+        self.assertNotEqual(structure(self.graph), self.before)
+
+    def test_telemetry_alone_is_not_caught(self):
+        # The one thing it must stay blind to, or mesh_ask can never pass.
+        next(iter(self.graph.nodes.values())).walks += 1
+        next(iter(self.graph.edges.values())).traversals += 1
+        self.assertEqual(structure(self.graph), self.before)
 
 
 class BlastRadiusIsADryRunTest(unittest.TestCase):
@@ -240,10 +302,9 @@ class SurfaceTest(unittest.TestCase):
                     forbidden, name, f"{name} looks like a write tool; v0.1 is read-only"
                 )
 
-    def test_every_tool_declares_a_schema_and_a_description(self):
+    def test_every_tool_declares_a_description(self):
         for name, entry in tools.TOOLS.items():
             self.assertTrue(entry["description"].strip(), name)
-            self.assertEqual(entry["schema"]["type"], "object", name)
             self.assertTrue(callable(entry["fn"]), name)
 
     def test_unknown_tool_and_unknown_ids_raise_cleanly(self):
@@ -262,6 +323,16 @@ class SurfaceTest(unittest.TestCase):
         described = self.session.describe()
         self.assertFalse(described["persistent"])
         self.assertIn("from_dict", described["note"])
+
+    def test_the_session_reports_live_and_total_separately(self):
+        described = self.session.describe()
+        for key in ("nodes_live", "nodes_total", "edges_live", "edges_total"):
+            self.assertIn(key, described)
+        # The demo rejects an assumption, so live must actually be the smaller
+        # number — otherwise this reads as a distinction without a difference.
+        self.assertLess(described["nodes_live"], described["nodes_total"])
+        self.assertLessEqual(described["edges_live"], described["edges_total"])
+        self.assertNotIn("nodes", described, "the ambiguous key should be gone")
 
     def test_every_payload_is_json_serialisable(self):
         node_id = next(iter(self.session.graph.nodes))
@@ -298,6 +369,33 @@ class ServerTest(unittest.TestCase):
 
         registered = sorted(t.name for t in asyncio.run(server.mcp.list_tools()))
         self.assertEqual(registered, tools.names())
+
+    def test_the_registered_schema_matches_each_tool_signature(self):
+        """One source of truth: the typed signature is what the SDK publishes.
+
+        The tool table used to carry hand-written JSON schemas that nothing
+        registered — documentation shaped like a contract, free to drift from
+        the contract. They are gone; this asserts the published schema against
+        the function the tool actually calls.
+        """
+        import asyncio
+        import inspect
+
+        from contextmesh_mcp import server
+
+        for tool in asyncio.run(server.mcp.list_tools()):
+            fn = tools.TOOLS[tool.name]["fn"]
+            expected = [
+                name
+                for name in inspect.signature(fn).parameters
+                if name != "session"
+            ]
+            schema = tool.input_schema
+            self.assertEqual(schema["type"], "object", tool.name)
+            self.assertEqual(sorted(schema["properties"]), sorted(expected), tool.name)
+            self.assertEqual(
+                sorted(schema.get("required", [])), sorted(expected), tool.name
+            )
 
     def test_the_server_registers_the_resources(self):
         import asyncio

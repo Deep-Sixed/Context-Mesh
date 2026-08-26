@@ -31,9 +31,12 @@ class Session:
     def build(cls, rounds: int = DEFAULT_ROUNDS) -> "Session":
         """Build the bundled demo graph.
 
-        The ledger comes from the demo run rather than being constructed fresh:
-        a new ``AssumptionLedger`` over the same graph would start with an empty
-        history and report no lineage for assumptions that already have one.
+        The ledger comes from the demo run rather than being constructed fresh.
+        Not for lineage: ``lineage()`` walks ``supersedes`` on the graph's own
+        assumption records, so a new ``AssumptionLedger`` over the same graph
+        reconstructs it identically. What a fresh one loses is ``history`` — the
+        recorded sequence of assume / supersede / reject events, which is not
+        derivable from the graph and is worth keeping alongside it.
         """
         result = demo_run(rounds=rounds)
         return cls(
@@ -48,7 +51,15 @@ class Session:
         return sorted(self.graph.assumptions)
 
     def describe(self) -> dict:
-        counts = self.graph.type_counts()
+        """What this server is serving.
+
+        Live and total are reported separately rather than as one ``nodes``
+        number. ``type_counts()`` is live-only and ``len(graph.edges)`` is not,
+        so a single pair of counts silently compared two different things — and
+        in a graph whose whole point is that invalidated work is kept rather
+        than deleted, the gap between them is information, not noise.
+        """
+        live_counts = self.graph.type_counts()
         return {
             "source": "bundled demo corpus",
             "persistent": False,
@@ -58,9 +69,12 @@ class Session:
             ),
             "build": self.graph.build,
             "rounds": self.rounds,
-            "nodes": sum(counts.values()),
-            "node_types": counts,
-            "edges": len(self.graph.edges),
+            "nodes_live": sum(live_counts.values()),
+            "nodes_total": len(self.graph.nodes),
+            "node_types_live": live_counts,
+            "node_types_total": self.graph.type_counts(live_only=False),
+            "edges_live": sum(1 for e in self.graph.edges.values() if e.live),
+            "edges_total": len(self.graph.edges),
             "assumptions": len(self.graph.assumptions),
         }
 
