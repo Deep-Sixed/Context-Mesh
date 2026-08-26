@@ -47,3 +47,10 @@ An edge is legal only if the pair `(source type, target type)` appears in its ro
 4. Every `claim` and `decision` carries provenance to a `source`. A node without
    a path to a source is an orphan and is reported by graph health.
 5. A node is walkable only after `PRUNE`, and `PRUNE` drops what nothing walked.
+6. Re-running invalidated work never revives a `decision` — it appends a new one
+   that `supersedes` it, so rule 3 holds through re-execution. An `entity` *is*
+   revived when the decision that produces it runs again, because the artefact
+   was rebuilt; one the rerun stops producing stays invalidated.
+7. An `assumption` is only ever rejected by `evidence` that `contradicts` it. A
+   caller may not mark one false directly, because "why did this fall over" has
+   to have an answer inside the graph.

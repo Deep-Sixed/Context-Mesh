@@ -5,6 +5,7 @@
     python -m contextmesh health        # graph health signals
     python -m contextmesh export        # write the dashboard's data
     python -m contextmesh invalidate    # break an assumption, show the fallout
+    python -m contextmesh execute       # break one, then re-run only what fell
 """
 
 from __future__ import annotations
@@ -17,8 +18,10 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Sequence
 
 from .demo import run
+from .execute import Event
+from .execute import demo as execute_demo
 from .health import check
-from .model import AssumptionStatus
+from .model import AssumptionStatus, NodeType
 
 DEFAULT_EXPORT = Path(__file__).resolve().parent.parent / "dashboard" / "data" / "mesh.json"
 DASHBOARD_HTML = Path(__file__).resolve().parent.parent / "dashboard" / "index.html"
@@ -168,6 +171,62 @@ def cmd_invalidate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_execute(args: argparse.Namespace) -> int:
+    """Selective invalidation is only half the claim; this is the other half."""
+    result = execute_demo()
+    runner = result.runner
+    graph = runner.graph
+
+    _h("PLAN · tasks, and the ground each one currently stands on")
+    for task in runner.tasks:
+        needs = f"  needs {', '.join(task.needs)}" if task.needs else ""
+        print(f"  {task.name:<12} {task.title}{needs}")
+        print(f"  {'':<12} assumes: {task.assumes}")
+    if runner.unaudited:
+        print(f"\n  unaudited: {', '.join(runner.unaudited)}")
+
+    for report in runner.rounds:
+        _h(f"ROUND {report.round} · {len(report.executed)} executed, "
+           f"{len(report.cached)} cached")
+        for index, layer in enumerate(report.layers, start=1):
+            print(f"  layer {index}: {', '.join(layer)}")
+        for name in report.cached:
+            print(f"  cached  {name} — untouched, previous result stands")
+        for name, reason in report.blocked.items():
+            print(f"  blocked {name} — {reason}")
+        for name, reason in report.failed.items():
+            print(f"  FAILED  {name} — {reason}")
+
+    _h("THE GROUND MOVED · discovered by an auditor, not announced")
+    for entry in runner.ledger.entries:
+        if entry.event is Event.DISPROVED:
+            print(f"  {entry.task}: {entry.detail}")
+    for inv in result.invalidations:
+        print(f"\n  rejected: {inv.statement}")
+        print(f"  blast radius {inv.blast_radius}, preserved {len(inv.preserved)}")
+        for node_id in inv.invalidated:
+            print(f"    ✗ {graph.node(node_id).label[:64]}")
+            print(f"        {inv.why(node_id)}")
+
+    _h("ARTEFACTS · rebuilt, abandoned, or never touched")
+    for node in graph.nodes.values():
+        if node.type is not NodeType.ENTITY:
+            continue
+        mark = "live" if node.live else "GONE"
+        print(f"  [{mark}] {node.label}")
+
+    _h("ASSUMPTION LINEAGE · a rejection is never edited away")
+    for assumption in graph.assumptions.values():
+        print(f"  v{assumption.version} [{assumption.status.value}] {assumption.statement}")
+
+    _h("LEDGER · append-only, and checkably so")
+    for entry in runner.ledger.entries:
+        print(f"  {entry.seq:>3} r{entry.round} {entry.event.value:<12} "
+              f"{entry.task:<12} {entry.detail[:60]}")
+    print(f"\n  head {runner.ledger.head} · chain intact: {runner.ledger.verify()}")
+    return 0
+
+
 def cmd_export(args: argparse.Namespace) -> int:
     result = run(rounds=args.rounds)
     payload = result.payload()
@@ -219,6 +278,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     sub.add_parser(
         "invalidate", help="reject an assumption and show the blast radius"
     ).set_defaults(func=cmd_invalidate)
+    sub.add_parser(
+        "execute", help="break an assumption, then re-run only what fell over"
+    ).set_defaults(func=cmd_execute)
     export = sub.add_parser("export", help="write the dashboard payload")
     export.add_argument(
         "--rounds",

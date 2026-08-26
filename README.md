@@ -32,11 +32,12 @@ python -m contextmesh demo            # build, walk, break an assumption, report
 python -m contextmesh ask "Why did the Index Builder run out of memory?"
 python -m contextmesh health          # what is quietly wrong with the graph
 python -m contextmesh invalidate      # reject an assumption, see the fallout
+python -m contextmesh execute         # break one, then re-run only what fell
 python -m contextmesh export --inline # regenerate the dashboard's data
 ```
 
 No dependencies. Python 3.9+. `python -m unittest discover -s tests` runs the
-suite (87 tests). CI runs it on 3.9 through 3.13, plus ruff and a set of
+suite (123 tests). CI runs it on 3.9 through 3.13, plus ruff and a set of
 end-to-end smoke checks — including that a build is byte-identical across
 `PYTHONHASHSEED`, and that `dashboard/data/mesh.json` still matches what the
 engine produces.
@@ -133,6 +134,69 @@ never propagate — that is what makes this selective rather than a purge.
 `supersedes` never deletes, so decision history stays append-only and "why did
 we change our mind" is answered by walking, not by reading a changelog.
 
+## Selective re-execution
+
+Knowing what fell is half the claim. `contextmesh/execute.py` is the half that
+acts on it: a `Runner` binds units of work to the graph's own vocabulary — a
+task *is* a `decision` node, its ground is a `depends_on` edge to an
+`assumption`, its dependencies are `depends_on` edges to other decisions, its
+outputs are `produces` edges to entities — so scheduling reads off the ontology
+rather than a second copy of it.
+
+```
+$ python -m contextmesh execute
+
+ROUND 1 · 5 executed, 0 cached
+  layer 1: schema, hashing, tokens
+  layer 2: routes
+  layer 3: rate_limit
+
+THE GROUND MOVED · discovered by an auditor, not announced
+  hashing: argon2-cffi has an open advisory — CVE-2026-9999: memory-hard
+           parameters silently downgraded
+  rejected: argon2-cffi has no open advisory
+  blast radius 8, preserved 15
+
+ROUND 3 · 3 executed, 2 cached
+  layer 1: hashing
+  layer 2: routes
+  layer 3: rate_limit
+  cached  schema — untouched, previous result stands
+  cached  tokens — untouched, previous result stands
+```
+
+Three properties are worth being precise about, because they are the ones a
+demo can fake:
+
+**The failure is discovered, not announced.** `recheck()` re-runs every standing
+auditor against current facts and executes nothing. The CVE is published to a
+feed *outside* the graph; the hashing auditor reads that feed and returns
+`ctx.disproved(...)`, and that disproof is what rejects the assumption and
+computes the blast radius. Nothing reaches in and marks a node false. An auditor
+distinguishes "the output is wrong" (`ctx.fail`, which fails one task) from "the
+ground is false" (`ctx.disproved`, which takes down everything standing on it),
+because those have different blast radii and an engine should not have to guess.
+
+**Re-running stays append-only.** A rerun never revives the old decision — it
+appends a new one that `supersedes` it, so the superseded reasoning is still
+walkable. Artefacts are the exception, and deliberately so: an `entity` fell
+only because the decision that produced it fell, so rebuilding that decision
+brings it back under the same id. An artefact the rerun *stops* producing — the
+Argon2 parameters, once the hasher becomes bcrypt — stays invalidated, which is
+the right answer for a thing that no longer exists.
+
+**The ledger is append-only in a way you can check.** Each entry's digest covers
+the one before it, so a rewritten or dropped entry breaks the chain and
+`ledger.verify()` says so. There are no timestamps in it: this package promises
+builds that are byte-identical across processes and hash seeds, and a clock
+would be the one field that could not be reproduced.
+
+A rejected assumption is never edited back to life. It stays rejected, and
+`repair()` grounds the task on a replacement that records what it supersedes —
+so `lineage()` still answers "what did we used to believe, and why did we stop".
+Until that repair happens the task is *blocked*, not run: nothing executes on
+ground the graph knows to be false.
+
 ### The standalone control layer
 
 `examples/assumption_control_layer.py` is the original single-file sketch of
@@ -151,8 +215,11 @@ python examples/assumption_control_layer.py
 ```
 
 It runs on its own with nothing imported from the package, and it is kept
-because the whole idea fits on one screen there. `contextmesh/assumptions.py`
-and `contextmesh/decisions.py` are the version the rest of this repository uses.
+because the whole idea fits on one screen there. It is a sketch, not the
+implementation: its `DRIFT` node is a stub that reports alignment without
+checking anything. `contextmesh/assumptions.py`, `contextmesh/decisions.py` and
+`contextmesh/execute.py` are the version the rest of this repository uses, and
+the one to read if you want the behaviour rather than the shape.
 
 ## Graph health
 
@@ -198,6 +265,7 @@ contextmesh/
   pipeline.py                CHUNK → EXTRACT → RESOLVE → LINK → EMBED → PRUNE
   traverse.py                walks, evidence paths, the four dead-end reasons
   assumptions.py             versioned assumptions, blast radius, rejection
+  execute.py                 re-runs exactly the closure an invalidation felled
   decisions.py               append-only decision history
   health.py                  the signals that make a graph quietly useless
   metrics.py                 the dashboard payload
@@ -205,7 +273,7 @@ contextmesh/
 dashboard/                   the rebuilt dashboard
 docs/                        the capture spec and the architecture notes
 examples/                    the original standalone control-layer sketch
-tests/                       87 tests over the invariants above
+tests/                       123 tests over the invariants above
 ```
 
 ## Staying publishable

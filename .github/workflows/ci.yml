@@ -82,6 +82,19 @@ jobs:
             | tee /tmp/dead.txt
           grep -q "dead end" /tmp/dead.txt
 
+      - name: Re-execution reruns the blast radius and caches the rest
+        run: |
+          python -m contextmesh execute | tee /tmp/exec.txt
+          # Round 1 builds everything; the rerun after the CVE must touch three
+          # steps and leave the two independent ones on their cached result.
+          grep -q "ROUND 1 · 5 executed, 0 cached" /tmp/exec.txt
+          grep -q "3 executed, 2 cached" /tmp/exec.txt
+          grep -q "chain intact: True" /tmp/exec.txt
+          # The disproof has to come from the auditor reading the advisory feed,
+          # not from the script announcing it.
+          grep -q "discovered by an auditor" /tmp/exec.txt
+          grep -q "CVE-2026-9999" /tmp/exec.txt
+
       - name: The standalone control-layer example still passes its own checks
         run: |
           python examples/assumption_control_layer.py | tee /tmp/acl.txt

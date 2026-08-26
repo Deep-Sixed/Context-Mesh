@@ -107,6 +107,45 @@ made it depend on the assumption.
 Nothing is deleted. Rejected assumptions and invalidated decisions stay in the
 graph flagged, so an audit can still walk to them.
 
+## Re-execution reads the same edges backwards
+
+`contextmesh/execute.py` schedules work off the ontology instead of a parallel
+task graph. A task *is* a `decision` node; its ground is a `depends_on` edge to
+an `assumption`; its dependencies are `depends_on` edges to other decisions; its
+outputs are `produces` edges to entities. So the rule that decides what falls
+and the rule that decides what runs are the same rule read in opposite
+directions: a task runs when everything it `depends_on` is standing, and reruns
+when something it depends on stopped standing.
+
+Three consequences follow, and each is a test rather than a claim:
+
+**Rejection has one cause.** An assumption is rejected only by `evidence` that
+`contradicts` it, produced by an auditor that returned `disproved`. `recheck()`
+re-runs every standing auditor against current facts and executes nothing; it
+is the step where the outside world gets to change its mind. An auditor that
+merely fails — the output is wrong — fails one task and propagates nothing,
+because "this result is bad" and "this ground is false" have different blast
+radii and the engine should not have to infer which one it was handed.
+
+**Re-running preserves history.** A rerun appends a new `decision` that
+`supersedes` the invalidated one rather than clearing the flag, so GRAPH.md
+rule 3 holds through re-execution and the superseded reasoning stays walkable.
+Artefacts are the deliberate exception: an `entity` fell only because the
+decision that produced it fell, so rebuilding the decision brings the entity
+back under the same id. An artefact the rerun stops producing stays
+invalidated — the correct answer for a thing that no longer exists.
+
+**The record is checkable, not just conventional.** Each ledger entry's digest
+covers the digest before it, so a rewritten or dropped entry breaks the chain.
+The entries carry no wall-clock time; the package promises byte-identical
+builds across processes and hash seeds, and a timestamp would be the one field
+that could not be reproduced.
+
+Until a rejected assumption is repaired, the tasks standing on it are *blocked*
+rather than run. Repair does not edit the rejection away — it grounds the task
+on a replacement that records what it supersedes, so the assumption's lineage
+still answers "what did we used to believe, and why did we stop".
+
 ## Token accounting
 
 `tokens ≈ words × 1.3`. A walk carries the nodes on its path and nothing else. A

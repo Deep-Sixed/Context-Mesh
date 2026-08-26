@@ -7,8 +7,12 @@ selective-invalidation idea end to end with a seven-node executor.
 The production version of these ideas lives in the package:
 
     contextmesh/assumptions.py   versioned assumptions, blast radius, rejection
+    contextmesh/execute.py       re-runs exactly the closure an invalidation felled
     contextmesh/decisions.py     append-only decision history
     contextmesh/graph.py         typed nodes and typed edges
+
+This file is a sketch, not the implementation: its DRIFT node is a stub that
+reports alignment without checking anything (see `drift_logic`).
 
 Run it with `python examples/assumption_control_layer.py`.
 
@@ -395,9 +399,18 @@ def audit_logic(ctx: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def drift_logic(ctx: Dict[str, Any]) -> Dict[str, Any]:
+    """STUB. Reports alignment without checking anything.
+
+    A real drift check would compare the accumulated work against INTENT — which
+    is a different question from AUDIT's "does this step hold under its own
+    declared assumption". This one reads neither, and returning ``False``
+    unconditionally is a placeholder for the node's shape, not a check. It is
+    left visible rather than removed because a stub that announces itself is
+    less misleading than one that reads like a working check.
+    """
     state: GraphState = ctx["state"]
     graph: EngineGraph = ctx["graph"]
-    graph.log_event("DRIFT", "CHECK", "Aligned with original INTENT")
+    graph.log_event("DRIFT", "CHECK", "Aligned with original INTENT (not checked)")
     state.drift_history.append("no_drift")
     return {"drift": False}
 

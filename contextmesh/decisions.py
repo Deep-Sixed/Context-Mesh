@@ -51,6 +51,7 @@ class DecisionLog:
         rationale: str,
         *,
         source_id: str,
+        id: Optional[str] = None,
         supported_by: Iterable[str] = (),
         cites: Iterable[str] = (),
         assumptions: Iterable[str] = (),
@@ -60,6 +61,11 @@ class DecisionLog:
         node = self.graph.add_node(
             NodeType.DECISION,
             title,
+            # A re-run appends a *new* decision that supersedes the old one, and
+            # two runs of the same step share a title. Without an explicit id the
+            # content slug would return the invalidated node instead of a
+            # successor, and the history would silently stop being append-only.
+            id=id,
             attrs={"rationale": rationale},
             provenance=Provenance(
                 source_id=source_id,
