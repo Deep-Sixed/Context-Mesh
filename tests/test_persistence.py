@@ -538,6 +538,77 @@ class IntegrityTest(unittest.TestCase):
                 p[field] = {"not": "a list"}
                 self.refuses(p)
 
+    def test_null_does_not_normalise_to_empty(self):
+        """A null in a non-nullable field is corruption, not an empty value.
+
+        The sharpest case is evidence: an assumption whose ``evidence_ids``
+        arrived as null would restore with nothing recorded as having
+        disproved it, and the file would load without complaint.
+        """
+        cases = (
+            ("node.attrs", lambda p: p["nodes"][0].__setitem__("attrs", None)),
+            (
+                "provenance.checks",
+                lambda p: next(n for n in p["nodes"] if n["provenance"])[
+                    "provenance"
+                ].__setitem__("checks", None),
+            ),
+            ("edge.evidence_ids", lambda p: p["edges"][0].__setitem__("evidence_ids", None)),
+            (
+                "assumption.evidence_ids",
+                lambda p: p["assumptions"][0].__setitem__("evidence_ids", None),
+            ),
+        )
+        for label, corrupt in cases:
+            with self.subTest(field=label):
+                p = self.payload()
+                corrupt(p)
+                self.refuses(p, ValueError)
+
+    def test_evidence_is_not_silently_dropped(self):
+        """The consequence the case above exists to prevent."""
+        graph = ContextGraph()
+        graph.build = 1
+        evidence = graph.add_node(NodeType.EVIDENCE, "CVE report", attrs={"kind": "disproof"})
+        ledger = AssumptionLedger(graph)
+        assumption = ledger.assume("ground", evidence_ids=[evidence.id])
+        self.assertEqual(assumption.evidence_ids, [evidence.id])
+        restored = ContextGraph.from_dict(graph.to_dict())
+        self.assertEqual(restored.assumptions[assumption.id].evidence_ids, [evidence.id])
+
+    def test_the_fields_the_schema_does_write_as_null_still_load(self):
+        """The fix must not close doors the format legitimately uses."""
+        nullable = (
+            ("node.provenance", lambda p: p["nodes"][0].__setitem__("provenance", None)),
+            (
+                "provenance.span",
+                lambda p: next(n for n in p["nodes"] if n["provenance"])[
+                    "provenance"
+                ].__setitem__("span", None),
+            ),
+            (
+                "node.embedding",
+                lambda p: (
+                    p["nodes"][0].__setitem__("embedding", None),
+                    p["nodes"][0].__setitem__("embedded", False),
+                ),
+            ),
+            ("edge.assumption_id", lambda p: p["edges"][0].__setitem__("assumption_id", None)),
+            (
+                "assumption.supersedes",
+                lambda p: p["assumptions"][0].__setitem__("supersedes", None),
+            ),
+            (
+                "assumption.rejected_at_build",
+                lambda p: p["assumptions"][0].__setitem__("rejected_at_build", None),
+            ),
+        )
+        for label, mutate in nullable:
+            with self.subTest(field=label):
+                p = self.payload()
+                mutate(p)
+                ContextGraph.from_dict(p)
+
     # ── references between records ───────────────────────────────────────
     def test_a_dangling_supersedes_is_refused(self):
         p = self.payload()

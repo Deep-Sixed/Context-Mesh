@@ -48,7 +48,11 @@ DISPLAY_TYPES: Tuple[NodeType, ...] = (
 
 # ── snapshot field validation ────────────────────────────────────────────
 # A snapshot is untrusted input, so the record loaders below check types
-# rather than coerce them. Coercion is not a harmless convenience here:
+# rather than coerce them. Null is accepted only where the schema actually
+# writes it — ``provenance``, ``provenance.span``, ``embedding``,
+# ``assumption_id``, ``supersedes``, ``superseded_by`` and
+# ``rejected_at_build``. Everywhere else a null is corruption, and normalising
+# it to an empty list or object would quietly discard what the field named. Coercion is not a harmless convenience here:
 # ``bool("false")`` is ``True``, so a malformed flag would silently turn a live
 # node into an invalidated one, and ``list("abc")`` turns a string into a
 # three-element "vector". A durable state format has to fail closed.
@@ -106,16 +110,18 @@ def _expect_str(value: Any, field: str) -> str:
 
 
 def _expect_str_list(value: Any, field: str) -> List[str]:
-    if value is None:
-        return []
+    # No ``None`` branch. These fields are never written as null, so a null is
+    # corruption — and normalising it to an empty list would erase the very
+    # associations it names. An assumption whose ``evidence_ids`` arrived as
+    # null would restore with nothing recorded as having disproved it.
     if not isinstance(value, list):
         _fail(field, value, "a list of strings")
     return [_expect_str(v, f"{field}[{i}]") for i, v in enumerate(value)]
 
 
 def _expect_dict(value: Any, field: str) -> Dict[str, Any]:
-    if value is None:
-        return {}
+    # Same rule: an empty object and a missing one are different claims, and
+    # only one of them is something ``to_dict`` ever writes.
     if not isinstance(value, dict):
         _fail(field, value, "an object")
     for key in value:

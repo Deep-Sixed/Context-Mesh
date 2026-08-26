@@ -37,7 +37,7 @@ python -m contextmesh export --inline # regenerate the dashboard's data
 ```
 
 No dependencies. Python 3.9+. `python -m unittest discover -s tests` runs the
-suite (263 tests). CI runs it on 3.9 through 3.13, plus ruff and a set of
+suite (266 tests). CI runs it on 3.9 through 3.13, plus ruff and a set of
 end-to-end smoke checks — including that a build is byte-identical across
 `PYTHONHASHSEED`, and that `dashboard/data/mesh.json` still matches what the
 engine produces.
@@ -294,6 +294,12 @@ deliberately killed; dropping `embedding` would restore one that answers
 differently. Defaults belong to a schema version with an older shape to migrate
 from, and v1 has none.
 
+`null` is accepted only where the schema writes it — `provenance`, its `span`,
+`embedding`, `assumption_id`, `supersedes`, `superseded_by`, `rejected_at_build`.
+Everywhere else a null is corruption, and normalising it to an empty list would
+discard what the field named: an assumption whose `evidence_ids` arrived as
+`null` would restore with nothing recorded as having disproved it.
+
 References between records are checked once every record exists: a lineage that
 names a missing assumption, a supersession only one side agrees with, an edge
 grounded on an assumption that is not there, evidence that is not a node. Each
@@ -305,7 +311,7 @@ Fields are checked rather than coerced, because coercion is not harmless here:
 into an invalidated one; `list("abc")` would turn a string into a
 three-element "vector"; and `bool` being a subclass of `int` means a count
 written as a flag would arrive as `1`. The suite corrupts a good snapshot
-sixty ways and requires each to be refused.
+sixty-five ways and requires each to be refused.
 
 **Records are emitted in insertion order, never sorted.** That is load-bearing.
 The walker's frontier is a heap whose tie-breaker is an insertion counter, and
@@ -414,7 +420,7 @@ contextmesh_mcp/             read-only MCP server (optional extra, 3.10+)
 dashboard/                   the rebuilt dashboard
 docs/                        the capture spec and the architecture notes
 examples/                    the original standalone control-layer sketch
-tests/                       263 tests over the invariants above
+tests/                       266 tests over the invariants above
 ```
 
 ## Staying publishable
