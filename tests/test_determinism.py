@@ -39,13 +39,33 @@ print(json.dumps({
 """ % str(REPO)
 
 
-def fingerprint_in_subprocess(seed: str) -> dict:
+#: The execution ledger is hash-chained, so a single reordered entry moves the
+#: head. That makes the head a one-line fingerprint of the whole re-execution
+#: run — scheduling order, audit outcomes, blast radius and all.
+LEDGER = """
+import json, sys
+sys.path.insert(0, %r)
+from contextmesh.execute import demo
+run = demo()
+print(json.dumps({
+    "head": run.runner.ledger.head,
+    "entries": len(run.runner.ledger),
+    "blast_radius": run.invalidations[0].blast_radius,
+}))
+""" % str(REPO)
+
+
+def _in_subprocess(script: str, seed: str) -> dict:
     env = dict(os.environ, PYTHONHASHSEED=seed)
     out = subprocess.run(
-        [sys.executable, "-c", FINGERPRINT],
+        [sys.executable, "-c", script],
         capture_output=True, text=True, env=env, cwd=str(REPO), check=True,
     )
     return json.loads(out.stdout)
+
+
+def fingerprint_in_subprocess(seed: str) -> dict:
+    return _in_subprocess(FINGERPRINT, seed)
 
 
 class InProcessTest(unittest.TestCase):
@@ -81,6 +101,16 @@ class CrossProcessTest(unittest.TestCase):
             self.assertEqual(
                 result, results[0],
                 f"build under PYTHONHASHSEED={seed} differs from PYTHONHASHSEED={seeds[0]}",
+            )
+
+    def test_re_execution_is_identical_under_different_hash_seeds(self):
+        seeds = ["0", "1", "99", "424242"]
+        results = [_in_subprocess(LEDGER, s) for s in seeds]
+        for seed, result in zip(seeds[1:], results[1:]):
+            self.assertEqual(
+                result, results[0],
+                f"re-execution under PYTHONHASHSEED={seed} differs from "
+                f"PYTHONHASHSEED={seeds[0]}",
             )
 
 

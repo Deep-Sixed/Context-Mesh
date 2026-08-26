@@ -15,6 +15,7 @@ The pieces:
 - ``pipeline``    CHUNK → EXTRACT → RESOLVE → LINK → EMBED → PRUNE
 - ``traverse``    walks that return the evidence path, and classify the failures
 - ``assumptions`` versioned assumptions and selective invalidation
+- ``execute``     re-runs exactly the work an invalidation knocked down
 - ``decisions``   append-only decision history
 - ``health``      the conditions that quietly make a graph useless
 - ``metrics``     the dashboard payload, computed from the live graph
@@ -23,6 +24,17 @@ The pieces:
 from .assumptions import AssumptionLedger, InvalidationReport
 from .corpus import documents
 from .decisions import DecisionLog, DecisionRecord
+from .execute import (
+    AuditContext,
+    ExecutionError,
+    RunContext,
+    RunLedger,
+    Runner,
+    RunReport,
+    Task,
+    TaskState,
+    Verdict,
+)
 from .graph import ContextGraph
 from .health import Signal, check, report
 from .metrics import snapshot
@@ -47,6 +59,7 @@ __all__ = [
     "Assumption",
     "AssumptionLedger",
     "AssumptionStatus",
+    "AuditContext",
     "BuildReport",
     "ContextGraph",
     "DeadEnd",
@@ -55,6 +68,7 @@ __all__ = [
     "Document",
     "Edge",
     "EdgeType",
+    "ExecutionError",
     "InvalidationReport",
     "Node",
     "NodeType",
@@ -64,7 +78,14 @@ __all__ = [
     "Provenance",
     "ResolutionRecord",
     "Resolver",
+    "RunContext",
+    "RunLedger",
+    "RunReport",
+    "Runner",
     "Signal",
+    "Task",
+    "TaskState",
+    "Verdict",
     "Walk",
     "Walker",
     "check",
