@@ -614,6 +614,8 @@ class Runner:
                 new.version = old.version + 1
                 new.supersedes = old.id
                 old.superseded_by = new.id
+                # Same mirror as above: the record is not the only copy.
+                self.graph.sync_assumption(new)
                 self.graph.add_edge(new.id, EdgeType.SUPERSEDES, old.id)
             task.assumes = assumes
             task.assumption_id = new.id

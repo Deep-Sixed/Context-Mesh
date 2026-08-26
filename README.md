@@ -37,7 +37,7 @@ python -m contextmesh export --inline # regenerate the dashboard's data
 ```
 
 No dependencies. Python 3.9+. `python -m unittest discover -s tests` runs the
-suite (183 tests). CI runs it on 3.9 through 3.13, plus ruff and a set of
+suite (266 tests). CI runs it on 3.9 through 3.13, plus ruff and a set of
 end-to-end smoke checks — including that a build is byte-identical across
 `PYTHONHASHSEED`, and that `dashboard/data/mesh.json` still matches what the
 engine produces.
@@ -269,6 +269,82 @@ every panel to the call that produces it and is explicit about what is a live
 stream and what is a snapshot. [`docs/DASHBOARD_SPEC.md`](docs/DASHBOARD_SPEC.md)
 is the frame-by-frame record of the original capture.
 
+## Persistence
+
+```python
+graph.save_json("graph.json")
+graph = ContextGraph.load_json("graph.json")
+```
+
+A versioned snapshot (`contextmesh.graph` v1) that restores the same graph, not
+a graph that looks the same. Nodes carry their actual embedding vector, not a
+`embedded: true` flag; provenance spans come back as tuples; `walks`,
+`traversals`, `pruned` and `invalidated` all survive.
+
+**A snapshot is untrusted input, and it fails closed.** Every edge is restored
+through `add_edge`, so `GRAPH.md` typechecks a file exactly as it would a live
+write, and `_out`, `_in` and `_edge_key` are rebuilt rather than persisted. A
+loader that writes straight into the internal dictionaries is faster and admits
+graphs the live API would refuse — which makes the ontology a convention that
+holds only until something is saved.
+
+Every field the writer emits is **required** on load — absence is corruption,
+not a default. Dropping `invalidated` would restore a node the graph had
+deliberately killed; dropping `embedding` would restore one that answers
+differently. Defaults belong to a schema version with an older shape to migrate
+from, and v1 has none.
+
+`null` is accepted only where the schema writes it — `provenance`, its `span`,
+`embedding`, `assumption_id`, `supersedes`, `superseded_by`, `rejected_at_build`.
+Everywhere else a null is corruption, and normalising it to an empty list would
+discard what the field named: an assumption whose `evidence_ids` arrived as
+`null` would restore with nothing recorded as having disproved it.
+
+References between records are checked once every record exists: a lineage that
+names a missing assumption, a supersession only one side agrees with, an edge
+grounded on an assumption that is not there, evidence that is not a node. Each
+of those loads cleanly and fails much later — `lineage()` raising `KeyError` on
+a graph that has been serving for an hour.
+
+Fields are checked rather than coerced, because coercion is not harmless here:
+`bool("false")` is `True`, so a malformed flag would quietly turn a live node
+into an invalidated one; `list("abc")` would turn a string into a
+three-element "vector"; and `bool` being a subclass of `int` means a count
+written as a flag would arrive as `1`. The suite corrupts a good snapshot
+97 ways and requires each to be refused — a counted figure, not an
+estimate: `tests/test_persistence.py` builds and rejects that many distinct
+corrupted snapshots across 55 test methods.
+
+**Records are emitted in insertion order, never sorted.** That is load-bearing.
+The walker's frontier is a heap whose tie-breaker is an insertion counter, and
+the lexical fallback iterates `graph.nodes`, so two equal-cost branches are
+decided by which was added first:
+
+```
+edges added alpha-first: answer = alpha  (hops 2, score 0.2750)
+edges added bravo-first: answer = bravo  (hops 2, score 0.2750)
+```
+
+Same facts, same score, different answer. Sorting the arrays would reorder those
+lists on reload and change answers without changing anything true, so
+`tests/test_persistence.py` builds that tie deliberately and asserts a round
+trip preserves it. Sorting the *keys* of each JSON object is safe, and
+`save_json` does that — along with `allow_nan=False`, because a snapshot other
+parsers refuse is not durable.
+
+One thing the snapshot **cannot** represent: disagreement. An assumption's
+`status` and `version` are stored on the record and projected onto its node so a
+walk can read them without a second lookup. The loader refuses a file where the
+two disagree — and enforcing that surfaced a real bug, since two paths bumped
+`version` on the record alone and left the mirror stale. `graph.sync_assumption`
+is now the one place that writes it.
+
+What persistence does **not** yet cover: the resolver, and the execution state
+in `Runner`. A reloaded graph answers, invalidates and reports health
+identically; rebuilding a `Walker` still needs a resolver, and resuming a
+selective re-execution still needs the task registry. Those are the next two
+milestones.
+
 ## MCP — read-only, experimental
 
 ```bash
@@ -330,6 +406,7 @@ GRAPH.md                     the ontology, parsed at import
 contextmesh/
   ontology.py                GRAPH.md → the schema every write is checked against
   model.py  graph.py         typed nodes, typed edges, no untyped code path
+                             and the versioned snapshot it saves and reloads as
   resolve.py                 entity resolution — one id per real-world thing
   pipeline.py                CHUNK → EXTRACT → RESOLVE → LINK → EMBED → PRUNE
   traverse.py                walks, evidence paths, the four dead-end reasons
@@ -345,7 +422,7 @@ contextmesh_mcp/             read-only MCP server (optional extra, 3.10+)
 dashboard/                   the rebuilt dashboard
 docs/                        the capture spec and the architecture notes
 examples/                    the original standalone control-layer sketch
-tests/                       183 tests over the invariants above
+tests/                       266 tests over the invariants above
 ```
 
 ## Staying publishable

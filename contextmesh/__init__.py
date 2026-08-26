@@ -10,7 +10,8 @@
 The pieces:
 
 - ``ontology``    GRAPH.md parsed into the schema every write is checked against
-- ``graph``       typed nodes and typed edges, with no untyped code path
+- ``graph``       typed nodes and typed edges, with no untyped code path,
+                  plus the versioned snapshot the graph saves and reloads as
 - ``resolve``     entity resolution — one id per real-world thing
 - ``pipeline``    CHUNK → EXTRACT → RESOLVE → LINK → EMBED → PRUNE
 - ``traverse``    walks that return the evidence path, and classify the failures
@@ -35,7 +36,12 @@ from .execute import (
     TaskState,
     Verdict,
 )
-from .graph import ContextGraph
+from .graph import (
+    SNAPSHOT_SCHEMA,
+    SNAPSHOT_VERSION,
+    ContextGraph,
+    SnapshotError,
+)
 from .health import Signal, check, report
 from .metrics import snapshot
 from .model import (
@@ -82,7 +88,10 @@ __all__ = [
     "RunLedger",
     "RunReport",
     "Runner",
+    "SNAPSHOT_SCHEMA",
+    "SNAPSHOT_VERSION",
     "Signal",
+    "SnapshotError",
     "Task",
     "TaskState",
     "Verdict",

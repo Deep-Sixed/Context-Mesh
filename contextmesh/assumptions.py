@@ -227,6 +227,9 @@ class AssumptionLedger:
             new = self.assume(replacement, created_by=assumption.created_by)
             new.version = assumption.version + 1
             new.supersedes = assumption_id
+            # The node carries a copy of version; bumping only the record left
+            # the two disagreeing, which the snapshot loader now catches.
+            graph.sync_assumption(new)
             assumption.superseded_by = new.id
             graph.add_edge(new.id, EdgeType.SUPERSEDES, assumption_id)
             report.replacement_id = new.id
