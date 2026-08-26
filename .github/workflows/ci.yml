@@ -90,6 +90,10 @@ jobs:
           grep -q "ROUND 1 · 5 executed, 0 cached" /tmp/exec.txt
           grep -q "3 executed, 2 cached" /tmp/exec.txt
           grep -q "chain intact: True" /tmp/exec.txt
+          # The blast radius must be readable off the ledger on its own, with
+          # both halves: what fell, and what was deliberately left standing.
+          grep -q "RECEIPT · the whole event, read back off the ledger alone" /tmp/exec.txt
+          grep -q "stood      15 node(s) untouched" /tmp/exec.txt
           # The disproof has to come from the auditor reading the advisory feed,
           # not from the script announcing it.
           grep -q "discovered by an auditor" /tmp/exec.txt

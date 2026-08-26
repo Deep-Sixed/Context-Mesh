@@ -38,6 +38,7 @@ reaches in and flips a node.
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
@@ -180,6 +181,40 @@ class Task:
 
 
 # ── the ledger ───────────────────────────────────────────────────────────
+#: Values a ledger entry's structured payload may contain. Anything else has no
+#: single canonical JSON form — a set has no order, bytes have no encoding, NaN
+#: is not JSON at all — so a digest taken over it would depend on how Python
+#: happened to render it that run. Rejecting them at the door keeps the chain
+#: meaningful rather than merely computed.
+_JSON_SCALARS = (str, bool, int, float, type(None))
+
+
+def _canonical(value: Any, *, path: str = "data") -> Any:
+    """Return `value` in its canonical JSON form, or refuse it."""
+    if isinstance(value, bool) or value is None or isinstance(value, str):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            raise ExecutionError(f"{path}: {value!r} has no JSON form")
+        return value
+    if isinstance(value, dict):
+        for key in value:
+            if not isinstance(key, str):
+                raise ExecutionError(f"{path}: keys must be strings, got {key!r}")
+        return {k: _canonical(v, path=f"{path}.{k}") for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        # A tuple round-trips out of JSON as a list, so store it as one now
+        # rather than letting the type change between write and read.
+        return [_canonical(v, path=f"{path}[{i}]") for i, v in enumerate(value)]
+    raise ExecutionError(
+        f"{path}: {type(value).__name__} is not JSON-deterministic; "
+        f"ledger data accepts {', '.join(t.__name__ for t in _JSON_SCALARS)}, "
+        f"list, tuple and dict with string keys"
+    )
+
+
 @dataclass(frozen=True)
 class LedgerEntry:
     seq: int
@@ -189,20 +224,43 @@ class LedgerEntry:
     detail: str
     node_id: Optional[str] = None
     assumption_id: Optional[str] = None
+    #: Structured payload. On a DISPROVED entry this is the whole blast-radius
+    #: receipt, so the event can be read off the ledger without the graph.
+    data: Dict[str, Any] = field(default_factory=dict)
     digest: str = ""
 
-    def payload(self) -> str:
-        return "|".join(
-            [
-                str(self.seq),
-                str(self.round),
-                self.event.value,
-                self.task,
-                self.detail,
-                self.node_id or "",
-                self.assumption_id or "",
-            ]
-        )
+    def payload(self, previous: str) -> bytes:
+        """The exact bytes the digest is taken over.
+
+        Canonical JSON rather than delimiter-joined fields: `detail` is free
+        text, and any separator that can appear inside a field makes two
+        different entries capable of producing one payload. Sorted keys and no
+        whitespace make the encoding a function of the values alone.
+        """
+        return json.dumps(
+            {
+                "seq": self.seq,
+                "round": self.round,
+                "event": self.event.value,
+                "task": self.task,
+                "detail": self.detail,
+                "node_id": self.node_id,
+                "assumption_id": self.assumption_id,
+                "data": self.data,
+                "previous": previous,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+
+    def compute_digest(self, previous: str) -> str:
+        return hashlib.sha256(self.payload(previous)).hexdigest()
+
+    @property
+    def short_digest(self) -> str:
+        """For display only. Comparisons use the full digest."""
+        return self.digest[:12]
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -213,6 +271,7 @@ class LedgerEntry:
             "detail": self.detail,
             "node_id": self.node_id,
             "assumption_id": self.assumption_id,
+            "data": dict(self.data),
             "digest": self.digest,
         }
 
@@ -220,16 +279,19 @@ class LedgerEntry:
 class RunLedger:
     """Append-only, and checkably so.
 
-    Every entry's digest covers the digest before it, so a rewritten or dropped
-    entry breaks the chain and :meth:`verify` says so. "Append-only" as a
-    convention is just a promise; as a hash chain it is a test.
+    Every entry's digest is SHA-256 over the canonical JSON of its own fields
+    *and* the digest before it, so a rewritten, reordered or dropped entry
+    breaks the chain and :meth:`verify` says so. "Append-only" as a convention
+    is just a promise; as a hash chain it is a test. Note what that buys and
+    what it does not: tampering is *detectable*, not prevented.
 
     There are no wall-clock timestamps in it. The package guarantees builds that
     are byte-identical across runs and hash seeds, and a clock would be the one
-    field in the record that could not be reproduced.
+    field in the record that could not be reproduced. For the same reason
+    :func:`_canonical` refuses payload values without a single JSON form.
     """
 
-    GENESIS = "contextmesh"
+    GENESIS = "0" * 64
 
     def __init__(self) -> None:
         self._entries: List[LedgerEntry] = []
@@ -248,6 +310,7 @@ class RunLedger:
         *,
         node_id: Optional[str] = None,
         assumption_id: Optional[str] = None,
+        data: Optional[Dict[str, Any]] = None,
     ) -> LedgerEntry:
         previous = self._entries[-1].digest if self._entries else self.GENESIS
         entry = LedgerEntry(
@@ -258,9 +321,11 @@ class RunLedger:
             detail=detail,
             node_id=node_id,
             assumption_id=assumption_id,
+            data=_canonical(dict(data or {})),
         )
-        digest = hashlib.sha1(f"{previous}|{entry.payload()}".encode("utf-8")).hexdigest()[:12]
-        entry = LedgerEntry(**{**entry.__dict__, "digest": digest})
+        entry = LedgerEntry(
+            **{**entry.__dict__, "digest": entry.compute_digest(previous)}
+        )
         self._entries.append(entry)
         return entry
 
@@ -269,8 +334,7 @@ class RunLedger:
         for index, entry in enumerate(self._entries, start=1):
             if entry.seq != index:
                 return False
-            expect = hashlib.sha1(f"{previous}|{entry.payload()}".encode("utf-8")).hexdigest()[:12]
-            if expect != entry.digest:
+            if entry.compute_digest(previous) != entry.digest:
                 return False
             previous = entry.digest
         return True
@@ -279,11 +343,26 @@ class RunLedger:
     def head(self) -> str:
         return self._entries[-1].digest if self._entries else self.GENESIS
 
+    @property
+    def short_head(self) -> str:
+        return self.head[:12]
+
     def of(self, task: str) -> Tuple[LedgerEntry, ...]:
         return tuple(e for e in self._entries if e.task == task)
 
     def count(self, event: Event) -> int:
         return sum(1 for e in self._entries if e.event is event)
+
+    def receipts(self) -> Tuple[Dict[str, Any], ...]:
+        """Every blast radius that happened, read off the ledger alone.
+
+        Each receipt answers the whole chain — which assumption failed, what
+        evidence disproved it, exactly what fell and why, and what was left
+        standing — without needing the graph the run was performed against.
+        """
+        return tuple(
+            dict(e.data) for e in self._entries if e.event is Event.DISPROVED and e.data
+        )
 
     def to_dict(self) -> List[Dict[str, Any]]:
         return [e.to_dict() for e in self._entries]
@@ -749,6 +828,15 @@ class Runner:
             f"disproof from {task.name}: {reason}",
             attrs={"kind": "disproof"},
         )
+        report = self.assumptions.reject(assumption.id, evidence_id=evidence.id)
+
+        # The whole event as one entry: which ground failed, what disproved it,
+        # exactly what fell and by which chain, and what was deliberately left
+        # standing. Reconstructing that by aggregating the per-node entries
+        # below would work, but it would mean the ledger can only answer
+        # "what fell" to a reader who already knows how to reassemble it.
+        # Saying three nodes fell proves half of selective invalidation; the
+        # preserved set is the other half, so it goes in the same receipt.
         self.ledger.record(
             self.round,
             Event.DISPROVED,
@@ -756,8 +844,18 @@ class Runner:
             reason,
             node_id=evidence.id,
             assumption_id=assumption.id,
+            data={
+                "assumption_id": assumption.id,
+                "assumption": assumption.statement,
+                "evidence_id": evidence.id,
+                "reason": reason,
+                "disproved_by": task.name,
+                "invalidated": {
+                    node_id: list(chain) for node_id, chain in report.invalidated.items()
+                },
+                "preserved": list(report.preserved),
+            },
         )
-        report = self.assumptions.reject(assumption.id, evidence_id=evidence.id)
 
         for name in self._order:
             other = self._tasks[name]

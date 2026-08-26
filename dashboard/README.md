@@ -69,3 +69,15 @@ entity has somewhere to go.
   113 nodes in four evenly sized clusters. This one shows whatever
   `contextmesh/corpus.py` built. Matching the original's numbers would have
   meant hard-coding them.
+- **The capture's branding is not reproduced.** Three strings are reworded,
+  because they name an organisation this project has no connection to and
+  carrying them over would imply a provenance there is no evidence for:
+
+  | The capture | The rebuild |
+  |---|---|
+  | `Claude Graph Engineering · Context Mesh` | `Context Mesh · a typed context graph` |
+  | `What Claude resolved, wired to whatever shares a typed edge` | `What the resolver folded, wired to whatever shares a typed edge` |
+  | `Claude · Graph engineering` | `Context Mesh · GRAPH.md is the schema` |
+
+  `docs/DASHBOARD_SPEC.md` still records what the frames actually said. That is
+  a record of the source material, not a claim about this repository.

@@ -1,12 +1,16 @@
 """Selective re-execution: the rerun touches the blast radius and nothing else."""
 
 import dataclasses
+import json
 import unittest
 
 from contextmesh.execute import (
     Advisories,
     AuditContext,
+    Event,
     ExecutionError,
+    LedgerEntry,
+    RunLedger,
     Runner,
     TaskState,
     Verdict,
@@ -422,6 +426,212 @@ class DemoTest(unittest.TestCase):
         self.assertEqual(a.runner.ledger.head, b.runner.ledger.head)
         self.assertEqual(a.runner.graph.to_dict(), b.runner.graph.to_dict())
         self.assertEqual(a.runner.to_dict(), b.runner.to_dict())
+
+
+class LedgerDigestTest(unittest.TestCase):
+    """The digest is taken over canonical JSON, not joined fields."""
+
+    def entries(self, *specs):
+        ledger = RunLedger()
+        for task, detail in specs:
+            ledger.record(1, Event.EXECUTED, task, detail)
+        return ledger
+
+    def test_a_separator_inside_a_field_cannot_forge_a_digest(self):
+        # Joined on "|", both of these render as ...|a|b|c|... — the exact
+        # collision canonical JSON exists to rule out.
+        first = self.entries(("a", "b|c"))
+        second = self.entries(("a|b", "c"))
+        self.assertNotEqual(first.head, second.head)
+        self.assertTrue(first.verify())
+        self.assertTrue(second.verify())
+
+    def test_identical_content_gives_an_identical_head(self):
+        self.assertEqual(
+            self.entries(("a", "one"), ("b", "two")).head,
+            self.entries(("a", "one"), ("b", "two")).head,
+        )
+
+    def test_the_digest_is_a_full_sha256(self):
+        ledger = self.entries(("a", "one"))
+        self.assertEqual(len(ledger.head), 64)
+        self.assertEqual(ledger.short_head, ledger.head[:12])
+        self.assertEqual(ledger.entries[0].short_digest, ledger.entries[0].digest[:12])
+
+    def test_the_first_entry_chains_off_genesis(self):
+        ledger = self.entries(("a", "one"))
+        self.assertEqual(
+            ledger.entries[0].digest, ledger.entries[0].compute_digest(RunLedger.GENESIS)
+        )
+
+    def test_reordering_two_entries_breaks_the_chain(self):
+        ledger = self.entries(("a", "one"), ("b", "two"))
+        ledger._entries[0], ledger._entries[1] = ledger._entries[1], ledger._entries[0]
+        self.assertFalse(ledger.verify())
+
+    def test_a_rewritten_receipt_breaks_the_chain(self):
+        ledger = RunLedger()
+        ledger.record(1, Event.DISPROVED, "t", "why", data={"invalidated": {"a": ["x"]}})
+        self.assertTrue(ledger.verify())
+        ledger._entries[0].data["invalidated"]["a"] = ["something else"]
+        self.assertFalse(ledger.verify())
+
+    def test_unicode_survives_the_round_trip(self):
+        ledger = self.entries(("t", "argon2 → bcrypt · CVE-2026-9999"))
+        self.assertTrue(ledger.verify())
+
+
+class LedgerDataGuardTest(unittest.TestCase):
+    """Payload values without one canonical JSON form are refused, not coerced."""
+
+    def record(self, data):
+        RunLedger().record(1, Event.EXECUTED, "t", "d", data=data)
+
+    def test_a_set_is_refused(self):
+        with self.assertRaises(ExecutionError) as caught:
+            self.record({"nodes": {"a", "b"}})
+        self.assertIn("not JSON-deterministic", str(caught.exception))
+
+    def test_bytes_are_refused(self):
+        with self.assertRaises(ExecutionError):
+            self.record({"blob": b"\x00"})
+
+    def test_a_nan_is_refused(self):
+        with self.assertRaises(ExecutionError):
+            self.record({"score": float("nan")})
+
+    def test_an_infinity_is_refused(self):
+        with self.assertRaises(ExecutionError):
+            self.record({"score": float("inf")})
+
+    def test_a_non_string_key_is_refused(self):
+        with self.assertRaises(ExecutionError):
+            self.record({"m": {1: "a"}})
+
+    def test_an_arbitrary_object_is_refused(self):
+        with self.assertRaises(ExecutionError):
+            self.record({"task": object()})
+
+    def test_nesting_is_walked_not_just_the_top_level(self):
+        with self.assertRaises(ExecutionError) as caught:
+            self.record({"outer": [{"inner": {"deep"}}]})
+        self.assertIn("outer[0].inner", str(caught.exception))
+
+    def test_a_tuple_is_stored_as_the_list_it_reads_back_as(self):
+        ledger = RunLedger()
+        entry = ledger.record(1, Event.EXECUTED, "t", "d", data={"xs": ("a", "b")})
+        self.assertEqual(entry.data["xs"], ["a", "b"])
+        self.assertTrue(ledger.verify())
+
+    def test_the_ordinary_payload_types_pass(self):
+        ledger = RunLedger()
+        ledger.record(
+            1, Event.EXECUTED, "t", "d",
+            data={"s": "x", "i": 1, "f": 1.5, "b": True, "n": None, "l": [1], "d": {"k": "v"}},
+        )
+        self.assertTrue(ledger.verify())
+
+
+class ReceiptTest(unittest.TestCase):
+    """One entry carries the whole blast radius, so the ledger can be read alone."""
+
+    def setUp(self):
+        self.run = demo()
+        self.ledger = self.run.runner.ledger
+        self.receipts = self.ledger.receipts()
+
+    def test_one_receipt_per_disproof(self):
+        self.assertEqual(len(self.receipts), 1)
+        self.assertEqual(self.ledger.count(Event.DISPROVED), 1)
+
+    def test_it_names_the_ground_the_evidence_and_the_auditor(self):
+        receipt = self.receipts[0]
+        report = self.run.invalidations[0]
+        self.assertEqual(receipt["assumption_id"], report.assumption_id)
+        self.assertEqual(receipt["assumption"], "argon2-cffi has no open advisory")
+        self.assertEqual(receipt["disproved_by"], "hashing")
+        self.assertIn("CVE-2026-9999", receipt["reason"])
+        self.assertIn("disproof", self.run.runner.graph.node(receipt["evidence_id"]).label)
+
+    def test_it_carries_the_closure_with_a_reason_chain_for_each_node(self):
+        receipt = self.receipts[0]
+        report = self.run.invalidations[0]
+        self.assertEqual(set(receipt["invalidated"]), set(report.invalidated))
+        for node_id, chain in receipt["invalidated"].items():
+            self.assertEqual(chain, report.invalidated[node_id])
+            self.assertTrue(chain, f"{node_id} has an empty chain")
+
+    def test_it_carries_the_preserved_set_as_well(self):
+        receipt = self.receipts[0]
+        self.assertEqual(receipt["preserved"], self.run.invalidations[0].preserved)
+        self.assertNotIn(
+            self.run.runner["schema"].node_id, receipt["invalidated"]
+        )
+        self.assertIn(self.run.runner["schema"].node_id, receipt["preserved"])
+
+    def test_the_per_node_events_are_kept_alongside_it(self):
+        # The receipt is the atomic event; these are each node's own history.
+        # Both are wanted, so the duplication is deliberate.
+        invalidated = [e for e in self.ledger.entries if e.event is Event.INVALIDATED]
+        self.assertEqual([e.task for e in invalidated], ["hashing", "routes", "rate_limit"])
+        for entry in invalidated:
+            self.assertTrue(entry.detail)
+
+    def test_the_receipt_is_covered_by_the_chain(self):
+        self.assertTrue(self.ledger.verify())
+        entry = next(e for e in self.ledger.entries if e.event is Event.DISPROVED)
+        self.assertEqual(entry.digest, entry.compute_digest(
+            self.ledger.entries[entry.seq - 2].digest
+        ))
+
+
+class ReplayTest(unittest.TestCase):
+    """Answer the four questions from serialised ledger entries and nothing else."""
+
+    def setUp(self):
+        run = demo()
+        self.expected = run.invalidations[0]
+        self.tasks = run.runner
+        # Round-trip through JSON: whatever survives this is all a reader gets.
+        self.rows = json.loads(json.dumps(run.runner.ledger.to_dict()))
+
+    def replay(self):
+        for row in self.rows:
+            if row["event"] == "disproved" and row["data"]:
+                return row["data"]
+        raise AssertionError("no receipt in the ledger")
+
+    def test_what_assumption_failed(self):
+        self.assertEqual(self.replay()["assumption_id"], self.expected.assumption_id)
+
+    def test_what_evidence_disproved_it(self):
+        self.assertTrue(self.replay()["evidence_id"])
+        self.assertIn("CVE-2026-9999", self.replay()["reason"])
+
+    def test_what_exactly_fell_and_why(self):
+        invalidated = self.replay()["invalidated"]
+        self.assertEqual(set(invalidated), set(self.expected.invalidated))
+        for node_id, chain in invalidated.items():
+            self.assertEqual(" → ".join(chain), self.expected.why(node_id))
+
+    def test_what_explicitly_survived(self):
+        self.assertEqual(self.replay()["preserved"], self.expected.preserved)
+
+    def test_the_chain_verifies_off_the_serialised_rows(self):
+        previous = RunLedger.GENESIS
+        for row in self.rows:
+            entry = LedgerEntry(
+                seq=row["seq"],
+                round=row["round"],
+                event=Event(row["event"]),
+                task=row["task"],
+                detail=row["detail"],
+                node_id=row["node_id"],
+                assumption_id=row["assumption_id"],
+                data=row["data"],
+            )
+            self.assertEqual(entry.compute_digest(previous), row["digest"])
+            previous = row["digest"]
 
 
 if __name__ == "__main__":
