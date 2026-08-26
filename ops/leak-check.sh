@@ -12,13 +12,25 @@ set -uo pipefail
 
 BASE="${1:-}"
 RANGE=""
-[ -n "$BASE" ] && RANGE="$BASE..HEAD"
+if [ -n "$BASE" ]; then
+  # Silently scanning the wrong range is worse than not scanning: it reports
+  # success without having checked. CI passes an exact SHA for this reason —
+  # `git fetch origin main` sets FETCH_HEAD only, so origin/main may not exist
+  # in the runner's checkout and `origin/main..HEAD` would cover the wrong set.
+  if ! git rev-parse --verify --quiet "$BASE^{commit}" >/dev/null; then
+    printf 'leak-check: base ref %s does not resolve here\n' "$BASE" >&2
+    printf '            pass a commit that exists, or no argument for full history\n' >&2
+    exit 2
+  fi
+  RANGE="$BASE..HEAD"
+fi
 FAILED=0
 
-# The checker states the patterns it looks for, so a plain scan of the tree
-# finds them in this file. Exclude it from the content pass; its own metadata is
-# still covered, and its patterns are reviewed like any other code.
-SCAN=(. ":(exclude)ops/leak-check.sh")
+# These two files exist to describe leaks, so scanning them for leaks always
+# fires: this script states the patterns it searches for, and the accepted-
+# authors list holds addresses on purpose. Both are excluded from the content
+# pass and reviewed like any other code; commit metadata still covers them.
+SCAN=(. ":(exclude)ops/leak-check.sh" ":(exclude)ops/accepted-authors.txt")
 
 say()  { printf '%s\n' "$*"; }
 fail() { printf '  ✗ %s\n' "$*"; FAILED=1; }
