@@ -357,6 +357,7 @@ directory of three separately versioned files:
 ```
 session/
   session.json           contextmesh.session  v1  — the manifest, and the commit
+  session.lock           the writer lock, created once and never deleted
   graph-000003.json      contextmesh.graph    v1
   resolver-000003.json   contextmesh.resolver v1
 ```
@@ -384,6 +385,44 @@ rather than correctness. The guarantee is reader-visible and tested as such: a
 process holding `session.json` open across a save still reads the previous
 generation whole, because `os.replace` gives the manifest a new inode rather
 than rewriting the old one in place.
+
+**Generations are atomic against a crash. They do nothing against a second
+writer**, and that failure is nastier because nothing about it looks torn. Two
+processes reading generation 5 both choose 6 and overwrite each other's
+companions. Worse, one can commit 6 and sweep while the other has already
+written 7 but not yet swapped — leaving a manifest that is atomically valid and
+names files the first process just deleted:
+
+```
+end   : ['session.json']
+manifest -> generation 3   graph-000003.json exists: False
+```
+
+That is a real reproduction, staged across two processes, and it is now a test.
+So a save takes the directory's writer lock for the **whole** transaction —
+from reading the current generation to sweeping the superseded one. Locking only
+the swap would still allow both races above. The lock is `flock`/`msvcrt`, held
+by the kernel rather than by convention, so it is released when the holder dies
+however it dies; there is no stale-lock heuristic to guess wrong under exactly
+the load that made a save slow. A second writer is refused, not queued:
+
+```
+SessionLockedError: … is already being written by pid 4127 on host; one writer at a time
+```
+
+Readers never take it. The manifest swap already gives them a consistent view,
+and a read that had to wait behind a checkpoint would be a worse trade.
+
+Serialising writers stops corruption; it does not stop the second writer from
+silently discarding the first one's work. So a session that has a home also
+checks that home before committing: if the directory has moved on since this
+session last committed there, the save is refused rather than clobbering. The
+`Checkpointer` treats lock contention as a skipped commit — the mutation stays
+pending for the next one — and counts it, because a server that keeps losing
+the race is a configuration problem worth being able to see.
+
+Multi-writer *coordination* is out of scope: two servers on one directory get
+one clear refusal each time they collide, not a merge.
 
 **The resolver cannot be rebuilt from the graph, and that is the point.**
 `resolve()` writes a scored match back into its alias table, so a run learns
@@ -559,7 +598,7 @@ contextmesh_mcp/             read-only MCP server (optional extra, 3.10+)
 dashboard/                   the rebuilt dashboard
 docs/                        the capture spec and the architecture notes
 examples/                    the original standalone control-layer sketch
-tests/                       391 tests over the invariants above
+tests/                       407 tests over the invariants above
 ```
 
 ## Staying publishable

@@ -39,9 +39,11 @@ from __future__ import annotations
 
 import json
 import os
+import socket
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from contextmesh.assumptions import AssumptionLedger
 from contextmesh.demo import run as demo_run
@@ -58,6 +60,7 @@ SESSION_SCHEMA = "contextmesh.session"
 SESSION_VERSION = 1
 
 SESSION_FILE = "session.json"
+LOCK_FILE = "session.lock"
 GRAPH_STEM = "graph"
 RESOLVER_STEM = "resolver"
 
@@ -77,6 +80,16 @@ def generation_name(stem: str, generation: int) -> str:
     is the exact failure generations exist to prevent.
     """
     return f"{stem}-{generation:06d}.json"
+
+
+class SessionLockedError(Exception):
+    """Raised when another process is already writing this session directory.
+
+    Not a ``SessionError``: the directory is fine, and so is the session. The
+    only problem is timing, and a caller that wants to wait and retry needs to
+    tell that apart from "this directory cannot be restored". ``Checkpointer``
+    treats it as a skipped commit; the mutation stays pending for the next one.
+    """
 
 
 class SessionError(ValueError):
@@ -120,6 +133,90 @@ def _fsync_dir(path: Path) -> None:
         pass
     finally:
         os.close(handle)
+
+
+def _lock_exclusive(handle: Any) -> None:
+    """Take an exclusive lock on an open file, without waiting.
+
+    Kernel-held rather than advisory-by-convention, which matters more than the
+    portability cost: a lock the kernel owns is released when the holder dies,
+    however it dies. A lock file with a pid in it has to guess whether a stale
+    holder is dead or merely slow, and it guesses wrong exactly when a machine
+    is under the load that made the save slow in the first place.
+    """
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - Windows
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        return
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock(handle: Any) -> None:
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - Windows
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _holder(path: Path) -> str:
+    """Best-effort description of whoever holds the lock, for the error."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return f"pid {data['pid']} on {data['host']}"
+    except (OSError, ValueError, KeyError, TypeError):
+        return "another process"
+
+
+@contextmanager
+def writer_lock(directory: Any) -> Iterator[Path]:
+    """Serialise writers over one session directory.
+
+    Generations make a save atomic *against a crash*. They do nothing against a
+    second writer, and the failure there is worse than a torn file because it
+    ends with a valid-looking manifest. Two processes reading generation 5 both
+    choose 6 and overwrite each other's companions; worse, one can commit 6 and
+    sweep while the other has already written 7 but not yet swapped — leaving a
+    manifest naming files that the first process just deleted.
+
+    So the lock has to span the whole transaction, from reading the current
+    generation to sweeping the superseded one. Locking only the swap would
+    still allow both of those.
+
+    The lock file is created once and never deleted. Deleting it on release
+    would let a third process create a *new* file at the same name while a
+    fourth still holds the old inode, and both would believe they had the lock.
+    """
+    target = Path(directory)
+    path = target / LOCK_FILE
+    handle = open(path, "a+", encoding="utf-8")
+    try:
+        try:
+            _lock_exclusive(handle)
+        except OSError:
+            raise SessionLockedError(
+                f"{target} is already being written by {_holder(path)}; "
+                "one writer at a time"
+            ) from None
+        try:
+            handle.seek(0)
+            handle.truncate()
+            handle.write(
+                json.dumps({"pid": os.getpid(), "host": socket.gethostname()}) + "\n"
+            )
+            handle.flush()
+            yield path
+        finally:
+            _unlock(handle)
+    finally:
+        handle.close()
 
 
 def _bare_name(value: Any, field_name: str) -> str:
@@ -378,10 +475,32 @@ class Session:
 
         Superseded files are removed afterwards. That cleanup is the only step
         allowed to fail without losing the save.
+
+        The whole transaction runs under the directory's writer lock, from
+        reading the current generation to sweeping the superseded one. Readers
+        never take it: the manifest swap already gives them a consistent view,
+        and a read that had to wait for a checkpoint would be a worse trade.
         """
         target = Path(directory)
         target.mkdir(parents=True, exist_ok=True)
-        generation = self._live_generation(target) + 1
+        with writer_lock(target):
+            return self._commit(target)
+
+    def _commit(self, target: Path) -> Path:
+        """The transaction itself. Only called holding the writer lock."""
+        live = self._live_generation(target)
+        # Serialising writers stops the directory being corrupted; it does not
+        # stop the second writer from silently discarding the first one's work.
+        # A session that has a home is checked against it: if the directory
+        # moved on since this session last committed there, someone else has
+        # written, and overwriting them wholesale is not a thing to do quietly.
+        if self.path is not None and target == self.path and live != self.generation:
+            raise SessionError(
+                f"{target} is at generation {live} but this session last "
+                f"committed generation {self.generation}; another writer has "
+                "committed since, and saving now would discard their work"
+            )
+        generation = live + 1
         payload = self.manifest(generation)
 
         graph_path = target / payload["graph"]
@@ -410,7 +529,10 @@ class Session:
         os.replace(staged, target / SESSION_FILE)
         _fsync_dir(target)
 
-        self._sweep(target, keep={SESSION_FILE, payload["graph"], payload["resolver"]})
+        self._sweep(
+            target,
+            keep={SESSION_FILE, LOCK_FILE, payload["graph"], payload["resolver"]},
+        )
         self.generation = generation
         return target
 
@@ -418,9 +540,11 @@ class Session:
     def _sweep(directory: Path, keep: Any) -> None:
         """Delete superseded generations and abandoned staging files.
 
-        Runs after the commit, so anything it removes is already unreferenced.
+        Runs after the commit, still under the writer lock, so anything it
+        removes is unreferenced and no other writer is mid-transaction.
         Deliberately narrow: only files this build's own naming produces are
-        candidates, so a directory holding something else keeps it.
+        candidates, so a directory holding something else keeps it — the lock
+        file included, since a queued writer is holding that very inode.
         """
         for entry in directory.iterdir():
             name = entry.name
@@ -637,6 +761,10 @@ class Checkpointer:
         #: ``on-exit`` server that was never asked anything writes nothing.
         self.pending = 0
         self.commits = 0
+        #: Commits skipped because another process held the writer lock. The
+        #: mutations stay pending, so nothing is lost — but a server that keeps
+        #: losing the race is a configuration problem worth being able to see.
+        self.contended = 0
 
     @property
     def durable(self) -> bool:
@@ -650,9 +778,19 @@ class Checkpointer:
         return None
 
     def commit(self) -> Optional[Path]:
+        """Write pending mutations back, unless someone else is writing.
+
+        Contention is expected and benign — the mutations stay pending and the
+        next commit picks them up — so it is counted rather than raised. Any
+        other failure is a real problem with the directory and propagates.
+        """
         if not self.durable or not self.pending:
             return None
-        written = self.session.checkpoint()
+        try:
+            written = self.session.checkpoint()
+        except SessionLockedError:
+            self.contended += 1
+            return None
         self.pending = 0
         self.commits += 1
         return written

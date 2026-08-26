@@ -215,10 +215,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         mcp.run(transport="stdio")
     finally:
         # A clean shutdown is the last chance for on-exit, and the safety net
-        # for every-ask if a mutation landed after the final commit.
-        written = _CHECKPOINTER.close()
-        if written is not None:
-            print(f"context-mesh: checkpointed {written}", file=sys.stderr)
+        # for every-ask if a mutation landed after the final commit. Reported
+        # the same way a per-question checkpoint failure is: a shutdown that
+        # cannot write is worth saying out loud, and worth saying *once*, not
+        # worth replacing the exit code of whatever stopped the server.
+        try:
+            written = _CHECKPOINTER.close()
+        except Exception as exc:
+            print(f"context-mesh: final checkpoint failed: {exc}", file=sys.stderr)
+        else:
+            if written is not None:
+                print(f"context-mesh: checkpointed {written}", file=sys.stderr)
     return 0
 
 

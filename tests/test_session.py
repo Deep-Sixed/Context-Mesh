@@ -27,6 +27,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -37,6 +38,7 @@ from contextmesh.traverse import DEFAULT_POLICY, EdgeType
 from contextmesh_mcp import tools
 from contextmesh_mcp.session import (
     GRAPH_STEM,
+    LOCK_FILE,
     RESOLVER_STEM,
     SESSION_FILE,
     SESSION_SCHEMA,
@@ -44,9 +46,11 @@ from contextmesh_mcp.session import (
     Checkpointer,
     Session,
     SessionError,
+    SessionLockedError,
     WalkerConfig,
     check_agreement,
     generation_name,
+    writer_lock,
 )
 
 ROUNDS = 4
@@ -103,6 +107,7 @@ class RoundTripTest(unittest.TestCase):
             names(self.dir),
             sorted([
                 SESSION_FILE,
+                LOCK_FILE,
                 generation_name(GRAPH_STEM, 1),
                 generation_name(RESOLVER_STEM, 1),
             ]),
@@ -200,6 +205,7 @@ class GenerationTest(unittest.TestCase):
     def expected(self, generation: int) -> list:
         return sorted([
             SESSION_FILE,
+            LOCK_FILE,
             generation_name(GRAPH_STEM, generation),
             generation_name(RESOLVER_STEM, generation),
         ])
@@ -1131,6 +1137,7 @@ class ProcessBoundaryTest(unittest.TestCase):
             sorted(wrote["files"]),
             sorted([
                 SESSION_FILE,
+                LOCK_FILE,
                 generation_name(GRAPH_STEM, 1),
                 generation_name(RESOLVER_STEM, 1),
             ]),
@@ -1223,6 +1230,256 @@ class ProcessBoundaryTest(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 2)
         self.assertIn("no meaning for --session", proc.stderr)
+
+
+class ConcurrentWriterTest(unittest.TestCase):
+    """Generations survive a crash. They do nothing about a second writer.
+
+    Two processes reading generation 5 both choose 6 and overwrite each other's
+    companions. Worse, one can commit 6 and sweep while the other has already
+    written 7 but not yet swapped — leaving a manifest that is atomically valid
+    and names files the first process just deleted. That failure is nastier than
+    a torn file precisely because nothing about it looks torn.
+
+    So the lock spans the whole transaction, from reading the current generation
+    to sweeping the superseded one.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.dir = Path(self.tmp) / "session"
+        build().save(self.dir)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    # ── the lock itself ──────────────────────────────────────────────────
+    def test_a_second_acquire_is_refused_while_the_first_is_held(self):
+        with writer_lock(self.dir):
+            with self.assertRaises(SessionLockedError) as caught:
+                with writer_lock(self.dir):
+                    pass
+        self.assertIn("one writer at a time", str(caught.exception))
+
+    def test_the_error_names_the_holder(self):
+        import os
+
+        with writer_lock(self.dir):
+            with self.assertRaises(SessionLockedError) as caught:
+                with writer_lock(self.dir):
+                    pass
+        self.assertIn(str(os.getpid()), str(caught.exception))
+
+    def test_the_lock_is_released_on_the_way_out(self):
+        with writer_lock(self.dir):
+            pass
+        with writer_lock(self.dir):
+            pass
+
+    def test_the_lock_is_released_even_when_the_body_raises(self):
+        with self.assertRaises(ZeroDivisionError):
+            with writer_lock(self.dir):
+                1 / 0
+        with writer_lock(self.dir):
+            pass
+
+    def test_a_locked_directory_refuses_a_save(self):
+        session = Session.load(self.dir)
+        with writer_lock(self.dir):
+            with self.assertRaises(SessionLockedError):
+                session.checkpoint()
+        self.assertEqual(manifest(self.dir)["generation"], 1)
+
+    def test_the_lock_file_is_never_swept(self):
+        """A queued writer is holding that exact inode."""
+        for _ in range(3):
+            Session.load(self.dir).checkpoint()
+            self.assertIn(LOCK_FILE, names(self.dir))
+
+    def test_the_sweep_honours_keep(self):
+        """Two things protect the lock file, and this pins the second.
+
+        It survives mainly because it does not look like a generation, so
+        naming it in ``keep`` is belt-and-braces — a mutation that removes it
+        from ``keep`` changes nothing today. That redundancy is worth having
+        against a later rename, but it is only worth having if ``keep`` is
+        itself honoured, which is what this asserts: a file that *would* be
+        swept is spared when it is named.
+        """
+        spared = self.dir / generation_name(GRAPH_STEM, 99)
+        doomed = self.dir / generation_name(RESOLVER_STEM, 99)
+        for path in (spared, doomed):
+            path.write_text("{}", encoding="utf-8")
+
+        Session._sweep(self.dir, keep={SESSION_FILE, LOCK_FILE, spared.name})
+
+        self.assertTrue(spared.is_file(), "a file named in keep was swept")
+        self.assertFalse(doomed.is_file(), "an unreferenced generation survived")
+        self.assertIn(LOCK_FILE, names(self.dir))
+
+    def test_a_lock_file_left_behind_does_not_block_a_later_writer(self):
+        """It is kernel-held, so there is no such thing as a stale one."""
+        (self.dir / LOCK_FILE).write_text('{"pid": 999999, "host": "gone"}', encoding="utf-8")
+        Session.load(self.dir).checkpoint()
+        self.assertEqual(manifest(self.dir)["generation"], 2)
+
+    def test_a_load_never_waits_on_the_lock(self):
+        """Readers are already safe: the manifest swap is atomic."""
+        with writer_lock(self.dir):
+            self.assertEqual(Session.load(self.dir).generation, 1)
+
+    # ── the lost-update guard ────────────────────────────────────────────
+    def test_a_checkpoint_over_someone_else_s_commit_is_refused(self):
+        """Serialising writers stops corruption, not silent overwriting."""
+        mine = Session.load(self.dir)
+        Session.load(self.dir).checkpoint()  # somebody else commits generation 2
+        with self.assertRaises(SessionError) as caught:
+            mine.checkpoint()
+        message = str(caught.exception)
+        self.assertIn("another writer has committed since", message)
+        self.assertEqual(manifest(self.dir)["generation"], 2)
+
+    def test_reloading_after_a_conflict_lets_the_work_continue(self):
+        mine = Session.load(self.dir)
+        Session.load(self.dir).checkpoint()
+        with self.assertRaises(SessionError):
+            mine.checkpoint()
+        Session.load(self.dir).checkpoint()
+        self.assertEqual(manifest(self.dir)["generation"], 3)
+
+    def test_saving_into_a_different_directory_is_not_constrained(self):
+        """The guard is about a session's own home, not about saving anywhere."""
+        elsewhere = Path(self.tmp) / "elsewhere"
+        loaded = Session.load(self.dir)
+        Session.load(self.dir).checkpoint()
+        loaded.save(elsewhere)
+        self.assertEqual(manifest(elsewhere)["generation"], 1)
+
+    def test_a_built_session_may_be_saved_over_an_existing_directory(self):
+        build().save(self.dir)
+        self.assertEqual(manifest(self.dir)["generation"], 2)
+
+    # ── what the server does with contention ─────────────────────────────
+    def test_contention_leaves_the_mutation_pending_rather_than_raising(self):
+        live = Session.load(self.dir)
+        checkpointer = Checkpointer(live)
+        with writer_lock(self.dir):
+            tools.call(live, "mesh_ask", {"question": "What supports HNSW?"})
+            self.assertIsNone(checkpointer.record_mutation())
+        self.assertEqual(checkpointer.contended, 1)
+        self.assertEqual(checkpointer.commits, 0)
+        self.assertEqual(checkpointer.pending, 1)
+
+        self.assertIsNotNone(checkpointer.commit())
+        self.assertEqual(checkpointer.pending, 0)
+        self.assertEqual(manifest(self.dir)["generation"], 2)
+
+
+class ProcessLockTest(unittest.TestCase):
+    """The race, staged across two real processes.
+
+    One writer stalls in the window between the manifest swap and the sweep —
+    the interleaving that used to leave a manifest naming deleted files.
+    """
+
+    STALL = (
+        "import sys, time\n"
+        "from pathlib import Path\n"
+        "from contextmesh_mcp.session import Session\n"
+        "root, gate = Path(sys.argv[1]), Path(sys.argv[2])\n"
+        "original = Session._sweep\n"
+        "def stalling(directory, keep):\n"
+        "    gate.write_text('committed')\n"
+        "    deadline = time.time() + 60\n"
+        "    while not (gate.parent / 'b-done').exists() and time.time() < deadline:\n"
+        "        time.sleep(0.02)\n"
+        "    original(directory, keep)\n"
+        "Session._sweep = staticmethod(stalling)\n"
+        "Session.load(root).checkpoint()\n"
+        "print('A-DONE')\n"
+    )
+    CONTEND = (
+        "import sys, time\n"
+        "from pathlib import Path\n"
+        "from contextmesh_mcp.session import Session, SessionLockedError\n"
+        "root, gate = Path(sys.argv[1]), Path(sys.argv[2])\n"
+        "done = gate.parent / 'b-done'\n"
+        "deadline = time.time() + 60\n"
+        "while not gate.exists() and time.time() < deadline:\n"
+        "    time.sleep(0.02)\n"
+        "try:\n"
+        "    Session.load(root).checkpoint()\n"
+        "    print('B-COMMITTED-IN-WINDOW')\n"
+        "except SessionLockedError:\n"
+        "    print('B-REFUSED')\n"
+        "finally:\n"
+        "    done.write_text('done')\n"
+        "time.sleep(1.0)\n"
+        "again = Session.load(root)\n"
+        "again.checkpoint()\n"
+        "print('B-RETRY-GENERATION', again.generation)\n"
+    )
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.dir = Path(self.tmp) / "session"
+        self.gate = Path(self.tmp) / "gate"
+        build().save(self.dir)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def spawn(self, script):
+        return subprocess.Popen(
+            [sys.executable, "-c", script, str(self.dir), str(self.gate)],
+            cwd=REPO_ROOT,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+    def test_the_second_writer_is_refused_then_succeeds_on_retry(self):
+        first, second = self.spawn(self.STALL), self.spawn(self.CONTEND)
+        a_out, a_err = first.communicate(timeout=120)
+        b_out, b_err = second.communicate(timeout=120)
+        self.assertEqual(first.returncode, 0, a_err)
+        self.assertEqual(second.returncode, 0, b_err)
+
+        self.assertIn("A-DONE", a_out)
+        self.assertIn("B-REFUSED", b_out)
+        self.assertNotIn("B-COMMITTED-IN-WINDOW", b_out)
+        self.assertIn("B-RETRY-GENERATION 3", b_out)
+
+        committed = manifest(self.dir)
+        self.assertEqual(committed["generation"], 3)          # monotonic 1 → 2 → 3
+        self.assertTrue(graph_file(self.dir).is_file())       # nothing committed
+        self.assertTrue(resolver_file(self.dir).is_file())    # was swept
+        self.assertEqual(Session.load(self.dir).generation, 3)
+
+    def test_a_writer_killed_mid_transaction_does_not_hold_the_lock(self):
+        """Kernel-held, so a SIGKILL releases it. No stale-lock guessing."""
+        holder = self.spawn(
+            "import sys, time\n"
+            "from pathlib import Path\n"
+            "from contextmesh_mcp.session import writer_lock\n"
+            "root, gate = Path(sys.argv[1]), Path(sys.argv[2])\n"
+            "with writer_lock(root):\n"
+            "    gate.write_text('held')\n"
+            "    time.sleep(120)\n"
+        )
+        deadline = time.time() + 60
+        while not self.gate.exists() and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(self.gate.exists(), "the holder never took the lock")
+
+        with self.assertRaises(SessionLockedError):
+            Session.load(self.dir).checkpoint()
+
+        holder.kill()
+        holder.communicate(timeout=60)  # reap it, and close the pipes
+
+        Session.load(self.dir).checkpoint()
+        self.assertEqual(manifest(self.dir)["generation"], 2)
 
 
 class ServedMutationTest(unittest.TestCase):
