@@ -7,6 +7,9 @@ directory is the reconstruction.
 ```
 python -m contextmesh export --inline    # build the graph, write this page's data
 open dashboard/index.html                # works from file://, no server needed
+
+python dashboard/bundle.py out.html      # one self-contained file to send someone
+python dashboard/bundle.py --artifact f  # same, minus the document skeleton
 ```
 
 `index.html` is the layout and the palette, `mesh.js` is the renderer, and
