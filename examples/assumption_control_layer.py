@@ -1,7 +1,16 @@
 """
-Context Mesh – Assumption-Aware Control Layer
-=============================================
-Companion runtime for the Context Mesh typed graph.
+Context Mesh – Assumption-Aware Control Layer (standalone demo)
+==============================================================
+The original single-file sketch, kept because it runs on its own and shows the
+selective-invalidation idea end to end with a seven-node executor.
+
+The production version of these ideas lives in the package:
+
+    contextmesh/assumptions.py   versioned assumptions, blast radius, rejection
+    contextmesh/decisions.py     append-only decision history
+    contextmesh/graph.py         typed nodes and typed edges
+
+Run it with `python examples/assumption_control_layer.py`.
 
 This module implements the control plane that sits on top of a Context Mesh
 knowledge graph. It treats assumptions as first-class, versioned objects,
@@ -305,7 +314,12 @@ def worker_logic(ctx: Dict[str, Any]) -> Dict[str, Any]:
 
     raw = [120, 450, "$3200", 95, "N/A", 12.5]
 
-    if asm and "currency" in asm.claim.lower():
+    # Assumption A is phrased "...unitless quantities (no currency conversion
+    # needed)", so testing for the word "currency" matched A as well as B and
+    # the worker took the currency-aware branch on the first pass — which meant
+    # AUDIT passed and the rejection this demo exists to show never happened.
+    # AUDIT keys on "unitless"; the worker keys on the same word, inverted.
+    if asm and "unitless" not in asm.claim.lower():
         # Assumption B – currency aware
         processed = []
         for v in raw:
@@ -496,7 +510,9 @@ def run_demo():
         ("Blast radius does NOT contain BRANCH_C2", "BRANCH_C2" not in inv_nodes),
         ("BRANCH_C1 output preserved", "BRANCH_C1" in shared.node_outputs),
         ("BRANCH_C2 output preserved", "BRANCH_C2" in shared.node_outputs),
-        ("Final WORKER kept 4 records", shared.node_outputs.get("WORKER", {}).get("kept_count") == 4),
+        # Under B the "$3200" string is parsed rather than dropped, so the
+        # re-run keeps five records where the first pass kept four.
+        ("Final WORKER kept 5 records", shared.node_outputs.get("WORKER", {}).get("kept_count") == 5),
         ("Final AUDIT passed", shared.node_outputs.get("AUDIT", {}).get("passed") is True),
         ("active_for_node only tracks WORKER (clean)",
          set(shared.active_for_node.keys()) <= {"WORKER"}),

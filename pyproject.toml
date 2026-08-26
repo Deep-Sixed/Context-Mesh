@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "contextmesh"
+version = "0.1.0"
+description = "A typed context graph for AI agents: provenance, assumptions, and answers that walk a path you can read."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+keywords = ["knowledge-graph", "provenance", "agents", "retrieval", "context"]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/charlessnydercareer/Context-Mesh"
+
+[project.scripts]
+contextmesh = "contextmesh.cli:main"
+
+[tool.setuptools]
+packages = ["contextmesh"]
+
+[tool.setuptools.package-data]
+contextmesh = ["../GRAPH.md"]
