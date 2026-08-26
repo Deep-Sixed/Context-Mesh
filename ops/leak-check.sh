@@ -15,6 +15,11 @@ RANGE=""
 [ -n "$BASE" ] && RANGE="$BASE..HEAD"
 FAILED=0
 
+# The checker states the patterns it looks for, so a plain scan of the tree
+# finds them in this file. Exclude it from the content pass; its own metadata is
+# still covered, and its patterns are reviewed like any other code.
+SCAN=(. ":(exclude)ops/leak-check.sh")
+
 say()  { printf '%s\n' "$*"; }
 fail() { printf '  ✗ %s\n' "$*"; FAILED=1; }
 pass() { printf '  ✓ %s\n' "$*"; }
@@ -31,17 +36,17 @@ CONTENT_PATTERNS=(
   '-----BEGIN OPENSSH PRIVATE KEY-----'
 )
 for pat in "${CONTENT_PATTERNS[@]}"; do
-  if git grep -nIE "$pat" -- . >/dev/null 2>&1; then
+  if git grep -nIE "$pat" -- "${SCAN[@]}" >/dev/null 2>&1; then
     fail "secret-shaped string matching /$pat/"
-    git grep -nIE "$pat" -- . | head -3 | sed 's/^/      /'
+    git grep -nIE "$pat" -- "${SCAN[@]}" | head -3 | sed 's/^/      /'
   fi
 done
 
 # Any email that is not the Anthropic no-reply used for co-authorship.
-if git grep -nIE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' -- . 2>/dev/null \
+if git grep -nIE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' -- "${SCAN[@]}" 2>/dev/null \
      | grep -v 'noreply@anthropic.com' | grep -q .; then
   fail "email address in tracked content"
-  git grep -nIE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' -- . \
+  git grep -nIE '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' -- "${SCAN[@]}" \
     | grep -v 'noreply@anthropic.com' | head -3 | sed 's/^/      /'
 else
   pass "no email addresses in tracked content"
@@ -49,17 +54,17 @@ fi
 
 # Machine-local and internal paths. An internal directory layout is itself
 # private information, so these do not belong in a public tree.
-if git grep -nIE '/mnt/[a-z]|/home/[a-z]+/|/Users/[A-Za-z]+/|[A-Z]:\\\\Users' -- . 2>/dev/null | grep -q .; then
+if git grep -nIE '/mnt/[a-z]|/home/[a-z]+/|/Users/[A-Za-z]+/|[A-Z]:\\\\Users' -- "${SCAN[@]}" 2>/dev/null | grep -q .; then
   fail "machine-local or internal path in tracked content"
-  git grep -nIE '/mnt/[a-z]|/home/[a-z]+/|/Users/[A-Za-z]+/' -- . | head -3 | sed 's/^/      /'
+  git grep -nIE '/mnt/[a-z]|/home/[a-z]+/|/Users/[A-Za-z]+/' -- "${SCAN[@]}" | head -3 | sed 's/^/      /'
 else
   pass "no machine-local or internal paths"
 fi
 
 # Private Claude links: session URLs are private, artifact URLs are per-user.
-if git grep -nIE 'claude\.ai/code/(session|artifact)' -- . 2>/dev/null | grep -q .; then
+if git grep -nIE 'claude\.ai/code/(session|artifact)' -- "${SCAN[@]}" 2>/dev/null | grep -q .; then
   fail "private claude.ai session or artifact URL in tracked content"
-  git grep -nIE 'claude\.ai/code/(session|artifact)' -- . | head -3 | sed 's/^/      /'
+  git grep -nIE 'claude\.ai/code/(session|artifact)' -- "${SCAN[@]}" | head -3 | sed 's/^/      /'
 else
   pass "no private claude.ai URLs in tracked content"
 fi
