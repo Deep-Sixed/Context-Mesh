@@ -12,6 +12,18 @@ This repository is a working implementation, reverse-engineered from a screen
 capture of the dashboard. The dashboard is rebuilt too, and every number on it
 is computed by the engine rather than written into the page.
 
+![The Context Mesh dashboard: build path, the live typed graph, hop budget, edge
+ledger, walk-vs-flat token cost, the traversal grid and the dead-end ledger](docs/img/dashboard.png)
+
+Every panel above is a query against the graph — the node counts, the hop
+histogram, the edge traffic, the dead-end reasons. Open
+[`dashboard/context-mesh.html`](dashboard/context-mesh.html) for the live page
+in a single file, or rebuild it from your own data:
+
+```bash
+python -m contextmesh export --inline && open dashboard/index.html
+```
+
 ```bash
 git clone https://github.com/charlessnydercareer/Context-Mesh
 cd Context-Mesh
