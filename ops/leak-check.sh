@@ -87,12 +87,22 @@ AUTHORS="$(git log $RANGE --format='%ae%n%ce' 2>/dev/null | sort -u | grep -v '^
 # "noreply" as its local part, while GitHub's has it inside the domain.
 ALLOWED='^(noreply@anthropic\.com|noreply@github\.com|.+@users\.noreply\.github\.com)$'
 UNEXPECTED="$(printf '%s\n' "$AUTHORS" | grep -vE "$ALLOWED" || true)"
+
+# Addresses deliberately published are recorded rather than hardcoded, so the
+# check can distinguish a decision from an accident.
+ACCEPTED_FILE="$(dirname "$0")/accepted-authors.txt"
+if [ -n "$UNEXPECTED" ] && [ -f "$ACCEPTED_FILE" ]; then
+  ACCEPTED="$(grep -vE '^\s*(#|$)' "$ACCEPTED_FILE" | tr -d '[:blank:]')"
+  if [ -n "$ACCEPTED" ]; then
+    UNEXPECTED="$(printf '%s\n' "$UNEXPECTED" | grep -vxF "$ACCEPTED" || true)"
+  fi
+fi
 if [ -n "$UNEXPECTED" ]; then
   fail "author or committer address that is not a no-reply:"
   printf '%s\n' "$UNEXPECTED" | sed 's/^/      /'
   printf '      set a no-reply identity, or accept these as intentionally public\n'
 else
-  pass "every author and committer uses a no-reply address"
+  pass "every author and committer is a no-reply or an accepted address"
 fi
 
 say ""

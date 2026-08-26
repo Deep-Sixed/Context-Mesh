@@ -211,6 +211,10 @@ ops/leak-check.sh origin/main  # only what a branch adds
 
 CI runs the second form on every pull request.
 
+`ops/accepted-authors.txt` records addresses that are public on purpose, so the
+check can tell a decision from an accident instead of failing forever on a known
+case. An address that is not listed and not a no-reply still fails.
+
 ## Where it fits
 
 Context Mesh complements retrieval and agent memory rather than replacing them.

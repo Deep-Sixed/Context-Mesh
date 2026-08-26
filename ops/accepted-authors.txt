@@ -1,0 +1,14 @@
+# Author and committer addresses accepted as intentionally public.
+#
+# ops/leak-check.sh flags any address that is not a no-reply, because a personal
+# address arriving in a public repo is usually an accident. An address listed
+# here is a decision someone made on purpose, recorded so the check can tell the
+# two apart instead of failing forever on a known case.
+#
+# One address per line. Comments and blank lines ignored.
+
+# The original seven commits. Public authorship of this repository, deliberate:
+# a .career alias, and already published. Rewriting history would break every
+# clone while only partially erasing it — GitHub keeps orphaned commits
+# reachable by SHA, and forks keep their own copies.
+charles.snyder.career@gmail.com
