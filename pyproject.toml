@@ -12,14 +12,22 @@ license = { file = "LICENSE" }
 keywords = ["knowledge-graph", "provenance", "agents", "retrieval", "context"]
 dependencies = []
 
+# The MCP SDK needs Python 3.10+ and pulls ~19 packages. The core promises
+# 3.9 and zero dependencies, so the server lives behind an extra: installing
+# contextmesh never installs mcp, and `contextmesh_mcp.server` is the only
+# module that imports it.
+[project.optional-dependencies]
+mcp = ["mcp>=2"]
+
 [project.urls]
 Homepage = "https://github.com/charlessnydercareer/Context-Mesh"
 
 [project.scripts]
 contextmesh = "contextmesh.cli:main"
+contextmesh-mcp = "contextmesh_mcp.server:main"
 
 [tool.setuptools]
-packages = ["contextmesh"]
+packages = ["contextmesh", "contextmesh_mcp"]
 
 [tool.setuptools.package-data]
 contextmesh = ["../GRAPH.md"]
