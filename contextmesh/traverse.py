@@ -464,7 +464,11 @@ class Walker:
     def _credit(self, steps: Sequence[Step]) -> None:
         graph = self.graph
         for previous, step in zip(steps, steps[1:]):
-            a, b = (step.node_id, previous.node_id) if step.reverse else (previous.node_id, step.node_id)
+            a, b = (
+                (step.node_id, previous.node_id)
+                if step.reverse
+                else (previous.node_id, step.node_id)
+            )
             for edge in graph.out_edges(a, (step.edge_type,) if step.edge_type else None):
                 if edge.dst == b:
                     edge.traversals += 1

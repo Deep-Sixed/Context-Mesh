@@ -37,7 +37,7 @@ from .model import (
 )
 from .ontology import ONTOLOGY, Ontology, OntologyError
 from .pipeline import BuildReport, Document, Pipeline
-from .resolve import Resolver, ResolutionRecord
+from .resolve import ResolutionRecord, Resolver
 from .traverse import DeadEnd, Walk, Walker
 
 __version__ = "0.1.0"

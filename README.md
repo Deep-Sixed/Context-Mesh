@@ -24,7 +24,10 @@ python -m contextmesh export --inline # regenerate the dashboard's data
 ```
 
 No dependencies. Python 3.9+. `python -m unittest discover -s tests` runs the
-suite (84 tests).
+suite (87 tests). CI runs it on 3.9 through 3.13, plus ruff and a set of
+end-to-end smoke checks — including that a build is byte-identical across
+`PYTHONHASHSEED`, and that `dashboard/data/mesh.json` still matches what the
+engine produces.
 
 ## An answer is a path
 
@@ -190,7 +193,7 @@ contextmesh/
 dashboard/                   the rebuilt dashboard
 docs/                        the capture spec and the architecture notes
 examples/                    the original standalone control-layer sketch
-tests/                       84 tests over the invariants above
+tests/                       87 tests over the invariants above
 ```
 
 ## Where it fits

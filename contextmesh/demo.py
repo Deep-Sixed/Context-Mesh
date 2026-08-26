@@ -177,7 +177,7 @@ def run(*, rounds: int = 40, reject: bool = True) -> DemoResult:
         produces=[_entity_id(graph, "HNSW index")] if _entity_id(graph, "HNSW index") else [],
     )
 
-    d_partition = decisions.decide(
+    decisions.decide(
         "Rebuild the index in partitions",
         "A single-node rebuild died at 16GB once the corpus reached 26M chunks. "
         "Per-shard peak memory is 2.1GB, at the cost of 31 minutes total build.",

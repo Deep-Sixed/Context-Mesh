@@ -18,7 +18,16 @@ DOCS: List[Document] = [
         title="RFC 014 — retrieval layer for the agent runtime",
         origin="docs/rfc/014-retrieval.md",
         retrieved_at="2026-01-08",
-        entities=["pgvector", "HNSW index", "Retrieval Service", "Agent Runtime", "recall at ten", "ninety-fifth percentile", "embedding column", "document span"],
+        entities=[
+            "pgvector",
+            "HNSW index",
+            "Retrieval Service",
+            "Agent Runtime",
+            "recall at ten",
+            "ninety-fifth percentile",
+            "embedding column",
+            "document span",
+        ],
         text=(
             "The Retrieval Service stores embeddings in pgvector behind the Agent Runtime. "
             "An HNSW index is built over the embedding column at write time. "
@@ -32,7 +41,15 @@ DOCS: List[Document] = [
         title="Benchmark run 2026-01 — recall and latency",
         origin="bench/2026-01/report.json",
         retrieved_at="2026-01-19",
-        entities=["HNSW index", "IVFFlat index", "Retrieval Service", "recall at ten", "build time", "query latency", "resident memory"],
+        entities=[
+            "HNSW index",
+            "IVFFlat index",
+            "Retrieval Service",
+            "recall at ten",
+            "build time",
+            "query latency",
+            "resident memory",
+        ],
         text=(
             "The HNSW index reached recall of zero point ninety-one at ten on the evaluation set. "
             "The IVFFlat index reached recall of zero point eighty-two on the same set. "
@@ -49,7 +66,15 @@ DOCS: List[Document] = [
         title="Incident 221 — index rebuild exhausted memory",
         origin="incidents/221.md",
         retrieved_at="2026-02-03",
-        entities=["HNSW index", "Retrieval Service", "Index Builder", "resident memory", "corpus size", "builder node", "Partitioned Rebuild"],
+        entities=[
+            "HNSW index",
+            "Retrieval Service",
+            "Index Builder",
+            "resident memory",
+            "corpus size",
+            "builder node",
+            "Partitioned Rebuild",
+        ],
         text=(
             "The Index Builder was killed during a rebuild when resident memory passed sixteen gigabytes. "
             "The Retrieval Service served stale results for forty minutes. "
@@ -63,7 +88,15 @@ DOCS: List[Document] = [
         title="Review thread 88 — partitioned rebuild",
         origin="reviews/88.md",
         retrieved_at="2026-02-11",
-        entities=["Index Builder", "Partitioned Rebuild", "HNSW index", "shard", "peak memory", "build time", "corpus size"],
+        entities=[
+            "Index Builder",
+            "Partitioned Rebuild",
+            "HNSW index",
+            "shard",
+            "peak memory",
+            "build time",
+            "corpus size",
+        ],
         text=(
             "A Partitioned Rebuild splits the corpus into shards and builds each shard separately. "
             "Peak memory per shard measured two point one gigabytes. "
@@ -72,7 +105,11 @@ DOCS: List[Document] = [
             "Reviewers accepted the tradeoff of build time for bounded memory."
         ),
         relations=[
-            ("The Index Builder no longer requires the whole corpus", "supersedes", "The rebuild assumed the corpus fits"),
+            (
+                "The Index Builder no longer requires the whole corpus",
+                "supersedes",
+                "The rebuild assumed the corpus fits",
+            ),
         ],
     ),
     Document(
@@ -80,7 +117,15 @@ DOCS: List[Document] = [
         title="Embedding model migration note",
         origin="docs/embeddings/migration.md",
         retrieved_at="2026-03-02",
-        entities=["Embedding Model", "Retrieval Service", "pgvector", "v2 encoder", "v3 encoder", "keyword search", "re-embedding"],
+        entities=[
+            "Embedding Model",
+            "Retrieval Service",
+            "pgvector",
+            "v2 encoder",
+            "v3 encoder",
+            "keyword search",
+            "re-embedding",
+        ],
         text=(
             "The Embedding Model was upgraded from the v2 encoder to the v3 encoder. "
             "Vectors produced by the v3 encoder are not comparable with v2 vectors. "
@@ -94,7 +139,14 @@ DOCS: List[Document] = [
         title="Reranker evaluation",
         origin="bench/rerank/eval.md",
         retrieved_at="2026-03-14",
-        entities=["Cross Encoder Reranker", "Retrieval Service", "HNSW index", "precision at five", "candidate set", "ninety-fifth percentile"],
+        entities=[
+            "Cross Encoder Reranker",
+            "Retrieval Service",
+            "HNSW index",
+            "precision at five",
+            "candidate set",
+            "ninety-fifth percentile",
+        ],
         text=(
             "The Cross Encoder Reranker improved precision at five from zero point sixty-one to zero point seventy-nine. "
             "Reranking added ninety milliseconds to the ninety-fifth percentile latency. "
@@ -108,7 +160,14 @@ DOCS: List[Document] = [
         title="Why the answers were not auditable",
         origin="docs/notes/auditability.md",
         retrieved_at="2026-04-06",
-        entities=["Retrieval Service", "Context Mesh", "Agent Runtime", "top-k", "typed edge", "ranked list"],
+        entities=[
+            "Retrieval Service",
+            "Context Mesh",
+            "Agent Runtime",
+            "top-k",
+            "typed edge",
+            "ranked list",
+        ],
         text=(
             "Answers from the Retrieval Service could not be traced back to a reason. "
             "The Agent Runtime received a ranked list with no relation between the items. "
@@ -117,7 +176,11 @@ DOCS: List[Document] = [
             "A typed edge records that both sides agree on the relation, not merely that they are similar."
         ),
         relations=[
-            ("A typed edge records that both sides agree", "contradicts", "Two chunks agreeing by coincidence looked identical"),
+            (
+                "A typed edge records that both sides agree",
+                "contradicts",
+                "Two chunks agreeing by coincidence looked identical",
+            ),
         ],
     ),
     Document(
@@ -125,7 +188,15 @@ DOCS: List[Document] = [
         title="Context Mesh design note",
         origin="docs/rfc/021-context-mesh.md",
         retrieved_at="2026-04-21",
-        entities=["Context Mesh", "Agent Runtime", "Retrieval Service", "typed edge", "typed node", "assumption", "readable path"],
+        entities=[
+            "Context Mesh",
+            "Agent Runtime",
+            "Retrieval Service",
+            "typed edge",
+            "typed node",
+            "assumption",
+            "readable path",
+        ],
         text=(
             "Context Mesh stores entities, claims, sources and decisions as typed nodes. "
             "Relations between nodes are typed edges rather than similarity scores. "
@@ -139,7 +210,14 @@ DOCS: List[Document] = [
         title="Quarterly cost review",
         origin="finance/q1-review.md",
         retrieved_at="2026-04-28",
-        entities=["Retrieval Service", "Agent Runtime", "Cross Encoder Reranker", "token spend", "retrieved context", "cost per answer"],
+        entities=[
+            "Retrieval Service",
+            "Agent Runtime",
+            "Cross Encoder Reranker",
+            "token spend",
+            "retrieved context",
+            "cost per answer",
+        ],
         text=(
             "Token spend for the Agent Runtime was dominated by retrieved context. "
             "The median answer carried one hundred and twenty thousand tokens of retrieved chunks. "
@@ -153,7 +231,14 @@ DOCS: List[Document] = [
         title="Drift audit — stale claims in the index",
         origin="audits/drift-2026-05.md",
         retrieved_at="2026-05-12",
-        entities=["Retrieval Service", "Embedding Model", "Context Mesh", "superseded decision", "stale claim", "similarity"],
+        entities=[
+            "Retrieval Service",
+            "Embedding Model",
+            "Context Mesh",
+            "superseded decision",
+            "stale claim",
+            "similarity",
+        ],
         text=(
             "Fourteen percent of indexed claims referenced a decision that had been superseded. "
             "The Retrieval Service had no way to know a claim was stale. "
@@ -162,7 +247,11 @@ DOCS: List[Document] = [
             "The Embedding Model cannot detect staleness because similarity does not encode time."
         ),
         relations=[
-            ("Context Mesh marks a superseded decision", "cites", "Context Mesh stores entities, claims, sources and decisions"),
+            (
+                "Context Mesh marks a superseded decision",
+                "cites",
+                "Context Mesh stores entities, claims, sources and decisions",
+            ),
         ],
     ),
     Document(
@@ -170,7 +259,14 @@ DOCS: List[Document] = [
         title="On-call notes — partial invalidation",
         origin="ops/oncall/2026-05.md",
         retrieved_at="2026-05-30",
-        entities=["Index Builder", "Partitioned Rebuild", "Retrieval Service", "shard", "partial invalidation", "recovery time"],
+        entities=[
+            "Index Builder",
+            "Partitioned Rebuild",
+            "Retrieval Service",
+            "shard",
+            "partial invalidation",
+            "recovery time",
+        ],
         text=(
             "A bad shard forced a rebuild of one partition rather than the whole index. "
             "The Partitioned Rebuild made partial invalidation possible for the first time. "
@@ -179,7 +275,11 @@ DOCS: List[Document] = [
             "Recovery time fell from forty minutes to four minutes."
         ),
         relations=[
-            ("The Partitioned Rebuild made partial invalidation possible", "cites", "A Partitioned Rebuild splits the corpus into shards"),
+            (
+                "The Partitioned Rebuild made partial invalidation possible",
+                "cites",
+                "A Partitioned Rebuild splits the corpus into shards",
+            ),
         ],
     ),
     Document(
@@ -187,7 +287,14 @@ DOCS: List[Document] = [
         title="Capacity model for the builder fleet",
         origin="docs/capacity/builder.md",
         retrieved_at="2026-06-09",
-        entities=["Index Builder", "Partitioned Rebuild", "builder node", "shard", "region", "capacity model"],
+        entities=[
+            "Index Builder",
+            "Partitioned Rebuild",
+            "builder node",
+            "shard",
+            "region",
+            "capacity model",
+        ],
         text=(
             "Each builder node provides sixteen gigabytes of usable memory. "
             "A shard is sized so that peak build memory stays under four gigabytes. "
@@ -201,7 +308,15 @@ DOCS: List[Document] = [
         title="Postmortem 233 — the linear sharding assumption",
         origin="incidents/233.md",
         retrieved_at="2026-07-02",
-        entities=["Partitioned Rebuild", "Index Builder", "Retrieval Service", "shard", "tenant", "sizing rule", "corpus size"],
+        entities=[
+            "Partitioned Rebuild",
+            "Index Builder",
+            "Retrieval Service",
+            "shard",
+            "tenant",
+            "sizing rule",
+            "corpus size",
+        ],
         text=(
             "Shard count did not grow linearly with corpus size once documents clustered by tenant. "
             "One tenant accounted for thirty-one percent of all chunks in a single shard. "
@@ -210,8 +325,16 @@ DOCS: List[Document] = [
             "Sharding must key on tenant as well as corpus position."
         ),
         relations=[
-            ("Shard count did not grow linearly", "contradicts", "The capacity model assumes shard count grows linearly"),
-            ("Sharding must key on tenant", "supersedes", "A shard is sized so that peak build memory"),
+            (
+                "Shard count did not grow linearly",
+                "contradicts",
+                "The capacity model assumes shard count grows linearly",
+            ),
+            (
+                "Sharding must key on tenant",
+                "supersedes",
+                "A shard is sized so that peak build memory",
+            ),
         ],
     ),
     Document(
@@ -219,7 +342,15 @@ DOCS: List[Document] = [
         title="Context Mesh evaluation against flat retrieval",
         origin="bench/mesh/eval.md",
         retrieved_at="2026-07-24",
-        entities=["Context Mesh", "Retrieval Service", "Agent Runtime", "readable path", "audit question", "path depth", "dead end"],
+        entities=[
+            "Context Mesh",
+            "Retrieval Service",
+            "Agent Runtime",
+            "readable path",
+            "audit question",
+            "path depth",
+            "dead end",
+        ],
         text=(
             "Context Mesh answered ninety-one of one hundred audit questions with a readable path. "
             "The Retrieval Service answered the same questions with no path in every case. "
@@ -228,7 +359,11 @@ DOCS: List[Document] = [
             "The Agent Runtime preferred the path answers in blind review."
         ),
         relations=[
-            ("The Retrieval Service answered the same questions with no path", "cites", "Answers from the Retrieval Service could not be traced"),
+            (
+                "The Retrieval Service answered the same questions with no path",
+                "cites",
+                "Answers from the Retrieval Service could not be traced",
+            ),
         ],
     ),
 ]

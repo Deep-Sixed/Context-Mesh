@@ -7,14 +7,14 @@ change, and if a panel has no data it renders empty rather than plausible.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 
 from .assumptions import AssumptionLedger, InvalidationReport
 from .decisions import DecisionLog
 from .graph import ContextGraph
 from .health import report as health_report
-from .model import DISPLAY_TYPES, EdgeType, NodeType
-from .pipeline import BuildReport, Pipeline
+from .model import DISPLAY_TYPES, EdgeType
+from .pipeline import BuildReport
 from .resolve import Resolver
 from .traverse import DeadEnd, Walker
 

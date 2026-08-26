@@ -145,7 +145,11 @@ class AssumptionLedger:
                 seeds.append(
                     (
                         edge.dst,
-                        [start_label, f"justifies {edge.type.value} edge", graph.node(edge.dst).label],
+                        [
+                            start_label,
+                            f"justifies {edge.type.value} edge",
+                            graph.node(edge.dst).label,
+                        ],
                     )
                 )
         frontier.extend(seeds)

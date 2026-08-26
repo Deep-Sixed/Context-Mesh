@@ -14,11 +14,11 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Optional, Sequence
 
-from .demo import DemoResult, run
+from .demo import run
 from .health import check
-from .model import AssumptionStatus, NodeType
+from .model import AssumptionStatus
 
 DEFAULT_EXPORT = Path(__file__).resolve().parent.parent / "dashboard" / "data" / "mesh.json"
 DASHBOARD_HTML = Path(__file__).resolve().parent.parent / "dashboard" / "index.html"
@@ -192,7 +192,8 @@ def _inline(html_path: Path, payload: Dict[str, Any]) -> None:
     )
     if not pattern.search(html):
         raise SystemExit(f"{html_path} has no <script id='mesh-data'> block")
-    html_path.write_text(pattern.sub(lambda m: m.group(1) + blob + m.group(3), html), encoding="utf-8")
+    rewritten = pattern.sub(lambda m: m.group(1) + blob + m.group(3), html)
+    html_path.write_text(rewritten, encoding="utf-8")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

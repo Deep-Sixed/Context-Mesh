@@ -2,12 +2,12 @@
 
 import unittest
 
+from contextmesh.corpus import documents
 from contextmesh.graph import ContextGraph
 from contextmesh.model import EdgeType, NodeType, Provenance
 from contextmesh.pipeline import Pipeline
 from contextmesh.resolve import Resolver
 from contextmesh.traverse import ANSWERING, DeadEnd, Walker
-from contextmesh.corpus import documents
 
 
 def built():

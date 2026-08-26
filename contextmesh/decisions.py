@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional
 
 from .graph import ContextGraph
-from .model import EdgeType, Node, NodeType, Provenance, slug
+from .model import EdgeType, Node, NodeType, Provenance
 
 
 @dataclass

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 _NOISE = re.compile(r"[^a-z0-9 ]+")
 # Only genuine corporate forms are noise. Stripping "service", "api" or a
@@ -146,26 +146,30 @@ class Resolver:
             eid = self.aliases[key]
             return eid, 1.0, "alias table"
 
-        candidates: Set[str] = set()
-        for block in self._block_keys(mention):
-            candidates |= self.blocks.get(block, set())
-
-        best_id, best_score = None, 0.0
-        for eid in candidates:
-            score = similarity(mention, self.canonical[eid])
-            if score > best_score:
-                best_id, best_score = eid, score
+        best_id, best_score = self._best_candidate(mention)
         if best_id is not None and best_score >= self.threshold:
             return best_id, best_score, "scored match"
         return None
 
     def near_miss(self, mention: str) -> Tuple[Optional[str], float]:
         """The candidate that came closest without clearing the threshold."""
+        return self._best_candidate(mention)
+
+    def _best_candidate(self, mention: str) -> Tuple[Optional[str], float]:
+        """Highest-scoring candidate for a mention, resolved deterministically.
+
+        Blocking collects candidates into a set, and iterating a set of strings
+        follows Python's per-process hash salt. Two mentions that tie on score
+        would then resolve to different entities in different processes — so the
+        same corpus built twice produced different edges. Sorting the candidates
+        makes the tie-break the entity id, which is stable everywhere.
+        """
         candidates: Set[str] = set()
         for block in self._block_keys(mention):
             candidates |= self.blocks.get(block, set())
+
         best_id, best_score = None, 0.0
-        for eid in candidates:
+        for eid in sorted(candidates):
             score = similarity(mention, self.canonical[eid])
             if score > best_score:
                 best_id, best_score = eid, score

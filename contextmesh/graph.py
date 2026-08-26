@@ -227,4 +227,7 @@ class ContextGraph:
 
     def __repr__(self) -> str:
         live = sum(1 for n in self.nodes.values() if n.live)
-        return f"<ContextGraph build={self.build} nodes={live}/{len(self.nodes)} edges={len(self.edges)}>"
+        return (
+            f"<ContextGraph build={self.build} "
+            f"nodes={live}/{len(self.nodes)} edges={len(self.edges)}>"
+        )

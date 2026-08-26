@@ -11,9 +11,9 @@
   "build": {
     "number": 1,
     "spans_in": 70,
-    "edges": 373,
+    "edges": 372,
     "dropped_at_resolve": 1264,
-    "committed_walkable": 373,
+    "committed_walkable": 372,
     "collapsed_aliases": 90,
     "stages": [
       {
@@ -92,7 +92,7 @@
         "id": "source:rfc-014",
         "t": "source",
         "label": "RFC 014 \u2014 retrieval layer for the agent runtime",
-        "deg": 23,
+        "deg": 21,
         "walks": 1058
       },
       {
@@ -120,7 +120,7 @@
         "id": "source:embed-migration",
         "t": "source",
         "label": "Embedding model migration note",
-        "deg": 19,
+        "deg": 21,
         "walks": 1058
       },
       {
@@ -232,7 +232,7 @@
         "id": "entity:embedding-column-670f0a",
         "t": "entity",
         "label": "embedding column",
-        "deg": 3,
+        "deg": 6,
         "walks": 1058
       },
       {
@@ -309,7 +309,7 @@
         "id": "entity:embedding-model-3e12c4",
         "t": "entity",
         "label": "Embedding Model",
-        "deg": 10,
+        "deg": 6,
         "walks": 1058
       },
       {
@@ -526,7 +526,7 @@
         "id": "claim:an-hnsw-index-is-built-over-the-embeddin-0ec8ff",
         "t": "claim",
         "label": "An HNSW index is built over the embedding column at write time.",
-        "deg": 3,
+        "deg": 2,
         "walks": 1058
       },
       {
@@ -1109,14 +1109,14 @@
         "s": 0,
         "d": 20,
         "t": "mentions",
-        "w": 4.0,
+        "w": 6.0,
         "n": 0
       },
       {
         "s": 20,
         "d": 0,
         "t": "derived_from",
-        "w": 4.0,
+        "w": 6.0,
         "n": 0
       },
       {
@@ -1403,14 +1403,14 @@
         "s": 4,
         "d": 31,
         "t": "mentions",
-        "w": 3.0,
+        "w": 2.0,
         "n": 3
       },
       {
         "s": 31,
         "d": 4,
         "t": "derived_from",
-        "w": 3.0,
+        "w": 2.0,
         "n": 0
       },
       {
@@ -2290,31 +2290,10 @@
       },
       {
         "s": 62,
-        "d": 31,
-        "t": "mentions",
-        "w": 2.0,
-        "n": 21
-      },
-      {
-        "s": 0,
-        "d": 31,
-        "t": "mentions",
-        "w": 2.0,
-        "n": 0
-      },
-      {
-        "s": 31,
-        "d": 0,
-        "t": "derived_from",
-        "w": 2.0,
-        "n": 0
-      },
-      {
-        "s": 62,
         "d": 20,
         "t": "mentions",
-        "w": 3.0,
-        "n": 0
+        "w": 5.0,
+        "n": 21
       },
       {
         "s": 63,
@@ -2661,10 +2640,24 @@
       },
       {
         "s": 85,
-        "d": 31,
+        "d": 20,
         "t": "mentions",
         "w": 1.0,
         "n": 19
+      },
+      {
+        "s": 4,
+        "d": 20,
+        "t": "mentions",
+        "w": 1.0,
+        "n": 0
+      },
+      {
+        "s": 20,
+        "d": 4,
+        "t": "derived_from",
+        "w": 1.0,
+        "n": 0
       },
       {
         "s": 86,
@@ -3694,12 +3687,12 @@
     "note": "FLAT RAG = 1 HOP, NO PATH"
   },
   "edge_ledger": {
-    "total": 404,
+    "total": 403,
     "rows": [
       {
         "type": "mentions",
         "label": "MENTIONS",
-        "count": 195,
+        "count": 194,
         "traversals": 841
       },
       {
@@ -5114,7 +5107,8 @@
       {
         "question": "What supports Embedding Model?",
         "seeds": [
-          "entity:embedding-model-3e12c4"
+          "entity:embedding-model-3e12c4",
+          "entity:embedding-column-670f0a"
         ],
         "resolved": true,
         "answer_id": "claim:the-embedding-model-cannot-detect-stalen-a674ef",
@@ -5249,7 +5243,7 @@
     "status": "warn",
     "nodes_live": 137,
     "nodes_total": 140,
-    "edges_live": 404,
+    "edges_live": 403,
     "edge_types_used": 8,
     "signals": [
       {
@@ -5268,9 +5262,9 @@
         "remedy": "extend the alias table or lower the resolver threshold",
         "items": [
           "'An HNSW' \u2014 best candidate 'HNSW index' scored 0.50 < 0.62",
-          "'index' \u2014 best candidate 'Index Builder' scored 0.50 < 0.62",
+          "'index' \u2014 best candidate 'HNSW index' scored 0.50 < 0.62",
           "'column' \u2014 best candidate 'embedding column' scored 0.50 < 0.62",
-          "'time' \u2014 best candidate 'recovery time' scored 0.50 < 0.62",
+          "'time' \u2014 best candidate 'build time' scored 0.50 < 0.62",
           "'service' \u2014 best candidate 'Retrieval Service' scored 0.50 < 0.62",
           "'span' \u2014 best candidate 'document span' scored 0.50 < 0.62",
           "'build' \u2014 best candidate 'build time' scored 0.50 < 0.62",

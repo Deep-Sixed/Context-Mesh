@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .embed import embed
 from .graph import ContextGraph
@@ -183,7 +183,7 @@ class Pipeline:
         claim_spans: List[Tuple[Document, int, int, str, str]] = []
 
         for doc in docs:
-            source = graph.add_node(
+            graph.add_node(
                 NodeType.SOURCE,
                 doc.title,
                 id=doc.id,

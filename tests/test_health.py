@@ -3,13 +3,13 @@
 import json
 import unittest
 
+from contextmesh.corpus import documents
 from contextmesh.demo import run
 from contextmesh.graph import ContextGraph
 from contextmesh.health import check, report
-from contextmesh.metrics import LEDGER_EDGES, snapshot
-from contextmesh.model import EdgeType, NodeType, Provenance
+from contextmesh.metrics import LEDGER_EDGES
+from contextmesh.model import EdgeType, NodeType
 from contextmesh.pipeline import Pipeline
-from contextmesh.corpus import documents
 from contextmesh.resolve import Resolver
 from contextmesh.traverse import DeadEnd, Walker
 

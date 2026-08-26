@@ -3,7 +3,7 @@
 import unittest
 
 from contextmesh.corpus import documents
-from contextmesh.model import EdgeType, NodeType
+from contextmesh.model import NodeType
 from contextmesh.pipeline import STAGES, Document, Pipeline
 
 
