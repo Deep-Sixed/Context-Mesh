@@ -121,7 +121,7 @@ class ResolutionRecord:
         with _resolver_errors():
             canonical_id = _require(data, "canonical_id", where)
             canonical_label = _require(data, "canonical_label", where)
-            return cls(
+            record = cls(
                 mention=_expect_str(_require(data, "mention", where), f"{where}.mention"),
                 # ``null`` here is a resolution that *failed*, which is a fact
                 # worth keeping. Only a missing key is an error.
@@ -136,6 +136,18 @@ class ResolutionRecord:
                 score=_expect_number(_require(data, "score", where), f"{where}.score"),
                 reason=_expect_str(_require(data, "reason", where), f"{where}.reason"),
             )
+        # An id without a label, or a label without an id, is neither a
+        # resolution nor a miss. ``resolved`` keys off the id alone, so a
+        # half-null record reads as resolved and then hands back a label that
+        # is not there.
+        if (record.canonical_id is None) != (record.canonical_label is None):
+            raise ResolverSnapshotError(
+                f"{where} for {record.mention!r} has canonical_id="
+                f"{record.canonical_id!r} and canonical_label="
+                f"{record.canonical_label!r}; a resolution has both, a miss has "
+                "neither"
+            )
+        return record
 
 
 class ResolverSnapshotError(ValueError):
@@ -383,9 +395,23 @@ class Resolver:
                         f"resolver.blocks[{key!r}] names {eid!r}, which is not canonical"
                     )
         for record in log:
-            if record.canonical_id is not None and record.canonical_id not in canonical:
+            if record.canonical_id is None:
+                continue
+            if record.canonical_id not in canonical:
                 raise ResolverSnapshotError(
                     f"resolver.log names {record.canonical_id!r}, which is not canonical"
+                )
+            # ``resolve`` reads the label straight out of ``canonical``, so the
+            # two can only disagree in a file someone else wrote. Letting it
+            # through would put a name in the log that the resolver would never
+            # have produced for that id, and the log is what the health signals
+            # and the borderline report are computed from.
+            if record.canonical_label != canonical[record.canonical_id]:
+                raise ResolverSnapshotError(
+                    f"resolver.log records {record.mention!r} resolving to "
+                    f"{record.canonical_id!r} as {record.canonical_label!r}, but "
+                    f"the resolver calls that entity "
+                    f"{canonical[record.canonical_id]!r}"
                 )
 
         return cls(

@@ -153,8 +153,17 @@ jobs:
         run: |
           python -m contextmesh_mcp --demo --rounds 4 --save /tmp/session | tee /tmp/wrote.txt
           test -f /tmp/session/session.json
-          test -f /tmp/session/graph.json
-          test -f /tmp/session/resolver.json
+          python - <<'EOF'
+          import json, pathlib
+          root = pathlib.Path("/tmp/session")
+          data = json.loads((root / "session.json").read_text())
+          assert data["generation"] == 1, data["generation"]
+          assert data["graph"] == "graph-000001.json", data["graph"]
+          assert data["resolver"] == "resolver-000001.json", data["resolver"]
+          for key in ("graph", "resolver"):
+              assert (root / data[key]).is_file(), data[key]
+          print("committed generation 1:", sorted(p.name for p in root.iterdir()))
+          EOF
 
       - name: Another process reads it, and gets the same graph
         run: |
@@ -177,10 +186,12 @@ jobs:
       - name: A resolution the graph never stored survives the restart
         run: |
           python - <<'EOF' | tee /tmp/alias.txt
-          import json
+          import json, pathlib
           from contextmesh.resolve import Resolver
           from contextmesh_mcp.session import Session
-          saved = json.load(open("/tmp/session/resolver.json"))
+          root = pathlib.Path("/tmp/session")
+          names = json.loads((root / "session.json").read_text())
+          saved = json.loads((root / names["resolver"]).read_text())
           registered = Resolver()
           for eid, label in saved["canonical"].items():
               registered.register(eid, label)
@@ -199,10 +210,18 @@ jobs:
       - name: Re-saving a restored session reproduces it byte for byte
         run: |
           python -m contextmesh_mcp --session /tmp/session --save /tmp/again > /dev/null
-          for f in session.json graph.json resolver.json; do
-            cmp "/tmp/session/$f" "/tmp/again/$f" || {
-              echo "::error::$f changed across a save/load/save cycle"; exit 1; }
-          done
+          python - <<'EOF'
+          import json, pathlib
+          a, b = pathlib.Path("/tmp/session"), pathlib.Path("/tmp/again")
+          ma = json.loads((a / "session.json").read_text())
+          mb = json.loads((b / "session.json").read_text())
+          # A save into a fresh directory commits generation 1, so the whole
+          # manifest must match: the counter belongs to the directory.
+          assert ma == mb, "manifests differ across a save/load/save cycle"
+          for key in ("graph", "resolver"):
+              assert (a / ma[key]).read_bytes() == (b / mb[key]).read_bytes(), key
+          print("save/load/save is byte-identical at generation", ma["generation"])
+          EOF
 
       - name: A session this build cannot restore is refused, not half-loaded
         run: |
@@ -224,11 +243,31 @@ jobs:
           elif how == "policy":
               data["walker"]["policy"] = ["teleports_to"]
           elif how == "missing":
-              (root / "graph.json").unlink()
+              (root / data["graph"]).unlink()
           elif how == "foreign":
-              r = json.loads((root / "resolver.json").read_text())
+              r = json.loads((root / data["resolver"]).read_text())
               r["canonical"]["entity:ghost"] = "Ghost"
-              (root / "resolver.json").write_text(json.dumps(r))
+              (root / data["resolver"]).write_text(json.dumps(r))
+          elif how == "renamed":
+              # A resolver that is internally consistent and still disagrees
+              # with the graph: same id, right type, different name. Only the
+              # session can see it, so the log is renamed to match and the
+              # refusal has to come from check_agreement.
+              r = json.loads((root / data["resolver"]).read_text())
+              entity = next(iter(r["canonical"]))
+              r["canonical"][entity] = "Not What The Graph Calls It"
+              for row in r["log"]:
+                  if row["canonical_id"] == entity:
+                      row["canonical_label"] = "Not What The Graph Calls It"
+              (root / data["resolver"]).write_text(json.dumps(r))
+          elif how == "generation":
+              data["generation"] = 9
+          elif how == "symlink":
+              companion = root / data["graph"]
+              elsewhere = root.parent / "escaped-graph.json"
+              elsewhere.write_text(companion.read_text())
+              companion.unlink()
+              companion.symlink_to(elsewhere)
           sfile.write_text(json.dumps(data))
           EOF
             python -m contextmesh_mcp --session /tmp/broken >/dev/null 2>/tmp/why.txt
@@ -238,15 +277,144 @@ jobs:
             fi
             echo "  refused ($1): $(head -c 110 /tmp/why.txt)"
           }
-          for how in version escape rounds policy missing foreign; do
+          for how in version escape rounds policy missing foreign renamed generation symlink; do
             break_it "$how" || exit 1
           done
           echo "EVERY BROKEN SESSION REFUSED"
 
+      - name: A question asked after startup outlives the process that asked it
+        run: |
+          python - <<'EOF' | tee /tmp/served.txt
+          import json, pathlib, subprocess, sys
+          from contextmesh_mcp.session import Session
+
+          root = "/tmp/session"
+          named = json.loads((pathlib.Path(root) / "session.json").read_text())
+          saved = json.loads((pathlib.Path(root) / named["resolver"]).read_text())
+          mention = "PG Vector"
+          assert mention.lower() not in saved["aliases"], "fixture already knows it"
+
+          # A separate interpreter asks, checkpoints, and exits. Nothing but
+          # the directory crosses between it and the assertions below.
+          script = (
+              "import sys\n"
+              "from contextmesh_mcp.session import Session, Checkpointer\n"
+              "from contextmesh_mcp import tools\n"
+              "s = Session.load(sys.argv[1])\n"
+              "c = Checkpointer(s)\n"
+              "for q in sys.argv[2:]:\n"
+              "    tools.call(s, 'mesh_ask', {'question': q})\n"
+              "    c.record_mutation()\n"
+              "print(c.commits)\n"
+          )
+          before = Session.load(root)
+          state = lambda s: (
+              len(s.resolver.aliases),
+              len(s.resolver.log),
+              sum(n.walks for n in s.graph.nodes.values()),
+              sum(e.traversals for e in s.graph.edges.values()),
+          )
+          was = state(before)
+
+          proc = subprocess.run(
+              [sys.executable, "-c", script, root,
+               f"What does {mention} depend on?",
+               "What contradicts the sharding assumption?"],
+              capture_output=True, text=True,
+          )
+          assert proc.returncode == 0, proc.stderr
+          assert proc.stdout.strip() == "2", proc.stdout
+
+          after = Session.load(root)
+          now = state(after)
+          print("aliases/log/walks/traversals", was, "->", now)
+          assert all(b > a for a, b in zip(was, now)), (was, now)
+          assert after.generation > before.generation, after.generation
+
+          record = after.resolver.resolve(mention)
+          print(f"{mention!r} -> {record.canonical_id} via {record.reason}")
+          assert record.reason == "alias table", record.reason
+          print("SERVED MUTATIONS SURVIVED THE PROCESS")
+          EOF
+          grep -q "SERVED MUTATIONS SURVIVED THE PROCESS" /tmp/served.txt
+
+      - name: A save never writes to a file the live manifest names
+        run: |
+          python - <<'EOF' | tee /tmp/atomic.txt
+          import json, os, pathlib, shutil
+          from contextmesh_mcp.session import Session
+
+          shutil.rmtree("/tmp/gen", ignore_errors=True)
+          shutil.copytree("/tmp/session", "/tmp/gen")
+          root = pathlib.Path("/tmp/gen")
+          live = root / "session.json"
+          session = Session.load(root)
+
+          # A reader holding the manifest across the commit must still see the
+          # previous generation, whole. That is what os.replace buys, and an
+          # in-place rewrite of the same bytes would not.
+          inode = live.stat().st_ino
+          with open(live, encoding="utf-8") as reader:
+              session.checkpoint()
+              held = json.loads(reader.read())
+          assert live.stat().st_ino != inode, "the manifest was written in place"
+          assert held["generation"] == session.generation - 1, held["generation"]
+          assert (root / held["graph"]).name == held["graph"]
+
+          committed = json.loads(live.read_text())
+          assert committed["generation"] == held["generation"] + 1
+          leftovers = sorted(p.name for p in root.iterdir())
+          assert leftovers == sorted(
+              ["session.json", committed["graph"], committed["resolver"]]
+          ), leftovers
+          print("generation", held["generation"], "->", committed["generation"], leftovers)
+          print("COMMIT IS ATOMIC AND SWEPT")
+          EOF
+          grep -q "COMMIT IS ATOMIC AND SWEPT" /tmp/atomic.txt
+
+      - name: An interrupted save leaves the previous generation serving
+        run: |
+          python - <<'EOF' | tee /tmp/interrupted.txt
+          import json, pathlib, shutil
+          from contextmesh_mcp.session import Session
+
+          shutil.rmtree("/tmp/torn", ignore_errors=True)
+          shutil.copytree("/tmp/session", "/tmp/torn")
+          root = pathlib.Path("/tmp/torn")
+          data = json.loads((root / "session.json").read_text())
+          nxt = data["generation"] + 1
+
+          # Exactly what a crash between the companions and the swap leaves:
+          # a complete new graph, a half-written new resolver, old manifest.
+          Session.load(root).graph.save_json(root / f"graph-{nxt:06d}.json")
+          (root / f"resolver-{nxt:06d}.json").write_text('{"schema": "contextmes')
+
+          back = Session.load(root)
+          assert back.generation == data["generation"], back.generation
+          print("still serving generation", back.generation)
+
+          # And the next real save clears the wreckage rather than tripping on it.
+          back.checkpoint()
+          after = json.loads((root / "session.json").read_text())
+          leftovers = sorted(p.name for p in root.iterdir())
+          assert leftovers == sorted(
+              ["session.json", after["graph"], after["resolver"]]
+          ), leftovers
+          print("recovered to generation", after["generation"], leftovers)
+          print("INTERRUPTED SAVE DID NOT MIX GENERATIONS")
+          EOF
+          grep -q "INTERRUPTED SAVE DID NOT MIX GENERATIONS" /tmp/interrupted.txt
+
       - name: A graph and a resolver that were never a session together
         run: |
           rm -rf /tmp/mixed && cp -r /tmp/session /tmp/mixed
-          python -c "from contextmesh.graph import ContextGraph; ContextGraph().save_json('/tmp/mixed/graph.json')"
+          python - <<'EOF'
+          import json, pathlib
+          from contextmesh.graph import ContextGraph
+          root = pathlib.Path("/tmp/mixed")
+          named = json.loads((root / "session.json").read_text())["graph"]
+          ContextGraph().save_json(root / named)
+          EOF
           if python -m contextmesh_mcp --session /tmp/mixed >/dev/null 2>/tmp/mixed.txt; then
             echo "::error::a resolver was loaded against a graph it does not match"; exit 1
           fi

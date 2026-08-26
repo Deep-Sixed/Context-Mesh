@@ -34,7 +34,14 @@ except ImportError as exc:  # pragma: no cover - depends on the optional extra
     ) from exc
 
 from . import resources, tools
-from .session import SessionError, add_source_arguments, adopt, open_session, session
+from .session import (
+    Checkpointer,
+    SessionError,
+    add_source_arguments,
+    adopt,
+    open_session,
+    session,
+)
 
 SERVER_NAME = "context-mesh"
 INSTRUCTIONS = """\
@@ -65,21 +72,46 @@ def _payload(value: Any) -> str:
     return json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False, default=str)
 
 
-def _run(name: str, arguments: Optional[Dict[str, Any]] = None) -> str:
+#: Set by ``main`` once the session is open. ``None`` while the module is
+#: merely imported, which is how the tool handlers stay callable in tests.
+_CHECKPOINTER: Optional[Checkpointer] = None
+
+
+def _run(
+    name: str, arguments: Optional[Dict[str, Any]] = None, *, mutates: bool = False
+) -> str:
+    """Answer a tool call, and commit afterwards if the call changed anything.
+
+    ``mutates`` is passed at the call site rather than inferred, so adding a
+    sixth tool forces a decision about whether it writes. Only ``mesh_ask``
+    does today: a walk moves ``node.walks`` and ``edge.traversals``, and the
+    resolver learns aliases on a scored match.
+
+    The commit happens after a successful answer and never inside the error
+    paths — a question that failed has nothing worth persisting, and a failing
+    checkpoint must not turn a good answer into a dead channel.
+    """
     try:
-        return _payload(tools.call(session(), name, arguments))
+        result = tools.call(session(), name, arguments)
     except tools.MeshToolError as exc:
         return _payload({"error": "not_found", "tool": name, "message": str(exc)})
     except Exception as exc:  # surface engine errors as data, not a dead channel
         return _payload(
             {"error": type(exc).__name__, "tool": name, "message": str(exc)}
         )
+    if mutates and _CHECKPOINTER is not None:
+        try:
+            _CHECKPOINTER.record_mutation()
+        except Exception as exc:  # a failed write is reported, not fatal
+            print(f"context-mesh: checkpoint failed: {exc}", file=sys.stderr)
+    return _payload(result)
 
 
 # ── tools ────────────────────────────────────────────────────────────────
 @mcp.tool(name="mesh_ask", description=tools.TOOLS["mesh_ask"]["description"])
 def mesh_ask(question: str) -> str:
-    return _run("mesh_ask", {"question": question})
+    # The one tool that writes. See ``_run``.
+    return _run("mesh_ask", {"question": question}, mutates=True)
 
 
 @mcp.tool(name="mesh_get_node", description=tools.TOOLS["mesh_get_node"]["description"])
@@ -164,15 +196,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"contextmesh-mcp: wrote {target}", file=sys.stderr)
         return 0
 
+    global _CHECKPOINTER
     adopt(opened)
+    _CHECKPOINTER = Checkpointer(opened, args.checkpoint)
     described = opened.describe()
+    where = (
+        f"from {opened.path} gen {described['generation']}, checkpoint {args.checkpoint}"
+        if described["persistent"]
+        else "not persistent"
+    )
     print(
         f"context-mesh MCP: {described['nodes_live']}/{described['nodes_total']} nodes live, "
         f"{described['edges_live']}/{described['edges_total']} edges live, "
-        f"read-only, {'from ' + str(opened.path) if described['persistent'] else 'not persistent'}",
+        f"read-only, {where}",
         file=sys.stderr,
     )
-    mcp.run(transport="stdio")
+    try:
+        mcp.run(transport="stdio")
+    finally:
+        # A clean shutdown is the last chance for on-exit, and the safety net
+        # for every-ask if a mutation landed after the final commit.
+        written = _CHECKPOINTER.close()
+        if written is not None:
+            print(f"context-mesh: checkpointed {written}", file=sys.stderr)
     return 0
 
 

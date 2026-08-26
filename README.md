@@ -356,15 +356,34 @@ directory of three separately versioned files:
 
 ```
 session/
-  session.json    contextmesh.session  v1
-  graph.json      contextmesh.graph    v1
-  resolver.json   contextmesh.resolver v1
+  session.json           contextmesh.session  v1  — the manifest, and the commit
+  graph-000003.json      contextmesh.graph    v1
+  resolver-000003.json   contextmesh.resolver v1
 ```
 
 Three formats rather than one because graph snapshot v1 is **closed**. Query
 resolution is not graph state, and folding the resolver in would mean reopening
 a settled format every time the resolver learns a new field. The session file is
 the join.
+
+**A save never writes to a file the current manifest names.** Writing three
+files in sequence is safe the first time and unsafe every time after: crash
+between the graph and the resolver and the directory holds a new graph beside an
+old resolver — a pairing that never existed, and one that can still pass every
+check made on it. So each save commits a whole new *generation* under new names
+and then replaces `session.json` in a single `os.replace`:
+
+```
+crash before the swap  →  the previous generation is still named, intact
+crash during the swap  →  one manifest or the other, never half of one
+crash after the swap   →  the new generation is named, and complete
+```
+
+Superseded files are swept after the commit, so an interrupted save costs disk
+rather than correctness. The guarantee is reader-visible and tested as such: a
+process holding `session.json` open across a save still reads the previous
+generation whole, because `os.replace` gives the manifest a new inode rather
+than rewriting the old one in place.
 
 **The resolver cannot be rebuilt from the graph, and that is the point.**
 `resolve()` writes a scored match back into its alias table, so a run learns
@@ -389,20 +408,52 @@ comes back with a different answer, with nothing in the output to say why.
 **A session directory is untrusted input.** `Session.load` refuses one it cannot
 faithfully restore — wrong schema, unreadable version, a missing or mistyped
 field, a `rounds` written as `true`, a policy naming an edge type this ontology
-does not have. The two filenames in `session.json` must be plain names, so a
-directory you were handed cannot point the loader at `../../etc/passwd`. And one
-check lives here because neither file can make it alone: every entity the
-resolver resolves *to* has to be an entity the graph actually has. Without it a
-resolver saved against one graph loads clean against another and then raises
-`KeyError` on whichever question happens to use that surface form.
+does not have, a manifest whose filenames run ahead of its generation counter.
+The two filenames must be plain names, so a directory you were handed cannot
+point the loader at `../../etc/passwd`, and the files they name must resolve
+*inside* the directory — a correctly named `graph-000001.json` that is a symlink
+to somewhere else is refused too.
 
-**What a restart does not restore**, stated plainly because the suite pins it:
-walk history and the assumption ledger's event log. `mesh_lineage` and
-`mesh_blast_radius` come back identical — both read the graph's own assumption
-records — and every count in `mesh_health` restores exactly. The one field that
-does not is health's `dead_ends` signal, which is computed from the walk list
-and so is absent until the new process has walked. That is a cold start, not a
-lost capability, and `SurfaceEquivalenceTest` asserts it is the *only* one.
+Three checks live here because neither file can make them alone. Every entity
+the resolver resolves *to* must exist in the graph, must be an entity, and must
+carry **the same label**. The first two fail loudly; the third is the quiet one.
+`Resolver.canonical` is not a display string — it is scored against every
+mention that reaches `near_miss` — so a resolver holding `entity:pgvector ->
+"HNSW"` over a graph holding `"pgvector"` keeps resolving, resolves differently,
+and both files are individually valid. The resolver's own log is held to the
+same standard: a record naming an id must carry the label that id has, and a
+resolution has both an id and a label while a miss has neither.
+
+### Checkpoints — because asking is a write
+
+A saved session that is never written back is a durable *starting* snapshot, not
+a durable session. Asking a question moves `node.walks` and `edge.traversals`,
+grows the resolver's log, and teaches it aliases it did not have — so without a
+checkpoint every question asked after startup is discarded on restart, silently,
+including exactly the learned aliases the format exists to keep.
+
+```bash
+contextmesh-mcp --session ./session                       # commit after each ask
+contextmesh-mcp --session ./session --checkpoint on-exit  # commit once, on a clean stop
+contextmesh-mcp --session ./session --checkpoint never    # serve it, never write to it
+```
+
+`every-ask` is the default and it is the expensive one on purpose: one full
+serialisation per question is a real cost, and a silently lost question is a
+worse one. `on-exit` is cheaper and worth nothing if the process is killed
+rather than asked to stop. `never` is the honest choice for a directory you were
+handed and do not own. `mesh_ask` is the only tool that triggers a commit —
+which is asserted at the call site rather than inferred, so a sixth tool forces
+a decision about whether it writes.
+
+**What a restart still does not restore**, stated plainly because the suite pins
+it: the walker's in-process walk list, and the assumption ledger's event log.
+`mesh_lineage` and `mesh_blast_radius` come back identical — both read the
+graph's own assumption records — and every *count* in `mesh_health` restores
+exactly. The one field that does not is health's `dead_ends` signal, computed
+from the walk list and so absent until the new process has walked. That is a
+cold start, not a lost capability, and `SurfaceEquivalenceTest` asserts it is
+the *only* one.
 
 ## MCP — read-only, experimental
 
@@ -472,9 +523,10 @@ is and whether anything a client reads outlives the server.
 }
 ```
 
-What is still missing before this is agent memory: nothing writes *into* a
-session from the client side. Structure and belief change only through the
-engine, and execution state does not persist at all — see above.
+What a client does to a served session now survives it — see **Checkpoints**
+above. What is still missing before this is agent memory: nothing writes
+*structure or belief* into a session from the client side. Those change only
+through the engine, and execution state does not persist at all.
 
 The core stays untouched by all of this: `contextmesh` remains Python 3.9+ with
 zero dependencies, the MCP SDK arrives only through the `[mcp]` extra, and
@@ -507,7 +559,7 @@ contextmesh_mcp/             read-only MCP server (optional extra, 3.10+)
 dashboard/                   the rebuilt dashboard
 docs/                        the capture spec and the architecture notes
 examples/                    the original standalone control-layer sketch
-tests/                       355 tests over the invariants above
+tests/                       391 tests over the invariants above
 ```
 
 ## Staying publishable
