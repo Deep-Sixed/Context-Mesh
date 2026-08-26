@@ -118,6 +118,27 @@ never propagate — that is what makes this selective rather than a purge.
 `supersedes` never deletes, so decision history stays append-only and "why did
 we change our mind" is answered by walking, not by reading a changelog.
 
+### The standalone control layer
+
+`examples/assumption_control_layer.py` is the original single-file sketch of
+these ideas — a seven-node executor that carries an assumption on an edge,
+rejects it mid-run, and re-executes only what stood on it:
+
+```
+INTENT → DECOMPOSE → WORKER → AUDIT → DRIFT → LEDGER → ROOT
+             ↘
+              BRANCH_C1 → BRANCH_C2   (unrelated, must survive)
+```
+
+```bash
+python examples/assumption_control_layer.py
+# OVERALL: ALL ACCEPTANCE CHECKS PASSED
+```
+
+It runs on its own with nothing imported from the package, and it is kept
+because the whole idea fits on one screen there. `contextmesh/assumptions.py`
+and `contextmesh/decisions.py` are the version the rest of this repository uses.
+
 ## Graph health
 
 The states a long-running graph drifts into, none of which are errors:
