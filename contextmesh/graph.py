@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import json
 from collections import defaultdict
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set
 
 from .model import (
     Assumption,
@@ -15,6 +16,31 @@ from .model import (
     slug,
 )
 from .ontology import ONTOLOGY, Ontology, OntologyError
+
+#: The durable snapshot format. Separate from ``mesh.json``, which is the
+#: dashboard's projection: a view may be shaped for whatever reads it, a state
+#: contract may not. Bump ``SNAPSHOT_VERSION`` for any change that makes an
+#: older file load into a different graph — including a change to how node or
+#: edge ids are derived, since the loader checks the ids it recomputes.
+SNAPSHOT_SCHEMA = "contextmesh.graph"
+SNAPSHOT_VERSION = 1
+
+
+class SnapshotError(Exception):
+    """Raised when a snapshot is not a graph this build can faithfully restore.
+
+    Separate from :class:`OntologyError`, which the loader also lets through:
+    an illegal edge pair in a file is an ontology violation and should say so,
+    while a duplicate id or a missing record is a corrupt container.
+    """
+
+
+def _no_constants(value: str) -> float:
+    """json.load hook. ``NaN``/``Infinity`` are not JSON and do not round-trip."""
+    raise SnapshotError(
+        f"snapshot contains the non-JSON constant {value!r}; a durable graph "
+        "cannot hold values that other parsers will refuse"
+    )
 
 
 class ContextGraph:
@@ -207,12 +233,179 @@ class ContextGraph:
 
     # ── serialisation ────────────────────────────────────────────────────
     def to_dict(self) -> Dict[str, Any]:
+        """The durable snapshot: everything needed to rebuild this graph.
+
+        Records are emitted in **insertion order**, not sorted. That is not an
+        oversight. The walker's frontier is a heap whose tie-breaker is an
+        insertion counter (``traverse.py``), and expansions arrive in
+        ``_out``/``_in`` order — so for two equal-cost branches, adjacency order
+        decides which path an answer takes. Sorting the arrays would reorder
+        those lists on reload and could change an answer without changing a
+        single fact. Sorting the *keys* of each JSON object is safe and
+        ``save_json`` does exactly that.
+
+        ``_out``, ``_in`` and ``_edge_key`` are deliberately absent: they are
+        rebuilt by :meth:`from_dict` through ``add_edge``. Persisting them would
+        tie the format to today's internals and let a snapshot carry indexes
+        that disagree with its own edges.
+        """
         return {
+            "schema": SNAPSHOT_SCHEMA,
+            "version": SNAPSHOT_VERSION,
             "build": self.build,
             "nodes": [n.to_dict() for n in self.nodes.values()],
             "edges": [e.to_dict() for e in self.edges.values()],
             "assumptions": [a.to_dict() for a in self.assumptions.values()],
         }
+
+    @classmethod
+    def from_dict(
+        cls, data: Dict[str, Any], *, ontology: Ontology = ONTOLOGY
+    ) -> "ContextGraph":
+        """Rebuild a graph from a snapshot, re-checking it on the way in.
+
+        A snapshot is untrusted input. Every edge goes back through
+        :meth:`add_edge`, so ``GRAPH.md`` typechecks it exactly as it would a
+        live write, and the adjacency indexes are reconstructed rather than
+        believed. A loader that writes straight into the internal dictionaries
+        is faster and admits graphs the live API would refuse — which makes the
+        ontology a convention that holds only until something is saved.
+        """
+        if not isinstance(data, dict):
+            raise SnapshotError(f"snapshot must be an object, got {type(data).__name__}")
+        schema = data.get("schema")
+        if schema != SNAPSHOT_SCHEMA:
+            raise SnapshotError(
+                f"not a {SNAPSHOT_SCHEMA} snapshot: schema is {schema!r}"
+            )
+        version = data.get("version")
+        if version != SNAPSHOT_VERSION:
+            raise SnapshotError(
+                f"snapshot version {version!r} cannot be read by this build, "
+                f"which writes and reads version {SNAPSHOT_VERSION}"
+            )
+
+        graph = cls(ontology)
+        node_rows = list(data.get("nodes") or [])
+        edge_rows = list(data.get("edges") or [])
+        assumption_rows = list(data.get("assumptions") or [])
+
+        # ── nodes, in snapshot order so adjacency order survives ──────────
+        seen_nodes: Set[str] = set()
+        for row in node_rows:
+            node = Node.from_dict(row)
+            if node.id in seen_nodes:
+                raise SnapshotError(f"duplicate node id {node.id!r}")
+            seen_nodes.add(node.id)
+            restored = graph.add_node(
+                node.type,
+                node.label,
+                id=node.id,
+                attrs=node.attrs,
+                provenance=node.provenance,
+                embedding=node.embedding,
+            )
+            # State add_node does not take, because a live write never sets it.
+            restored.build = node.build
+            restored.walks = node.walks
+            restored.pruned = node.pruned
+            restored.invalidated = node.invalidated
+
+        # ── assumption records ────────────────────────────────────────────
+        for row in assumption_rows:
+            assumption = Assumption.from_dict(row)
+            if assumption.id in graph.assumptions:
+                raise SnapshotError(f"duplicate assumption id {assumption.id!r}")
+            node = graph.nodes.get(assumption.id)
+            if node is None:
+                raise SnapshotError(
+                    f"assumption {assumption.id!r} has no node in the snapshot"
+                )
+            if node.type is not NodeType.ASSUMPTION:
+                raise SnapshotError(
+                    f"assumption {assumption.id!r} maps to a "
+                    f"{node.type.value!r} node"
+                )
+            if node.label != assumption.statement:
+                raise SnapshotError(
+                    f"assumption {assumption.id!r}: node label and statement disagree"
+                )
+            graph.assumptions[assumption.id] = assumption
+        for node in graph.nodes.values():
+            if node.type is NodeType.ASSUMPTION and node.id not in graph.assumptions:
+                raise SnapshotError(
+                    f"assumption node {node.id!r} has no assumption record"
+                )
+
+        # ── edges, back through add_edge so the ontology gets a say ───────
+        seen_edges: Set[str] = set()
+        seen_keys: Set[tuple] = set()
+        for row in edge_rows:
+            stored = Edge.from_dict(row)
+            if stored.id in seen_edges:
+                raise SnapshotError(f"duplicate edge id {stored.id!r}")
+            seen_edges.add(stored.id)
+            key = (stored.src, stored.type.value, stored.dst)
+            # add_edge treats a repeated relationship as another observation
+            # and adds to its weight. That is right while building a graph and
+            # wrong while restoring one: the weight is already in the snapshot,
+            # so a duplicate here is corruption, not evidence.
+            if key in seen_keys:
+                raise SnapshotError(
+                    f"duplicate relationship {stored.src!r}"
+                    f"-[{stored.type.value}]->{stored.dst!r}"
+                )
+            seen_keys.add(key)
+            edge = graph.add_edge(
+                stored.src,
+                stored.type,
+                stored.dst,
+                assumption_id=stored.assumption_id,
+                evidence_ids=stored.evidence_ids,
+                weight=stored.weight,
+            )
+            # Edge identity is derived from (src, type, dst), so a snapshot id
+            # that disagrees with the recomputed one means the file was edited
+            # or written by a build with a different id scheme. Either way it
+            # is not restorable here. Changing how ids are derived is therefore
+            # a SNAPSHOT_VERSION bump, not a quiet refactor.
+            if edge.id != stored.id:
+                raise SnapshotError(
+                    f"edge id {stored.id!r} does not match the id this build "
+                    f"derives for the same relationship ({edge.id!r})"
+                )
+            edge.build = stored.build
+            edge.traversals = stored.traversals
+            edge.invalidated = stored.invalidated
+
+        graph.build = int(data.get("build", 0))
+        return graph
+
+    # ── files ────────────────────────────────────────────────────────────
+    def save_json(self, path: Any) -> Any:
+        """Write the snapshot. Object keys sorted; record arrays left alone."""
+        from pathlib import Path
+
+        target = Path(path)
+        payload = json.dumps(
+            self.to_dict(),
+            sort_keys=True,
+            indent=2,
+            ensure_ascii=False,
+            # NaN and Infinity are Python's, not JSON's. Refusing them here
+            # means a snapshot that saves is a snapshot other tools can read.
+            allow_nan=False,
+        )
+        target.write_text(payload + "\n", encoding="utf-8")
+        return target
+
+    @classmethod
+    def load_json(cls, path: Any, *, ontology: Ontology = ONTOLOGY) -> "ContextGraph":
+        from pathlib import Path
+
+        text = Path(path).read_text(encoding="utf-8")
+        data = json.loads(text, parse_constant=_no_constants)
+        return cls.from_dict(data, ontology=ontology)
 
     def __iter__(self) -> Iterator[Node]:
         return iter(self.nodes.values())

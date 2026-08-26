@@ -73,6 +73,19 @@ class Provenance:
             "recorded_at_build": self.recorded_at_build,
         }
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Provenance":
+        span = data.get("span")
+        return cls(
+            source_id=data["source_id"],
+            # A span is a tuple in memory and a list in JSON. Restoring it as a
+            # list would make an otherwise identical graph compare unequal.
+            span=tuple(span) if span else None,
+            extractor=data.get("extractor", "rule"),
+            checks=list(data.get("checks") or []),
+            recorded_at_build=int(data.get("recorded_at_build", 0)),
+        )
+
 
 @dataclass
 class Node:
@@ -98,12 +111,34 @@ class Node:
             "label": self.label,
             "attrs": dict(self.attrs),
             "provenance": self.provenance.to_dict() if self.provenance else None,
+            # ``embedded`` is the cheap view flag the dashboard-era code reads.
+            # ``embedding`` is the state: without the actual vector a reloaded
+            # graph seeds walks differently, so the snapshot would restore a
+            # graph that looks identical and does not reason identically.
             "embedded": self.embedding is not None,
+            "embedding": list(self.embedding) if self.embedding is not None else None,
             "build": self.build,
             "walks": self.walks,
             "pruned": self.pruned,
             "invalidated": self.invalidated,
         }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Node":
+        provenance = data.get("provenance")
+        embedding = data.get("embedding")
+        return cls(
+            id=data["id"],
+            type=NodeType(data["type"]),
+            label=data["label"],
+            attrs=dict(data.get("attrs") or {}),
+            provenance=Provenance.from_dict(provenance) if provenance else None,
+            embedding=list(embedding) if embedding is not None else None,
+            build=int(data.get("build", 0)),
+            walks=int(data.get("walks", 0)),
+            pruned=bool(data.get("pruned", False)),
+            invalidated=bool(data.get("invalidated", False)),
+        )
 
 
 @dataclass
@@ -138,6 +173,21 @@ class Edge:
             "invalidated": self.invalidated,
         }
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Edge":
+        return cls(
+            id=data["id"],
+            src=data["src"],
+            dst=data["dst"],
+            type=EdgeType(data["type"]),
+            assumption_id=data.get("assumption_id"),
+            evidence_ids=list(data.get("evidence_ids") or []),
+            weight=float(data.get("weight", 1.0)),
+            build=int(data.get("build", 0)),
+            traversals=int(data.get("traversals", 0)),
+            invalidated=bool(data.get("invalidated", False)),
+        )
+
 
 @dataclass
 class Assumption:
@@ -167,3 +217,18 @@ class Assumption:
             "rejected_at_build": self.rejected_at_build,
             "evidence_ids": list(self.evidence_ids),
         }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Assumption":
+        return cls(
+            id=data["id"],
+            statement=data["statement"],
+            status=AssumptionStatus(data["status"]),
+            version=int(data.get("version", 1)),
+            created_by=data.get("created_by", "system"),
+            created_at_build=int(data.get("created_at_build", 0)),
+            supersedes=data.get("supersedes"),
+            superseded_by=data.get("superseded_by"),
+            rejected_at_build=data.get("rejected_at_build"),
+            evidence_ids=list(data.get("evidence_ids") or []),
+        )

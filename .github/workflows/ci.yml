@@ -157,6 +157,48 @@ jobs:
           python examples/assumption_control_layer.py | tee /tmp/acl.txt
           grep -q "ALL ACCEPTANCE CHECKS PASSED" /tmp/acl.txt
 
+      - name: A saved graph reloads into the same graph
+        run: |
+          python - <<'EOF' | tee /tmp/persist.txt
+          import tempfile, pathlib
+          from contextmesh.demo import run
+          from contextmesh.graph import ContextGraph
+          g = run(rounds=4).graph
+          with tempfile.TemporaryDirectory() as tmp:
+              p = pathlib.Path(tmp) / "graph.json"
+              g.save_json(p)
+              back = ContextGraph.load_json(p)
+              # Saving the reload must reproduce the file byte for byte.
+              q = pathlib.Path(tmp) / "again.json"
+              back.save_json(q)
+              assert p.read_bytes() == q.read_bytes(), "snapshot is not stable"
+              print(f"nodes {len(back.nodes)} edges {len(back.edges)} "
+                    f"assumptions {len(back.assumptions)} bytes {p.stat().st_size:,}")
+          assert back.to_dict() == g.to_dict()
+          assert back.untyped_edges == 0
+          print("SNAPSHOT ROUND TRIP OK")
+          EOF
+          grep -q "SNAPSHOT ROUND TRIP OK" /tmp/persist.txt
+
+      - name: A corrupt snapshot is refused rather than loaded
+        run: |
+          python - <<'EOF'
+          import json
+          from contextmesh.demo import run
+          from contextmesh.graph import ContextGraph, SnapshotError
+          from contextmesh.ontology import OntologyError
+          payload = json.loads(json.dumps(run(rounds=2).graph.to_dict()))
+          edge = next(e for e in payload["edges"] if e["type"] == "mentions")
+          edge["type"] = "resolves_to"
+          edge["id"] = "edge:hand-written"
+          try:
+              ContextGraph.from_dict(payload)
+          except OntologyError as exc:
+              print("illegal pair refused on load:", str(exc)[:70])
+          else:
+              raise SystemExit("::error::a snapshot bypassed GRAPH.md on load")
+          EOF
+
       - name: The build is reproducible across hash seeds
         run: |
           PYTHONHASHSEED=0    python -m contextmesh export --out /tmp/a.json

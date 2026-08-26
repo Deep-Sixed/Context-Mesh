@@ -37,7 +37,7 @@ python -m contextmesh export --inline # regenerate the dashboard's data
 ```
 
 No dependencies. Python 3.9+. `python -m unittest discover -s tests` runs the
-suite (183 tests). CI runs it on 3.9 through 3.13, plus ruff and a set of
+suite (228 tests). CI runs it on 3.9 through 3.13, plus ruff and a set of
 end-to-end smoke checks — including that a build is byte-identical across
 `PYTHONHASHSEED`, and that `dashboard/data/mesh.json` still matches what the
 engine produces.
@@ -269,6 +269,51 @@ every panel to the call that produces it and is explicit about what is a live
 stream and what is a snapshot. [`docs/DASHBOARD_SPEC.md`](docs/DASHBOARD_SPEC.md)
 is the frame-by-frame record of the original capture.
 
+## Persistence
+
+```python
+graph.save_json("graph.json")
+graph = ContextGraph.load_json("graph.json")
+```
+
+A versioned snapshot (`contextmesh.graph` v1) that restores the same graph, not
+a graph that looks the same. Nodes carry their actual embedding vector, not a
+`embedded: true` flag; provenance spans come back as tuples; `walks`,
+`traversals`, `pruned` and `invalidated` all survive.
+
+**A snapshot is untrusted input.** Every edge is restored through `add_edge`, so
+`GRAPH.md` typechecks a file exactly as it would a live write, and `_out`,
+`_in` and `_edge_key` are rebuilt rather than persisted. A loader that writes
+straight into the internal dictionaries is faster and admits graphs the live API
+would refuse — which makes the ontology a convention that holds only until
+something is saved. The suite corrupts a good snapshot eighteen ways and
+requires each to be refused: illegal pair, unknown type, dangling edge, self
+edge, duplicate node/edge/relationship, an edge id this build would not derive,
+every assumption/node mismatch, bad schema, future version, and `NaN`.
+
+**Records are emitted in insertion order, never sorted.** That is load-bearing.
+The walker's frontier is a heap whose tie-breaker is an insertion counter, and
+the lexical fallback iterates `graph.nodes`, so two equal-cost branches are
+decided by which was added first:
+
+```
+edges added alpha-first: answer = alpha  (hops 2, score 0.2750)
+edges added bravo-first: answer = bravo  (hops 2, score 0.2750)
+```
+
+Same facts, same score, different answer. Sorting the arrays would reorder those
+lists on reload and change answers without changing anything true, so
+`tests/test_persistence.py` builds that tie deliberately and asserts a round
+trip preserves it. Sorting the *keys* of each JSON object is safe, and
+`save_json` does that — along with `allow_nan=False`, because a snapshot other
+parsers refuse is not durable.
+
+What persistence does **not** yet cover: the resolver, and the execution state
+in `Runner`. A reloaded graph answers, invalidates and reports health
+identically; rebuilding a `Walker` still needs a resolver, and resuming a
+selective re-execution still needs the task registry. Those are the next two
+milestones.
+
 ## MCP — read-only, experimental
 
 ```bash
@@ -330,6 +375,7 @@ GRAPH.md                     the ontology, parsed at import
 contextmesh/
   ontology.py                GRAPH.md → the schema every write is checked against
   model.py  graph.py         typed nodes, typed edges, no untyped code path
+                             and the versioned snapshot it saves and reloads as
   resolve.py                 entity resolution — one id per real-world thing
   pipeline.py                CHUNK → EXTRACT → RESOLVE → LINK → EMBED → PRUNE
   traverse.py                walks, evidence paths, the four dead-end reasons
@@ -345,7 +391,7 @@ contextmesh_mcp/             read-only MCP server (optional extra, 3.10+)
 dashboard/                   the rebuilt dashboard
 docs/                        the capture spec and the architecture notes
 examples/                    the original standalone control-layer sketch
-tests/                       183 tests over the invariants above
+tests/                       228 tests over the invariants above
 ```
 
 ## Staying publishable
