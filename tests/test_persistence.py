@@ -384,6 +384,106 @@ class IntegrityTest(unittest.TestCase):
         p["assumptions"][0]["statement"] = claim["label"]
         self.refuses(p)
 
+    # ── field types: a snapshot fails closed, it does not coerce ─────────
+    def test_a_string_flag_does_not_become_true(self):
+        """The sharpest case: bool("false") is True.
+
+        Coercing here would let a malformed snapshot turn a live node into an
+        invalidated one, silently, with no other sign that anything was wrong.
+        """
+        for field in ("invalidated", "pruned"):
+            with self.subTest(field=field):
+                p = self.payload()
+                p["nodes"][0][field] = "false"
+                self.refuses(p, ValueError)
+
+    def test_a_boolean_is_not_a_count(self):
+        # bool is a subclass of int, so True would arrive as 1.
+        for field in ("walks", "build"):
+            with self.subTest(field=field):
+                p = self.payload()
+                p["nodes"][0][field] = True
+                self.refuses(p, ValueError)
+
+    def test_a_negative_counter_is_refused(self):
+        p = self.payload()
+        p["nodes"][0]["walks"] = -1
+        self.refuses(p, ValueError)
+
+    def test_a_span_must_be_a_pair(self):
+        for span in ([1, 2, 3], [1], "0-4", 4):
+            with self.subTest(span=span):
+                p = self.payload()
+                node = next(n for n in p["nodes"] if n["provenance"])
+                node["provenance"]["span"] = span
+                self.refuses(p, ValueError)
+
+    def test_a_string_does_not_become_a_vector(self):
+        # list("abc") is ["a", "b", "c"], which would restore as an embedding.
+        p = self.payload()
+        p["nodes"][0]["embedding"] = "abc"
+        p["nodes"][0]["embedded"] = True
+        self.refuses(p, ValueError)
+
+    def test_a_vector_of_non_numbers_is_refused(self):
+        p = self.payload()
+        p["nodes"][0]["embedding"] = ["not-a-number"]
+        p["nodes"][0]["embedded"] = True
+        self.refuses(p, ValueError)
+
+    def test_the_embedded_flag_must_agree_with_the_vector(self):
+        p = self.payload()
+        p["nodes"][0]["embedding"] = None
+        p["nodes"][0]["embedded"] = True
+        self.refuses(p, ValueError)
+        p = self.payload()
+        p["nodes"][0]["embedding"] = [0.5]
+        p["nodes"][0]["embedded"] = False
+        self.refuses(p, ValueError)
+
+    def test_a_non_finite_weight_is_refused(self):
+        p = self.payload()
+        p["edges"][0]["weight"] = "not-a-number"
+        self.refuses(p, ValueError)
+
+    def test_evidence_ids_must_be_strings(self):
+        p = self.payload()
+        p["edges"][0]["evidence_ids"] = [1, 2]
+        self.refuses(p, ValueError)
+
+    def test_attrs_must_be_an_object(self):
+        p = self.payload()
+        p["nodes"][0]["attrs"] = ["not", "an", "object"]
+        self.refuses(p, ValueError)
+
+    def test_an_assumption_version_below_one_is_refused(self):
+        p = self.payload()
+        p["assumptions"][0]["version"] = 0
+        self.refuses(p, ValueError)
+
+    # ── the assumption mirror ────────────────────────────────────────────
+    def test_a_status_the_node_and_the_record_disagree_on(self):
+        p = self.payload()
+        node = next(n for n in p["nodes"] if n["id"] == self.assumption_id)
+        node["attrs"]["status"] = "rejected"
+        with self.assertRaises(SnapshotError) as caught:
+            ContextGraph.from_dict(p)
+        self.assertIn("status", str(caught.exception))
+
+    def test_a_version_the_node_and_the_record_disagree_on(self):
+        p = self.payload()
+        node = next(n for n in p["nodes"] if n["id"] == self.assumption_id)
+        node["attrs"]["version"] = 99
+        with self.assertRaises(SnapshotError) as caught:
+            ContextGraph.from_dict(p)
+        self.assertIn("version", str(caught.exception))
+
+    def test_a_missing_mirror_is_refused(self):
+        p = self.payload()
+        node = next(n for n in p["nodes"] if n["id"] == self.assumption_id)
+        node["attrs"] = {}
+        self.refuses(p)
+
     # ── non-JSON values ──────────────────────────────────────────────────
     def test_saving_a_nan_is_refused_rather_than_written(self):
         self.graph.node(next(iter(self.graph.nodes))).attrs["score"] = float("nan")
@@ -409,6 +509,63 @@ class IntegrityTest(unittest.TestCase):
             path.write_text(text, encoding="utf-8")
             with self.assertRaises(SnapshotError):
                 ContextGraph.load_json(path)
+
+
+class AssumptionMirrorTest(unittest.TestCase):
+    """status and version live on the record and on the node. They must agree.
+
+    The loader refusing disagreement is only safe if the live code keeps them
+    in step. It did not: two paths bumped ``version`` on the record alone, and
+    both demos carried a mismatch. These pin the fix.
+    """
+
+    def mismatches(self, graph):
+        return [
+            (aid, field)
+            for aid, assumption in graph.assumptions.items()
+            for field, recorded in (
+                ("status", assumption.status.value),
+                ("version", assumption.version),
+            )
+            if graph.nodes[aid].attrs.get(field) != recorded
+        ]
+
+    def test_the_corpus_demo_keeps_them_in_step(self):
+        self.assertEqual(self.mismatches(demo_graph().graph), [])
+
+    def test_rejecting_with_a_replacement_keeps_them_in_step(self):
+        from contextmesh.assumptions import AssumptionLedger
+
+        graph = ContextGraph()
+        graph.build = 1
+        ledger = AssumptionLedger(graph)
+        original = ledger.assume("shards grow linearly")
+        report = ledger.reject(original.id, replacement="shards grow with tenant skew")
+        self.assertIsNotNone(report.replacement_id)
+        replacement = graph.assumptions[report.replacement_id]
+        self.assertEqual(replacement.version, original.version + 1)
+        self.assertEqual(self.mismatches(graph), [])
+
+    def test_a_runner_repair_keeps_them_in_step(self):
+        from contextmesh.execute import demo as execute_demo
+
+        self.assertEqual(self.mismatches(execute_demo().runner.graph), [])
+
+    def test_superseding_keeps_them_in_step(self):
+        from contextmesh.assumptions import AssumptionLedger
+
+        graph = ContextGraph()
+        graph.build = 1
+        ledger = AssumptionLedger(graph)
+        first = ledger.assume("v1")
+        ledger.supersede(first.id, "v2")
+        self.assertEqual(self.mismatches(graph), [])
+
+    def test_a_graph_that_has_been_repaired_still_round_trips(self):
+        from contextmesh.execute import demo as execute_demo
+
+        graph = execute_demo().runner.graph
+        self.assertEqual(ContextGraph.from_dict(graph.to_dict()).to_dict(), graph.to_dict())
 
 
 class BehaviourTest(unittest.TestCase):

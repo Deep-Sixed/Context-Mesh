@@ -26,7 +26,7 @@ SNAPSHOT_SCHEMA = "contextmesh.graph"
 SNAPSHOT_VERSION = 1
 
 
-class SnapshotError(Exception):
+class SnapshotError(ValueError):
     """Raised when a snapshot is not a graph this build can faithfully restore.
 
     Separate from :class:`OntologyError`, which the loader also lets through:
@@ -231,6 +231,20 @@ class ContextGraph:
         )
         return assumption
 
+    def sync_assumption(self, assumption: Assumption) -> Node:
+        """Refresh the node's copy of an assumption's lifecycle fields.
+
+        ``status`` and ``version`` live on the record *and* are projected onto
+        the node so a walk can read them without a second lookup. Every path
+        that changes the record has to call this, or the graph holds two
+        answers to one question — which is exactly what a snapshot cannot
+        represent, and what :meth:`from_dict` now refuses to restore.
+        """
+        node = self.nodes[assumption.id]
+        node.attrs["status"] = assumption.status.value
+        node.attrs["version"] = assumption.version
+        return node
+
     # ── serialisation ────────────────────────────────────────────────────
     def to_dict(self) -> Dict[str, Any]:
         """The durable snapshot: everything needed to rebuild this graph.
@@ -330,6 +344,20 @@ class ContextGraph:
                 raise SnapshotError(
                     f"assumption {assumption.id!r}: node label and statement disagree"
                 )
+            # ``status`` and ``version`` are stored twice — on the record and
+            # projected onto the node. Both are durable, so a snapshot where
+            # they disagree has two answers to one question and neither can be
+            # trusted; picking one silently would make a reload a repair.
+            for field, recorded in (
+                ("status", assumption.status.value),
+                ("version", assumption.version),
+            ):
+                mirrored = node.attrs.get(field)
+                if mirrored != recorded:
+                    raise SnapshotError(
+                        f"assumption {assumption.id!r}: node attrs say "
+                        f"{field}={mirrored!r} but the record says {recorded!r}"
+                    )
             graph.assumptions[assumption.id] = assumption
         for node in graph.nodes.values():
             if node.type is NodeType.ASSUMPTION and node.id not in graph.assumptions:

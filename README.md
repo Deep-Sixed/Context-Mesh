@@ -37,7 +37,7 @@ python -m contextmesh export --inline # regenerate the dashboard's data
 ```
 
 No dependencies. Python 3.9+. `python -m unittest discover -s tests` runs the
-suite (228 tests). CI runs it on 3.9 through 3.13, plus ruff and a set of
+suite (247 tests). CI runs it on 3.9 through 3.13, plus ruff and a set of
 end-to-end smoke checks — including that a build is byte-identical across
 `PYTHONHASHSEED`, and that `dashboard/data/mesh.json` still matches what the
 engine produces.
@@ -281,15 +281,19 @@ a graph that looks the same. Nodes carry their actual embedding vector, not a
 `embedded: true` flag; provenance spans come back as tuples; `walks`,
 `traversals`, `pruned` and `invalidated` all survive.
 
-**A snapshot is untrusted input.** Every edge is restored through `add_edge`, so
-`GRAPH.md` typechecks a file exactly as it would a live write, and `_out`,
-`_in` and `_edge_key` are rebuilt rather than persisted. A loader that writes
-straight into the internal dictionaries is faster and admits graphs the live API
-would refuse — which makes the ontology a convention that holds only until
-something is saved. The suite corrupts a good snapshot eighteen ways and
-requires each to be refused: illegal pair, unknown type, dangling edge, self
-edge, duplicate node/edge/relationship, an edge id this build would not derive,
-every assumption/node mismatch, bad schema, future version, and `NaN`.
+**A snapshot is untrusted input, and it fails closed.** Every edge is restored
+through `add_edge`, so `GRAPH.md` typechecks a file exactly as it would a live
+write, and `_out`, `_in` and `_edge_key` are rebuilt rather than persisted. A
+loader that writes straight into the internal dictionaries is faster and admits
+graphs the live API would refuse — which makes the ontology a convention that
+holds only until something is saved.
+
+Fields are checked rather than coerced, because coercion is not harmless here:
+`bool("false")` is `True`, so a malformed flag would quietly turn a live node
+into an invalidated one; `list("abc")` would turn a string into a
+three-element "vector"; and `bool` being a subclass of `int` means a count
+written as a flag would arrive as `1`. The suite corrupts a good snapshot
+thirty ways and requires each to be refused.
 
 **Records are emitted in insertion order, never sorted.** That is load-bearing.
 The walker's frontier is a heap whose tie-breaker is an insertion counter, and
@@ -307,6 +311,13 @@ lists on reload and change answers without changing anything true, so
 trip preserves it. Sorting the *keys* of each JSON object is safe, and
 `save_json` does that — along with `allow_nan=False`, because a snapshot other
 parsers refuse is not durable.
+
+One thing the snapshot **cannot** represent: disagreement. An assumption's
+`status` and `version` are stored on the record and projected onto its node so a
+walk can read them without a second lookup. The loader refuses a file where the
+two disagree — and enforcing that surfaced a real bug, since two paths bumped
+`version` on the record alone and left the mirror stale. `graph.sync_assumption`
+is now the one place that writes it.
 
 What persistence does **not** yet cover: the resolver, and the execution state
 in `Runner`. A reloaded graph answers, invalidates and reports health
@@ -391,7 +402,7 @@ contextmesh_mcp/             read-only MCP server (optional extra, 3.10+)
 dashboard/                   the rebuilt dashboard
 docs/                        the capture spec and the architecture notes
 examples/                    the original standalone control-layer sketch
-tests/                       228 tests over the invariants above
+tests/                       247 tests over the invariants above
 ```
 
 ## Staying publishable
