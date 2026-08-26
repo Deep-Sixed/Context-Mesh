@@ -196,6 +196,21 @@ examples/                    the original standalone control-layer sketch
 tests/                       87 tests over the invariants above
 ```
 
+## Staying publishable
+
+This repository is public and carries nothing internal. `ops/leak-check.sh`
+makes that checkable rather than asserted — it scans tracked content for
+secrets, email addresses and machine-local paths, and commit *metadata* for
+private session URLs and non-no-reply author addresses, which is where leaks
+of this kind actually hide.
+
+```bash
+ops/leak-check.sh              # the whole history
+ops/leak-check.sh origin/main  # only what a branch adds
+```
+
+CI runs the second form on every pull request.
+
 ## Where it fits
 
 Context Mesh complements retrieval and agent memory rather than replacing them.

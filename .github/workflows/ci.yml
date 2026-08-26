@@ -42,6 +42,23 @@ jobs:
       - run: pipx install ruff
       - run: ruff check contextmesh tests dashboard/bundle.py
 
+  leaks:
+    name: no private data
+    # Scoped to what the pull request adds. The repository's existing history
+    # predates this check and carries a personal author address; blocking every
+    # PR on that decision would be the wrong place to force it. Run
+    # `ops/leak-check.sh` with no argument locally to audit the whole history.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Nothing private in what this PR adds
+        run: |
+          git fetch --no-tags origin "${{ github.event.pull_request.base.ref }}"
+          ops/leak-check.sh "origin/${{ github.event.pull_request.base.ref }}"
+
   smoke:
     name: cli · demo · export
     runs-on: ubuntu-latest
