@@ -539,6 +539,130 @@ jobs:
           EOF
           grep -q "KERNEL LOCK RELEASED ON DEATH" /tmp/killed.txt
 
+      - name: A hostile directory cannot make a checkpoint write outside it
+        run: |
+          python - <<'EOF' | tee /tmp/symlink.txt
+          import json, os, pathlib, shutil
+          from contextmesh_mcp.session import Session, SessionError
+
+          def fresh(case):
+              root = pathlib.Path(f"/tmp/hostile-{case}")
+              shutil.rmtree(root, ignore_errors=True)
+              shutil.copytree("/tmp/session", root, symlinks=True)
+              outside = pathlib.Path(f"/tmp/PRECIOUS-{case}.txt")
+              outside.write_text("precious")
+              return root, outside, json.loads((root / "session.json").read_text())
+
+          results = []
+          # The three names a save writes. A rename replaces a planted link
+          # rather than following it, so the outside file is never touched.
+          for case, key in (("graph", "graph"), ("resolver", "resolver")):
+              root, outside, manifest = fresh(case)
+              nxt = manifest["generation"] + 1
+              stem = "graph" if key == "graph" else "resolver"
+              planted = root / f"{stem}-{nxt:06d}.json"
+              planted.symlink_to(outside)
+              Session.load(root).checkpoint()
+              assert outside.read_text() == "precious", f"{case}: wrote through the link"
+              assert not planted.is_symlink(), f"{case}: link survived"
+              results.append(f"{case}: link replaced, outside intact")
+
+          # The lock cannot be replaced -- it must keep one inode for the
+          # kernel lock -- so it is refused instead.
+          for case, plant in (
+              ("lock-symlink", lambda root, outside: root.joinpath("session.lock").symlink_to(outside)),
+              ("lock-fifo", lambda root, outside: os.mkfifo(str(root / "session.lock"))),
+          ):
+              root, outside, _ = fresh(case)
+              (root / "session.lock").unlink()
+              plant(root, outside)
+              try:
+                  Session.load(root).checkpoint()
+                  raise SystemExit(f"::error::{case} was accepted as a session lock")
+              except SessionError as exc:
+                  assert "regular file" in str(exc), str(exc)
+              assert outside.read_text() == "precious", f"{case}: outside was written"
+              results.append(f"{case}: refused, outside intact")
+
+          for line in results:
+              print(" ", line)
+          print("HOSTILE DIRECTORY CONTAINED")
+          EOF
+          grep -q "HOSTILE DIRECTORY CONTAINED" /tmp/symlink.txt
+
+      - name: A checkpoint mid-read does not make a live session look broken
+        run: |
+          python - <<'EOF' | tee /tmp/reader.txt
+          import pathlib, shutil, subprocess, sys, threading, time
+          from contextmesh.graph import ContextGraph
+          from contextmesh_mcp.session import Session
+
+          shutil.rmtree("/tmp/reader", ignore_errors=True)
+          shutil.copytree("/tmp/session", "/tmp/reader")
+          root = pathlib.Path("/tmp/reader")
+          start = Session.load(root).generation
+
+          # Stall the reader after it has the manifest but before it opens the
+          # companions, then commit and sweep underneath it. Without the retry
+          # this is a FileNotFoundError on a perfectly healthy directory.
+          original = ContextGraph.load_json.__func__
+          paused, resume = threading.Event(), threading.Event()
+          attempts = []
+
+          def stalling(cls, path, **kwargs):
+              attempts.append(path)
+              if len(attempts) == 1:
+                  paused.set()
+                  resume.wait(60)
+              return original(cls, path, **kwargs)
+
+          outcome = {}
+
+          def read():
+              try:
+                  session = Session.load(root)
+                  outcome["generation"] = session.generation
+                  outcome["nodes"] = len(session.graph.nodes)
+              except BaseException as exc:
+                  outcome["error"] = f"{type(exc).__name__}: {exc}"
+
+          ContextGraph.load_json = classmethod(stalling)
+          reader = threading.Thread(target=read)
+          reader.start()
+          assert paused.wait(60), "the reader never started"
+
+          ContextGraph.load_json = classmethod(original)
+          Session.load(root).checkpoint()
+          ContextGraph.load_json = classmethod(stalling)
+          resume.set()
+          reader.join(120)
+          ContextGraph.load_json = classmethod(original)
+
+          assert "error" not in outcome, outcome["error"]
+          assert outcome["generation"] == start + 1, outcome
+          assert len(attempts) > 1, "the read never retried"
+          print(f"  read retried {len(attempts)} times, landed on generation "
+                f"{outcome['generation']} with {outcome['nodes']} nodes")
+
+          # And a directory that is genuinely broken must still fail at once.
+          shutil.rmtree("/tmp/broken-reader", ignore_errors=True)
+          shutil.copytree(str(root), "/tmp/broken-reader")
+          broken = pathlib.Path("/tmp/broken-reader")
+          import json as _json
+          (broken / _json.loads((broken / "session.json").read_text())["graph"]).unlink()
+          began = time.time()
+          try:
+              Session.load(broken)
+              raise SystemExit("::error::a directory missing its graph loaded")
+          except Exception as exc:
+              assert "no such file" in str(exc), str(exc)
+          waited = time.time() - began
+          assert waited < 1.0, f"a broken directory took {waited:.2f}s to fail"
+          print(f"  a genuinely missing companion still fails in {waited * 1000:.0f} ms")
+          print("READER SURVIVED A CONCURRENT SWEEP")
+          EOF
+          grep -q "READER SURVIVED A CONCURRENT SWEEP" /tmp/reader.txt
+
       - name: A graph and a resolver that were never a session together
         run: |
           rm -rf /tmp/mixed && cp -r /tmp/session /tmp/mixed

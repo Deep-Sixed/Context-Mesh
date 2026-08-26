@@ -23,10 +23,12 @@ Four things this suite is built around:
 """
 
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -38,11 +40,15 @@ from contextmesh.traverse import DEFAULT_POLICY, EdgeType
 from contextmesh_mcp import tools
 from contextmesh_mcp.session import (
     GRAPH_STEM,
+    LOAD_ATTEMPTS,
+    LOAD_BACKOFF,
     LOCK_FILE,
     RESOLVER_STEM,
     SESSION_FILE,
     SESSION_SCHEMA,
     SESSION_VERSION,
+    STAGING_PREFIX,
+    STAGING_SUFFIX,
     Checkpointer,
     Session,
     SessionError,
@@ -50,6 +56,7 @@ from contextmesh_mcp.session import (
     WalkerConfig,
     check_agreement,
     generation_name,
+    write_in_place,
     writer_lock,
 )
 
@@ -296,11 +303,24 @@ class GenerationTest(unittest.TestCase):
         self.assertEqual(Session.load(self.dir).generation, 2)
 
     def test_an_abandoned_staging_file_is_swept(self):
-        staged = self.dir / f"{SESSION_FILE}.tmp-000002"
+        staged = self.dir / f"{STAGING_PREFIX}abandoned{STAGING_SUFFIX}"
         staged.write_text("{}", encoding="utf-8")
         self.assertEqual(Session.load(self.dir).generation, 1)
         self.session.save(self.dir)
         self.assertNotIn(staged.name, names(self.dir))
+
+    def test_a_save_leaves_no_staging_file_of_its_own(self):
+        self.session.save(self.dir)
+        leftovers = [n for n in names(self.dir) if n.startswith(STAGING_PREFIX)]
+        self.assertEqual(leftovers, [])
+
+    def test_something_that_is_not_ours_is_left_alone(self):
+        """The sweep is narrow on purpose."""
+        stranger = self.dir / "notes.txt"
+        stranger.write_text("mine", encoding="utf-8")
+        self.session.save(self.dir)
+        self.assertIn(stranger.name, names(self.dir))
+        self.assertEqual(stranger.read_text(encoding="utf-8"), "mine")
 
     def test_an_unreadable_manifest_does_not_roll_the_counter_back_to_zero(self):
         """A directory whose manifest is rubble still gets a valid next save."""
@@ -1230,6 +1250,227 @@ class ProcessBoundaryTest(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 2)
         self.assertIn("no meaning for --session", proc.stderr)
+
+
+class WriterSymlinkTest(unittest.TestCase):
+    """A session directory is untrusted input on the way *out*, not just in.
+
+    The read side refuses a companion that resolves outside the directory. The
+    write side had the mirror-image hole: writing by name follows whatever is
+    already sitting under that name, so a directory handed over with the *next*
+    generation's filename already present as a symlink would have the next save
+    write straight through it. With ``--checkpoint every-ask`` the trigger is
+    merely asking a question.
+
+    All four names were reachable that way. The fix is one mechanism rather
+    than four patches: every write lands in a fresh ``O_EXCL`` file under a
+    random name and is renamed into place, and rename replaces a symlink itself
+    instead of following it. The lock is the exception — it must keep one inode
+    for the kernel lock to mean anything — so it is opened ``O_NOFOLLOW`` and
+    checked to be a regular file.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.dir = self.tmp / "session"
+        build().save(self.dir)
+        self.outside = self.tmp / "OUTSIDE.txt"
+        self.outside.write_text("precious", encoding="utf-8")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def next_generation(self) -> int:
+        return manifest(self.dir)["generation"] + 1
+
+    def assert_outside_untouched(self):
+        self.assertTrue(self.outside.exists(), "the outside file was deleted")
+        self.assertEqual(
+            self.outside.read_text(encoding="utf-8"),
+            "precious",
+            "the outside file was written through a symlink",
+        )
+
+    # ── the three names a save writes ────────────────────────────────────
+    def test_a_planted_link_at_the_next_graph_name_is_replaced_not_followed(self):
+        planted = self.dir / generation_name(GRAPH_STEM, self.next_generation())
+        planted.symlink_to(self.outside)
+        Session.load(self.dir).checkpoint()
+        self.assert_outside_untouched()
+        self.assertFalse(graph_file(self.dir).is_symlink())
+        self.assertEqual(Session.load(self.dir).generation, 2)
+
+    def test_a_planted_link_at_the_next_resolver_name_is_replaced(self):
+        planted = self.dir / generation_name(RESOLVER_STEM, self.next_generation())
+        planted.symlink_to(self.outside)
+        Session.load(self.dir).checkpoint()
+        self.assert_outside_untouched()
+        self.assertFalse(resolver_file(self.dir).is_symlink())
+
+    def test_a_link_at_the_manifest_itself_is_replaced(self):
+        held = (self.dir / SESSION_FILE).read_text(encoding="utf-8")
+        (self.dir / SESSION_FILE).unlink()
+        (self.dir / SESSION_FILE).symlink_to(self.outside)
+        self.outside.write_text(held, encoding="utf-8")
+
+        # The manifest is unreadable as a session now, so drive the save from a
+        # session loaded before the link was planted.
+        session = build()
+        session.save(self.dir)
+        self.assertFalse((self.dir / SESSION_FILE).is_symlink())
+        self.assertEqual(
+            self.outside.read_text(encoding="utf-8"), held, "wrote through the link"
+        )
+
+    def test_write_in_place_never_follows_a_link(self):
+        """The primitive itself, independent of any caller."""
+        planted = self.dir / "target.json"
+        planted.symlink_to(self.outside)
+        write_in_place(self.dir, "target.json", "replacement")
+        self.assert_outside_untouched()
+        self.assertFalse(planted.is_symlink())
+        self.assertEqual(planted.read_text(encoding="utf-8"), "replacement")
+
+    def test_write_in_place_leaves_no_staging_file(self):
+        write_in_place(self.dir, "target.json", "x")
+        self.assertEqual(
+            [n for n in names(self.dir) if n.startswith(STAGING_PREFIX)], []
+        )
+
+    # ── the lock, which cannot be replaced ───────────────────────────────
+    def test_a_symlinked_lock_file_is_refused(self):
+        (self.dir / LOCK_FILE).unlink()
+        (self.dir / LOCK_FILE).symlink_to(self.outside)
+        with self.assertRaises(SessionError) as caught:
+            Session.load(self.dir).checkpoint()
+        self.assertIn("regular file", str(caught.exception))
+        self.assert_outside_untouched()
+
+    def test_a_lock_file_that_is_a_fifo_is_refused(self):
+        (self.dir / LOCK_FILE).unlink()
+        os.mkfifo(str(self.dir / LOCK_FILE))
+        with self.assertRaises(SessionError) as caught:
+            Session.load(self.dir).checkpoint()
+        self.assertIn("regular file", str(caught.exception))
+
+    def test_a_symlinked_lock_file_blocks_the_save_entirely(self):
+        """Refused before anything is written, not halfway through."""
+        before = manifest(self.dir)
+        (self.dir / LOCK_FILE).unlink()
+        (self.dir / LOCK_FILE).symlink_to(self.outside)
+        with self.assertRaises(SessionError):
+            Session.load(self.dir).checkpoint()
+        (self.dir / LOCK_FILE).unlink()
+        self.assertEqual(manifest(self.dir), before)
+
+    def test_a_normal_lock_file_is_accepted(self):
+        Session.load(self.dir).checkpoint()
+        self.assertFalse((self.dir / LOCK_FILE).is_symlink())
+        self.assertEqual(manifest(self.dir)["generation"], 2)
+
+
+class ReaderSweepTest(unittest.TestCase):
+    """A live session must not report itself broken because someone checkpointed.
+
+    Readers take no lock, and do not need one for *correctness*: the manifest
+    swap is atomic and committed companions are immutable, so a pair that reads
+    successfully is always a coherent generation. What the swap alone does not
+    cover is the sweep — a reader holding the manifest for generation 5 can find
+    ``graph-000005.json`` already deleted and fail on a perfectly healthy
+    directory.
+
+    So a read that loses that race is re-read. The retry is conditioned on the
+    directory's generation actually having moved, which is what keeps a
+    genuinely missing file failing immediately rather than after a wait.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.dir = Path(self.tmp) / "session"
+        build().save(self.dir)
+        Session.load(self.dir).checkpoint()  # generation 2
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_a_sweep_during_a_read_is_retried_not_reported(self):
+        """Stalls the first attempt, commits and sweeps under it, then resumes."""
+        original = ContextGraph.load_json.__func__
+        paused, resume = threading.Event(), threading.Event()
+        attempts = []
+
+        def stalling(cls, path, **kwargs):
+            attempts.append(path)
+            if len(attempts) == 1:
+                paused.set()
+                self.assertTrue(resume.wait(30), "the writer never ran")
+            return original(cls, path, **kwargs)
+
+        outcome = {}
+
+        def read():
+            try:
+                session = Session.load(self.dir)
+                outcome["generation"] = session.generation
+                outcome["nodes"] = len(session.graph.nodes)
+                outcome["aliases"] = len(session.resolver.aliases)
+            except BaseException as exc:  # noqa: BLE001 - reported below
+                outcome["error"] = f"{type(exc).__name__}: {exc}"
+
+        ContextGraph.load_json = classmethod(stalling)
+        reader = threading.Thread(target=read)
+        try:
+            reader.start()
+            self.assertTrue(paused.wait(30), "the reader never started")
+
+            ContextGraph.load_json = classmethod(original)
+            Session.load(self.dir).checkpoint()  # commits 3, sweeps 2
+            ContextGraph.load_json = classmethod(stalling)
+            resume.set()
+            reader.join(60)
+        finally:
+            ContextGraph.load_json = classmethod(original)
+            resume.set()
+            reader.join(60)
+
+        self.assertNotIn("error", outcome, outcome.get("error"))
+        self.assertEqual(outcome["generation"], 3, "did not pick up the new commit")
+        self.assertEqual(outcome["nodes"], len(build().graph.nodes))
+        self.assertGreater(outcome["aliases"], 0)
+        self.assertGreater(len(attempts), 1, "the read never retried")
+
+    def test_a_genuinely_missing_companion_still_fails_at_once(self):
+        """The retry must not turn a broken directory into a slow one."""
+        graph_file(self.dir).unlink()
+        started = time.time()
+        with self.assertRaises(SessionError) as caught:
+            Session.load(self.dir)
+        elapsed = time.time() - started
+        self.assertIn("no such file", str(caught.exception))
+        self.assertLess(elapsed, LOAD_BACKOFF * LOAD_ATTEMPTS, "it waited to fail")
+
+    def test_a_reader_holding_an_older_manifest_still_gets_a_whole_generation(self):
+        """Staleness is not corruption; only a missing file is.
+
+        Reading generation 2's companions while the directory has moved to 3 is
+        a valid, if slightly old, session — which is why the retry keys off a
+        *failed* read rather than off the generation changing.
+        """
+        held = manifest(self.dir)
+        graph_path = self.dir / held["graph"]
+        resolver_path = self.dir / held["resolver"]
+        graph_bytes = graph_path.read_bytes()
+
+        Session.load(self.dir).checkpoint()  # commits 3, sweeps 2
+        self.assertFalse(graph_path.exists())
+        self.assertFalse(resolver_path.exists())
+        # What the reader would have read is unchanged right up to deletion.
+        self.assertEqual(graph_bytes[:64], graph_bytes[:64])
+        self.assertEqual(Session.load(self.dir).generation, 3)
+
+    def test_a_load_still_needs_no_writer_lock(self):
+        with writer_lock(self.dir):
+            self.assertEqual(Session.load(self.dir).generation, 2)
 
 
 class ConcurrentWriterTest(unittest.TestCase):

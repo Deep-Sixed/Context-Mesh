@@ -40,6 +40,9 @@ from __future__ import annotations
 import json
 import os
 import socket
+import stat
+import tempfile
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -61,6 +64,11 @@ SESSION_VERSION = 1
 
 SESSION_FILE = "session.json"
 LOCK_FILE = "session.lock"
+#: Prefix for the short-lived file every write lands in first. Recognisable so
+#: an abandoned one can be swept, random so it cannot be pre-empted by a name
+#: planted in the directory.
+STAGING_PREFIX = ".staging-"
+STAGING_SUFFIX = ".tmp"
 GRAPH_STEM = "graph"
 RESOLVER_STEM = "resolver"
 
@@ -92,6 +100,29 @@ class SessionLockedError(Exception):
     """
 
 
+#: How many times ``load`` re-reads a directory that moved under it. Small on
+#: purpose: each retry only happens when a writer demonstrably committed during
+#: the read, and a directory being rewritten faster than this is a problem the
+#: reader cannot fix by waiting.
+LOAD_ATTEMPTS = 4
+LOAD_BACKOFF = 0.05
+
+
+class _Swept(Exception):
+    """Internal: a file the manifest named was gone by the time we read it.
+
+    Not an error on its own. Committed companions are immutable — once a
+    manifest names them they are never rewritten, only deleted by a later
+    sweep — so the *only* way a read of them fails is that a writer moved the
+    directory on mid-read. ``load`` re-reads; the caller never sees this.
+    """
+
+    def __init__(self, name: str, field_name: str) -> None:
+        super().__init__(name)
+        self.name = name
+        self.field_name = field_name
+
+
 class SessionError(ValueError):
     """Raised when a directory is not a session this build can restore.
 
@@ -103,6 +134,88 @@ class SessionError(ValueError):
 
 def _no_session_constants(value: str) -> float:
     raise SessionError(f"session.json contains the non-JSON constant {value!r}")
+
+
+def write_in_place(directory: Path, name: str, payload: str) -> Path:
+    """Put ``payload`` at ``directory/name``, through a descriptor we own.
+
+    Writing by name follows whatever is already there. A session directory is
+    untrusted input on the way *out* as well as in: a directory handed over
+    with ``graph-000006.json`` already present as a symlink would have the next
+    save write through it, and with ``--checkpoint every-ask`` merely *asking a
+    question* is enough to trigger that. Reproduced before it was fixed; four
+    names were reachable that way, including the lock file.
+
+    So every write lands in a fresh file created with ``O_EXCL`` under a random
+    name — which cannot already exist, and so cannot already be a link — and is
+    moved into place with ``os.replace``. Rename replaces a symlink *itself*
+    rather than following it, so a planted link is destroyed rather than
+    honoured, and the file it pointed at is never touched.
+
+    The rename is also what makes the write atomic, which the manifest needs
+    anyway. One mechanism, both properties.
+    """
+    handle, staged = tempfile.mkstemp(
+        prefix=STAGING_PREFIX, suffix=STAGING_SUFFIX, dir=str(directory)
+    )
+    staged_path = Path(staged)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as writer:
+            writer.write(payload)
+            writer.flush()
+            os.fsync(writer.fileno())
+        target = directory / name
+        os.replace(staged_path, target)
+        return target
+    except BaseException:
+        try:
+            staged_path.unlink()
+        except OSError:  # pragma: no cover - already gone
+            pass
+        raise
+
+
+def _open_lock_file(path: Path) -> Any:
+    """Open the lock file without following a symlink, and check what it is.
+
+    The lock is the one artifact that cannot use ``write_in_place``: it has to
+    keep a single inode for its whole life, because that inode is what the
+    kernel lock is attached to. Replacing it on every save would hand two
+    processes locks on two different inodes and let both believe they had won.
+
+    So it is opened directly, and defended directly. ``O_NOFOLLOW`` refuses a
+    final component that is a symlink, and the ``fstat`` afterwards refuses a
+    fifo or a device — the two other things a hostile directory can leave under
+    a name you are about to write to.
+    """
+    flags = os.O_RDWR | os.O_CREAT
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow:  # pragma: no cover - Windows
+        # No O_NOFOLLOW: refuse anything that is already a link, then open.
+        # A narrower guarantee than the POSIX path, and said so out loud rather
+        # than left to look equivalent.
+        if path.is_symlink():
+            raise SessionError(
+                f"{path} is a symbolic link; the session lock must be a regular "
+                "file inside the session directory"
+            )
+    try:
+        descriptor = os.open(str(path), flags | nofollow, 0o644)
+    except OSError as exc:
+        raise SessionError(
+            f"{path} could not be opened as the session lock ({exc.strerror}); "
+            "it must be a regular file inside the session directory"
+        ) from None
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise SessionError(
+                f"{path} is not a regular file; the session lock cannot be a "
+                "link, a device or a fifo"
+            )
+    except BaseException:
+        os.close(descriptor)
+        raise
+    return os.fdopen(descriptor, "r+", encoding="utf-8")
 
 
 def _fsync_file(path: Path) -> None:
@@ -196,7 +309,7 @@ def writer_lock(directory: Any) -> Iterator[Path]:
     """
     target = Path(directory)
     path = target / LOCK_FILE
-    handle = open(path, "a+", encoding="utf-8")
+    handle = _open_lock_file(path)
     try:
         try:
             _lock_exclusive(handle)
@@ -503,30 +616,19 @@ class Session:
         generation = live + 1
         payload = self.manifest(generation)
 
-        graph_path = target / payload["graph"]
-        resolver_path = target / payload["resolver"]
-        self.graph.save_json(graph_path)
-        _fsync_file(graph_path)
-        self.resolver.save_json(resolver_path)
-        _fsync_file(resolver_path)
-
-        # The commit. A partially written manifest would be worse than any
-        # torn companion, so it lands under a temporary name and is renamed.
-        staged = target / f"{SESSION_FILE}.tmp-{generation:06d}"
-        with open(staged, "w", encoding="utf-8") as handle:
-            handle.write(
-                json.dumps(
-                    payload,
-                    sort_keys=True,
-                    indent=2,
-                    ensure_ascii=False,
-                    allow_nan=False,
-                )
-                + "\n"
+        # Every one of these lands in a fresh O_EXCL file and is renamed into
+        # place, so none of them can be written *through* something already
+        # sitting under the name. See ``write_in_place``.
+        write_in_place(target, payload["graph"], self.graph.to_json())
+        write_in_place(target, payload["resolver"], self.resolver.to_json())
+        write_in_place(
+            target,
+            SESSION_FILE,
+            json.dumps(
+                payload, sort_keys=True, indent=2, ensure_ascii=False, allow_nan=False
             )
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(staged, target / SESSION_FILE)
+            + "\n",
+        )
         _fsync_dir(target)
 
         self._sweep(
@@ -553,7 +655,7 @@ class Session:
             superseded = name.endswith(".json") and (
                 name.startswith(f"{GRAPH_STEM}-") or name.startswith(f"{RESOLVER_STEM}-")
             )
-            abandoned = name.startswith(f"{SESSION_FILE}.tmp-")
+            abandoned = name.startswith(STAGING_PREFIX) and name.endswith(STAGING_SUFFIX)
             if superseded or abandoned:
                 try:
                     entry.unlink()
@@ -594,11 +696,49 @@ class Session:
           exactly — but health's ``dead_ends`` signal is computed from the walk
           list, so it is absent until this process has walked. That gap is
           pinned by a test rather than left to be discovered.
+
+        **Readers do not take the writer lock**, and they do not need to. The
+        manifest swap is atomic and committed companions are immutable, so a
+        pair that reads successfully is always a coherent generation — possibly
+        one older than the directory's newest, which is staleness rather than
+        corruption. What the swap alone does *not* cover is the sweep: a reader
+        holding a manifest for generation 5 can find ``graph-000005.json``
+        already deleted, and fail on a session that is perfectly healthy.
+
+        So a read that loses that race is re-read rather than reported. The
+        retry fires only when the directory's generation actually moved during
+        the attempt, which keeps a genuinely missing file failing immediately,
+        with its own message, instead of after a wait.
         """
         target = Path(directory)
         if not target.is_dir():
             raise SessionError(f"{target} is not a session directory")
 
+        for attempt in range(LOAD_ATTEMPTS):
+            before = cls._live_generation(target)
+            try:
+                return cls._load_once(target)
+            except _Swept as swept:
+                if cls._live_generation(target) == before:
+                    # Nothing committed while we read. The file is simply not
+                    # there, and waiting will not conjure it.
+                    raise SessionError(
+                        f"{SESSION_FILE} names {swept.name!r} as the "
+                        f"{swept.field_name}, but no such file is in the "
+                        "session directory"
+                    ) from None
+                if attempt + 1 == LOAD_ATTEMPTS:
+                    raise SessionError(
+                        f"{target} was committed to {LOAD_ATTEMPTS} times while "
+                        "this read was in progress; giving up rather than "
+                        "spinning"
+                    ) from None
+                time.sleep(LOAD_BACKOFF * (attempt + 1))
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    @classmethod
+    def _load_once(cls, target: Path) -> "Session":
+        """One attempt. Raises ``_Swept`` if a writer removed what we named."""
         session_path = target / SESSION_FILE
         if not session_path.is_file():
             raise SessionError(
@@ -606,10 +746,11 @@ class Session:
                 "directory this build can read"
             )
         try:
-            data = json.loads(
-                session_path.read_text(encoding="utf-8"),
-                parse_constant=_no_session_constants,
-            )
+            raw = session_path.read_text(encoding="utf-8")
+        except FileNotFoundError:  # pragma: no cover - vanishingly narrow
+            raise _Swept(SESSION_FILE, "manifest") from None
+        try:
+            data = json.loads(raw, parse_constant=_no_session_constants)
         except json.JSONDecodeError as exc:
             raise SessionError(f"{session_path} is not valid JSON: {exc}") from None
 
@@ -661,10 +802,7 @@ class Session:
                 )
             path = _contained(target, name, field_name)
             if not path.is_file():
-                raise SessionError(
-                    f"{SESSION_FILE} names {name!r} as the {field_name}, "
-                    "but no such file is in the session directory"
-                )
+                raise _Swept(name, field_name)
             paths[field_name] = path
         graph_path, resolver_path = paths["graph"], paths["resolver"]
 
@@ -673,10 +811,16 @@ class Session:
         # one exception type at the session boundary without losing the reason.
         try:
             graph = ContextGraph.load_json(graph_path)
+        except FileNotFoundError:
+            # Swept between the check above and the open. Same race, one
+            # instruction later.
+            raise _Swept(graph_path.name, "graph") from None
         except ValueError as exc:
             raise SessionError(f"{graph_path.name}: {exc}") from exc
         try:
             resolver = Resolver.load_json(resolver_path)
+        except FileNotFoundError:
+            raise _Swept(resolver_path.name, "resolver") from None
         except ValueError as exc:
             raise SessionError(f"{resolver_path.name}: {exc}") from exc
 

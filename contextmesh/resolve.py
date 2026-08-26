@@ -422,9 +422,9 @@ class Resolver:
             log=log,
         )
 
-    def save_json(self, path: Any) -> Any:
-        target = Path(path)
-        target.write_text(
+    def to_json(self) -> str:
+        """The snapshot as text, so a caller can place the bytes itself."""
+        return (
             json.dumps(
                 self.to_dict(),
                 sort_keys=True,
@@ -432,9 +432,12 @@ class Resolver:
                 ensure_ascii=False,
                 allow_nan=False,
             )
-            + "\n",
-            encoding="utf-8",
+            + "\n"
         )
+
+    def save_json(self, path: Any) -> Any:
+        target = Path(path)
+        target.write_text(self.to_json(), encoding="utf-8")
         return target
 
     @classmethod

@@ -424,6 +424,38 @@ the race is a configuration problem worth being able to see.
 Multi-writer *coordination* is out of scope: two servers on one directory get
 one clear refusal each time they collide, not a merge.
 
+**Untrusted on the way out, too.** The read side refuses a companion that
+resolves outside the directory. Making the directory *writable* opened the
+mirror-image hole: writing by name follows whatever is already under that name,
+so a directory handed over with the next generation's filename already present
+as a symlink would have the next save write straight through it — and with
+`--checkpoint every-ask`, merely asking a question is the trigger. Four names
+were reachable that way, the lock file among them.
+
+One mechanism rather than four patches: every write lands in a fresh `O_EXCL`
+file under a random name — which cannot already exist, so cannot already be a
+link — and is moved into place with `os.replace`. Rename replaces a symlink
+*itself* instead of following it, so a planted link is destroyed and the file it
+pointed at is never touched. The same rename is what makes the write atomic, so
+the manifest's commit and the symlink defence are the same line of code.
+
+The lock is the exception, because it has to keep one inode for its whole life —
+that inode is what the kernel lock attaches to, and replacing it each save would
+hand two processes locks on two different inodes. So it is opened `O_NOFOLLOW`
+and checked with `fstat` to be a regular file, which also rules out a fifo or a
+device left under the name.
+
+**A checkpoint must not make a live session look broken.** Readers take no lock
+and do not need one for correctness — the manifest swap is atomic and committed
+companions are immutable, so a pair that reads successfully is always a coherent
+generation, at worst a slightly old one. What the swap alone does not cover is
+the *sweep*: a reader holding the manifest for generation 5 can find
+`graph-000005.json` already deleted and fail on a perfectly healthy directory.
+So a read that loses that race is re-read rather than reported, and the retry
+fires only when the directory's generation actually moved during the attempt —
+which keeps a genuinely missing file failing immediately, with its own message,
+instead of after a wait.
+
 **The resolver cannot be rebuilt from the graph, and that is the point.**
 `resolve()` writes a scored match back into its alias table, so a run learns
 surface forms no entity label contains: in the bundled demo, 72 of the
@@ -598,7 +630,7 @@ contextmesh_mcp/             read-only MCP server (optional extra, 3.10+)
 dashboard/                   the rebuilt dashboard
 docs/                        the capture spec and the architecture notes
 examples/                    the original standalone control-layer sketch
-tests/                       407 tests over the invariants above
+tests/                       422 tests over the invariants above
 ```
 
 ## Staying publishable
