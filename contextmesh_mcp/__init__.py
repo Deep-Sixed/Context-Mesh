@@ -1,14 +1,15 @@
 """Context Mesh MCP — a read-only interface over a Context Mesh graph.
 
-Experimental. This serves the bundled demo graph, rebuilt per process: there is
-no persistence yet (``ContextGraph`` serialises but cannot reload), so nothing a
-client sees outlives the server. It exists to prove the protocol surface, not to
-be agent memory.
+Experimental. It serves either the bundled demo graph, rebuilt per process, or
+a session directory that outlives the process — and it makes the caller say
+which, because silently serving a throwaway graph in place of someone's real
+one is the failure the session format exists to prevent.
 
 The split here is deliberate. ``session`` and ``tools`` are plain Python over
 the engine and import nothing from the MCP SDK, so the safety tests that matter
-run on every supported version with no dependencies. Only ``server`` needs the
-SDK, and only ``server`` requires Python 3.10+.
+run on every supported version with no dependencies — and so ``python -m
+contextmesh_mcp`` can write and inspect a session without the SDK at all. Only
+``server`` needs it, and only ``server`` requires Python 3.10+.
 
 The invariant this package is built around:
 
@@ -27,7 +28,7 @@ an auditor holding evidence, per GRAPH.md rule 7. A tool that let a client name
 an assumption and have it rejected would make that rule a convention.
 """
 
-from .session import Session
+from .session import Session, SessionError
 from .tools import (
     TOOLS,
     MeshToolError,
@@ -44,6 +45,7 @@ __all__ = [
     "TOOLS",
     "MeshToolError",
     "Session",
+    "SessionError",
     "mesh_ask",
     "mesh_blast_radius",
     "mesh_get_node",

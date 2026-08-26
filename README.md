@@ -339,17 +339,77 @@ two disagree — and enforcing that surfaced a real bug, since two paths bumped
 `version` on the record alone and left the mirror stale. `graph.sync_assumption`
 is now the one place that writes it.
 
-What persistence does **not** yet cover: the resolver, and the execution state
-in `Runner`. A reloaded graph answers, invalidates and reports health
-identically; rebuilding a `Walker` still needs a resolver, and resuming a
-selective re-execution still needs the task registry. Those are the next two
-milestones.
+What persistence does **not** yet cover: the execution state in `Runner`.
+Resuming a selective re-execution still needs the task registry and the run
+ledger's history. That is the next milestone.
+
+### Sessions — a graph *and* the resolver that reads it
+
+```bash
+python -m contextmesh_mcp --demo --rounds 8 --save ./session   # write one
+python -m contextmesh_mcp --session ./session                  # inspect it
+```
+
+A restored graph answers questions only if something can turn *"pgvector"* into
+`entity:pgvector-6db608`, and that is the resolver's job. So a session is a
+directory of three separately versioned files:
+
+```
+session/
+  session.json    contextmesh.session  v1
+  graph.json      contextmesh.graph    v1
+  resolver.json   contextmesh.resolver v1
+```
+
+Three formats rather than one because graph snapshot v1 is **closed**. Query
+resolution is not graph state, and folding the resolver in would mean reopening
+a settled format every time the resolver learns a new field. The session file is
+the join.
+
+**The resolver cannot be rebuilt from the graph, and that is the point.**
+`resolve()` writes a scored match back into its alias table, so a run learns
+surface forms no entity label contains: in the bundled demo, 72 of the
+resolver's 120 aliases are learned that way rather than registered. Restart
+without them and the same mention costs a full block scan and a scored match
+instead of a table hit.
+
+`blocks` is persisted rather than rebuilt, which is where the analogy with
+`_out`/`_in` breaks. Those are a function of the edge list. `blocks` is a
+function of *how* an alias arrived: `register` adds block keys for every name it
+is given, a match learned at query time adds none, and the alias table does not
+record which is which. Rebuilding from `canonical` alone loses keys; rebuilding
+from `canonical` plus `aliases` invents keys the resolver never had. Blocks
+decide the candidate set, so either version silently changes what resolves —
+`tests/test_session.py` measures both and shows them differing.
+
+Walker settings ride along in `session.json` for the same reason: restore a
+session saved with `hop_budget=3` into the default `6` and the same question
+comes back with a different answer, with nothing in the output to say why.
+
+**A session directory is untrusted input.** `Session.load` refuses one it cannot
+faithfully restore — wrong schema, unreadable version, a missing or mistyped
+field, a `rounds` written as `true`, a policy naming an edge type this ontology
+does not have. The two filenames in `session.json` must be plain names, so a
+directory you were handed cannot point the loader at `../../etc/passwd`. And one
+check lives here because neither file can make it alone: every entity the
+resolver resolves *to* has to be an entity the graph actually has. Without it a
+resolver saved against one graph loads clean against another and then raises
+`KeyError` on whichever question happens to use that surface form.
+
+**What a restart does not restore**, stated plainly because the suite pins it:
+walk history and the assumption ledger's event log. `mesh_lineage` and
+`mesh_blast_radius` come back identical — both read the graph's own assumption
+records — and every count in `mesh_health` restores exactly. The one field that
+does not is health's `dead_ends` signal, which is computed from the walk list
+and so is absent until the new process has walked. That is a cold start, not a
+lost capability, and `SurfaceEquivalenceTest` asserts it is the *only* one.
 
 ## MCP — read-only, experimental
 
 ```bash
 pip install 'contextmesh[mcp]'
-contextmesh-mcp
+contextmesh-mcp --demo               # a graph rebuilt for this process
+contextmesh-mcp --session ./session  # a graph that outlives it
 ```
 
 An MCP server over the graph, so an agent can query it as memory instead of
@@ -360,7 +420,7 @@ being handed chunks. Five tools — `mesh_ask`, `mesh_get_node`, `mesh_health`,
 ```json
 {
   "mcpServers": {
-    "context-mesh": { "command": "contextmesh-mcp" }
+    "context-mesh": { "command": "contextmesh-mcp", "args": ["--demo"] }
   }
 }
 ```
@@ -388,11 +448,33 @@ that no read changes graph structure, ontology state, assumptions, supersession
 or invalidation, while telemetry is free to move. `tests/test_mcp.py` asserts
 both halves separately.
 
-**It does not persist.** The server builds the bundled demo graph per process,
-because `ContextGraph` serialises but has no `from_dict`. This version is worth
-having to prove the protocol surface and how an agent consumes evidence paths;
-it is not agent memory yet. Lossless graph persistence is the next core
-milestone, and it is what makes an MCP server that loads real state possible.
+**It can now serve a saved session**, and it makes you say which:
+
+```bash
+contextmesh-mcp --demo --rounds 8 --save ./session   # write one
+contextmesh-mcp --session ./session                  # serve it
+```
+
+`--demo` used to be what you got by saying nothing. It has to be said now,
+because the alternative is no longer *nothing* but a real session on disk, and
+silently serving a throwaway graph when someone meant to serve theirs is the one
+failure the format exists to prevent. `contextmesh://session` reports which it
+is and whether anything a client reads outlives the server.
+
+```json
+{
+  "mcpServers": {
+    "context-mesh": {
+      "command": "contextmesh-mcp",
+      "args": ["--session", "/path/to/session"]
+    }
+  }
+}
+```
+
+What is still missing before this is agent memory: nothing writes *into* a
+session from the client side. Structure and belief change only through the
+engine, and execution state does not persist at all — see above.
 
 The core stays untouched by all of this: `contextmesh` remains Python 3.9+ with
 zero dependencies, the MCP SDK arrives only through the `[mcp]` extra, and
@@ -407,7 +489,8 @@ contextmesh/
   ontology.py                GRAPH.md → the schema every write is checked against
   model.py  graph.py         typed nodes, typed edges, no untyped code path
                              and the versioned snapshot it saves and reloads as
-  resolve.py                 entity resolution — one id per real-world thing
+  resolve.py                 entity resolution — one id per real-world thing,
+                             and the alias table it learns and reloads
   pipeline.py                CHUNK → EXTRACT → RESOLVE → LINK → EMBED → PRUNE
   traverse.py                walks, evidence paths, the four dead-end reasons
   assumptions.py             versioned assumptions, blast radius, rejection
@@ -417,12 +500,14 @@ contextmesh/
   metrics.py                 the dashboard payload
   corpus.py  demo.py  cli.py the worked example
 contextmesh_mcp/             read-only MCP server (optional extra, 3.10+)
-  session.py  tools.py       plain Python over the engine; no SDK import
-  resources.py  server.py    server.py is the only file that needs the SDK
+  session.py                 durable sessions: graph + resolver, on disk
+  tools.py  resources.py     plain Python over the engine; no SDK import
+  __main__.py                write or inspect a session without the SDK
+  server.py                  the only file that needs the SDK
 dashboard/                   the rebuilt dashboard
 docs/                        the capture spec and the architecture notes
 examples/                    the original standalone control-layer sketch
-tests/                       266 tests over the invariants above
+tests/                       355 tests over the invariants above
 ```
 
 ## Staying publishable

@@ -111,6 +111,147 @@ jobs:
           # If the server tests skipped here, the mcp job is not testing the SDK.
           ! grep -qi "skipped" /tmp/suite.txt
 
+      - name: The server serves the session it loaded, not a fresh demo
+        run: |
+          contextmesh-mcp --demo --rounds 4 --save /tmp/served
+          python - <<'EOF' | tee /tmp/adopt.txt
+          from contextmesh_mcp import server, session as sessionmod
+          # Stop before the transport: what is under test is which graph the
+          # tool handlers would answer from, not stdio.
+          server.mcp.run = lambda **kw: None
+          assert server.main(["--session", "/tmp/served"]) == 0
+          served = sessionmod.session()
+          described = served.describe()
+          print("persistent:", described["persistent"], "| path:", served.path)
+          assert described["persistent"], "the server built a demo instead of loading"
+          assert str(served.path) == "/tmp/served", served.path
+          print("ADOPTED THE LOADED SESSION")
+          EOF
+          grep -q "ADOPTED THE LOADED SESSION" /tmp/adopt.txt
+
+      - name: The server refuses a bad session before opening the transport
+        run: |
+          contextmesh-mcp --demo --rounds 2 --save /tmp/bad
+          python -c "import json,pathlib;p=pathlib.Path('/tmp/bad/session.json');d=json.loads(p.read_text());d['version']=99;p.write_text(json.dumps(d))"
+          if contextmesh-mcp --session /tmp/bad 2>/tmp/bad.txt; then
+            echo "::error::the server accepted a session it cannot restore"; exit 1
+          fi
+          grep -q "cannot be read by this build" /tmp/bad.txt
+
+  session:
+    name: session · survives a restart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # The oldest supported version: writing and reading a session must
+          # not quietly need the MCP extra, or 3.10.
+          python-version: "3.9"
+
+      - name: One process writes the session
+        run: |
+          python -m contextmesh_mcp --demo --rounds 4 --save /tmp/session | tee /tmp/wrote.txt
+          test -f /tmp/session/session.json
+          test -f /tmp/session/graph.json
+          test -f /tmp/session/resolver.json
+
+      - name: Another process reads it, and gets the same graph
+        run: |
+          python -m contextmesh_mcp --session /tmp/session > /tmp/read.json
+          python - <<'EOF' | tee /tmp/same.txt
+          import json
+          from contextmesh_mcp.session import Session
+          read = json.load(open("/tmp/read.json"))
+          fresh = Session.build(rounds=4).describe()
+          assert read["persistent"] is True, read
+          for key in ("nodes_live", "nodes_total", "edges_live", "edges_total",
+                      "assumptions", "build", "rounds"):
+              assert read[key] == fresh[key], (key, read[key], fresh[key])
+          print(f"{read['nodes_live']}/{read['nodes_total']} nodes, "
+                f"{read['edges_live']}/{read['edges_total']} edges, restored")
+          print("SESSION CROSSED THE PROCESS BOUNDARY")
+          EOF
+          grep -q "SESSION CROSSED THE PROCESS BOUNDARY" /tmp/same.txt
+
+      - name: A resolution the graph never stored survives the restart
+        run: |
+          python - <<'EOF' | tee /tmp/alias.txt
+          import json
+          from contextmesh.resolve import Resolver
+          from contextmesh_mcp.session import Session
+          saved = json.load(open("/tmp/session/resolver.json"))
+          registered = Resolver()
+          for eid, label in saved["canonical"].items():
+              registered.register(eid, label)
+          learned = sorted(set(saved["aliases"]) - set(registered.aliases))
+          assert learned, "the demo should learn aliases while it walks"
+          restored = Session.load("/tmp/session")
+          record = restored.resolver.resolve(learned[0])
+          print(f"{len(learned)} learned aliases; {learned[0]!r} -> "
+                f"{record.canonical_id} via {record.reason}")
+          assert record.reason == "alias table", record.reason
+          assert record.canonical_id == saved["aliases"][learned[0]]
+          print("LEARNED ALIAS SURVIVED")
+          EOF
+          grep -q "LEARNED ALIAS SURVIVED" /tmp/alias.txt
+
+      - name: Re-saving a restored session reproduces it byte for byte
+        run: |
+          python -m contextmesh_mcp --session /tmp/session --save /tmp/again > /dev/null
+          for f in session.json graph.json resolver.json; do
+            cmp "/tmp/session/$f" "/tmp/again/$f" || {
+              echo "::error::$f changed across a save/load/save cycle"; exit 1; }
+          done
+
+      - name: A session this build cannot restore is refused, not half-loaded
+        run: |
+          set +e
+          break_it() {
+            rm -rf /tmp/broken && cp -r /tmp/session /tmp/broken
+            python - "$1" <<'EOF'
+          import json, pathlib, sys
+          how = sys.argv[1]
+          root = pathlib.Path("/tmp/broken")
+          sfile = root / "session.json"
+          data = json.loads(sfile.read_text())
+          if how == "version":
+              data["version"] = 99
+          elif how == "escape":
+              data["graph"] = "../../etc/passwd"
+          elif how == "rounds":
+              data["rounds"] = True
+          elif how == "policy":
+              data["walker"]["policy"] = ["teleports_to"]
+          elif how == "missing":
+              (root / "graph.json").unlink()
+          elif how == "foreign":
+              r = json.loads((root / "resolver.json").read_text())
+              r["canonical"]["entity:ghost"] = "Ghost"
+              (root / "resolver.json").write_text(json.dumps(r))
+          sfile.write_text(json.dumps(data))
+          EOF
+            python -m contextmesh_mcp --session /tmp/broken >/dev/null 2>/tmp/why.txt
+            code=$?
+            if [ "$code" -eq 0 ]; then
+              echo "::error::a session broken by '$1' loaded anyway"; exit 1
+            fi
+            echo "  refused ($1): $(head -c 110 /tmp/why.txt)"
+          }
+          for how in version escape rounds policy missing foreign; do
+            break_it "$how" || exit 1
+          done
+          echo "EVERY BROKEN SESSION REFUSED"
+
+      - name: A graph and a resolver that were never a session together
+        run: |
+          rm -rf /tmp/mixed && cp -r /tmp/session /tmp/mixed
+          python -c "from contextmesh.graph import ContextGraph; ContextGraph().save_json('/tmp/mixed/graph.json')"
+          if python -m contextmesh_mcp --session /tmp/mixed >/dev/null 2>/tmp/mixed.txt; then
+            echo "::error::a resolver was loaded against a graph it does not match"; exit 1
+          fi
+          grep -q "not a node in this session's graph" /tmp/mixed.txt
+
   smoke:
     name: cli · demo · export
     runs-on: ubuntu-latest

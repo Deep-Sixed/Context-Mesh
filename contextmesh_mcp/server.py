@@ -1,9 +1,12 @@
 """Context Mesh MCP server — stdio transport.
 
     pip install 'contextmesh[mcp]'
-    contextmesh-mcp
+    contextmesh-mcp --demo --rounds 8 --save ./session   # write one
+    contextmesh-mcp --session ./session                  # serve it
 
-Requires Python 3.10+, because the MCP SDK does. Everything the tools actually
+Requires Python 3.10+, because the MCP SDK does. Writing and inspecting a
+session needs neither the SDK nor 3.10, which is why that lives in
+``session.py`` and is reachable as ``python -m contextmesh_mcp``. Everything the tools actually
 do lives in ``tools.py`` and ``resources.py``, which do not, so the behaviour
 this server exposes is tested without the SDK on every version the core
 supports. This file is transport and nothing else.
@@ -31,7 +34,7 @@ except ImportError as exc:  # pragma: no cover - depends on the optional extra
     ) from exc
 
 from . import resources, tools
-from .session import DEFAULT_ROUNDS, session
+from .session import SessionError, add_source_arguments, adopt, open_session, session
 
 SERVER_NAME = "context-mesh"
 INSTRUCTIONS = """\
@@ -47,8 +50,9 @@ mesh_blast_radius is a dry run: it tells you what would fall if an assumption
 turned out to be false, and what would survive. It changes nothing. This server
 is read-only; it cannot reject an assumption, repair, or execute.
 
-This instance serves a bundled demo graph rebuilt for each process. Nothing you
-see here persists.
+This instance may be serving a saved session directory or a demo graph rebuilt
+for this process. contextmesh://session says which, and whether anything you see
+here outlives the server.
 
 Independent project. No affiliation with, or endorsement by, anyone involved in
 the screen capture the dashboard was reverse-engineered from.
@@ -133,24 +137,39 @@ def resource_assumption(assumption_id: str) -> str:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="contextmesh-mcp",
-        description="Read-only MCP server over a Context Mesh graph.",
-    )
-    parser.add_argument(
-        "--rounds",
-        type=int,
-        default=DEFAULT_ROUNDS,
-        help=f"walk rounds to build the demo graph with (default: {DEFAULT_ROUNDS})",
+    parser = add_source_arguments(
+        argparse.ArgumentParser(
+            prog="contextmesh-mcp",
+            description="Read-only MCP server over a Context Mesh graph.",
+            epilog=(
+                "contextmesh-mcp --demo --rounds 8 --save ./session   write one\n"
+                "contextmesh-mcp --session ./session                  serve it"
+            ),
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
     )
     args = parser.parse_args(argv)
 
-    # Build before serving so the first tool call is not the slow one.
-    described = session(rounds=args.rounds).describe()
+    # Build or load before serving, so the first tool call is not the slow one
+    # and a session this build cannot restore fails at the shell rather than
+    # halfway through a client's first question.
+    try:
+        opened = open_session(args)
+    except SessionError as exc:
+        print(f"contextmesh-mcp: {exc}", file=sys.stderr)
+        return 2
+
+    if args.save is not None:
+        target = opened.save(args.save)
+        print(f"contextmesh-mcp: wrote {target}", file=sys.stderr)
+        return 0
+
+    adopt(opened)
+    described = opened.describe()
     print(
         f"context-mesh MCP: {described['nodes_live']}/{described['nodes_total']} nodes live, "
         f"{described['edges_live']}/{described['edges_total']} edges live, "
-        "read-only, not persistent",
+        f"read-only, {'from ' + str(opened.path) if described['persistent'] else 'not persistent'}",
         file=sys.stderr,
     )
     mcp.run(transport="stdio")

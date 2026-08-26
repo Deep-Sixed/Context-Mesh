@@ -7,9 +7,18 @@ the count of what was dropped is exactly the dashboard's DROPPED AT RESOLVE.
 
 from __future__ import annotations
 
+import json
 import re
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from pathlib import Path
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
+
+from .model import (
+    _expect_number,
+    _expect_str,
+    _require,
+)
 
 _NOISE = re.compile(r"[^a-z0-9 ]+")
 # Only genuine corporate forms are noise. Stripping "service", "api" or a
@@ -93,6 +102,88 @@ class ResolutionRecord:
     def resolved(self) -> bool:
         return self.canonical_id is not None
 
+    def to_dict(self) -> Dict[str, object]:
+        return {
+            "mention": self.mention,
+            "canonical_id": self.canonical_id,
+            "canonical_label": self.canonical_label,
+            "score": self.score,
+            "reason": self.reason,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> "ResolutionRecord":
+        where = "resolution record"
+        if not isinstance(data, dict):
+            raise ResolverSnapshotError(
+                f"{where} must be an object, got {type(data).__name__}"
+            )
+        with _resolver_errors():
+            canonical_id = _require(data, "canonical_id", where)
+            canonical_label = _require(data, "canonical_label", where)
+            return cls(
+                mention=_expect_str(_require(data, "mention", where), f"{where}.mention"),
+                # ``null`` here is a resolution that *failed*, which is a fact
+                # worth keeping. Only a missing key is an error.
+                canonical_id=(
+                    None if canonical_id is None
+                    else _expect_str(canonical_id, f"{where}.canonical_id")
+                ),
+                canonical_label=(
+                    None if canonical_label is None
+                    else _expect_str(canonical_label, f"{where}.canonical_label")
+                ),
+                score=_expect_number(_require(data, "score", where), f"{where}.score"),
+                reason=_expect_str(_require(data, "reason", where), f"{where}.reason"),
+            )
+
+
+class ResolverSnapshotError(ValueError):
+    """Raised when a resolver snapshot is not one this build can restore."""
+
+
+def _no_resolver_constants(value: str) -> float:
+    raise ResolverSnapshotError(
+        f"resolver snapshot contains the non-JSON constant {value!r}"
+    )
+
+
+@contextmanager
+def _resolver_errors() -> Iterator[None]:
+    """One exception type at the format boundary.
+
+    The field validators are shared with the graph's loader and raise plain
+    ``ValueError``. Letting those through would mean a caller had to catch two
+    types to mean one thing — "this file is not a resolver I can restore" —
+    and would make ``except ResolverSnapshotError`` a filter that silently
+    passes half the bad files. ``ResolverSnapshotError`` is itself a
+    ``ValueError``, so callers already catching that are unaffected.
+    """
+    try:
+        yield
+    except ResolverSnapshotError:
+        raise
+    except ValueError as exc:
+        raise ResolverSnapshotError(str(exc)) from exc
+
+
+def _expect_str_map(value: Any, field: str) -> Dict[str, str]:
+    if not isinstance(value, dict):
+        raise ResolverSnapshotError(
+            f"{field} must be an object, got {type(value).__name__}"
+        )
+    return {
+        _expect_str(k, f"{field} key"): _expect_str(v, f"{field}[{k!r}]")
+        for k, v in value.items()
+    }
+
+
+#: The resolver's own durable format, separate from the graph's. Keeping them
+#: apart means graph snapshot v1 stays closed: query-resolution state is not
+#: graph state, and a later runner or ledger format can be added the same way.
+SNAPSHOT_SCHEMA = "contextmesh.resolver"
+SNAPSHOT_VERSION = 1
+
 
 @dataclass
 class Resolver:
@@ -101,6 +192,16 @@ class Resolver:
     ``threshold`` is deliberately high: admitting a wrong merge corrupts every
     walk that later crosses the entity, while dropping a mention only costs one
     span, and the drop is recorded.
+
+    Three of these four fields are *learned*, which is why the resolver has to
+    be persisted rather than rebuilt from the graph's entities:
+
+    - ``resolve`` writes back into ``aliases`` when a mention clears the
+      threshold by score, so a surface form the graph never stored resolves
+      instantly next time.
+    - ``blocks`` is built by ``register`` from labels *and* explicitly
+      registered aliases, so it is not a function of ``canonical`` alone.
+    - ``log`` is the record every health signal counts.
     """
 
     threshold: float = 0.62
@@ -174,6 +275,146 @@ class Resolver:
             if score > best_score:
                 best_id, best_score = eid, score
         return best_id, best_score
+
+    # ── persistence ──────────────────────────────────────────────────────
+    def to_dict(self) -> Dict[str, Any]:
+        """The resolver's durable state.
+
+        ``blocks`` is persisted rather than rebuilt, which is where the analogy
+        with the graph's ``_out``/``_in`` breaks. Those are a function of the
+        edge list; ``blocks`` is a function of *how* aliases arrived. A learned
+        alias adds no block key, a registered one does, and the alias table
+        does not record which is which — so rebuilding from ``canonical`` loses
+        keys, and rebuilding from ``canonical`` plus ``aliases`` invents keys
+        the resolver never had. Either way candidate sets change, and with them
+        what resolves.
+
+        Sets are written as sorted lists so the file is byte-stable.
+        """
+        return {
+            "schema": SNAPSHOT_SCHEMA,
+            "version": SNAPSHOT_VERSION,
+            "threshold": self.threshold,
+            "canonical": dict(self.canonical),
+            "aliases": dict(self.aliases),
+            "blocks": {key: sorted(ids) for key, ids in self.blocks.items()},
+            "log": [record.to_dict() for record in self.log],
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Resolver":
+        """Rebuild a resolver from a snapshot, refusing one it cannot restore.
+
+        Same discipline as the graph loader: required fields, checked types, no
+        coercion, no null-to-empty, and references that have to point at
+        something. Every refusal leaves as ``ResolverSnapshotError``.
+        """
+        with _resolver_errors():
+            return cls._restore(data)
+
+    @classmethod
+    def _restore(cls, data: Dict[str, Any]) -> "Resolver":
+        if not isinstance(data, dict):
+            raise ResolverSnapshotError(
+                f"resolver snapshot must be an object, got {type(data).__name__}"
+            )
+        for key in ("schema", "version", "threshold", "canonical", "aliases", "blocks", "log"):
+            if key not in data:
+                raise ResolverSnapshotError(f"resolver snapshot is missing {key!r}")
+        if data["schema"] != SNAPSHOT_SCHEMA:
+            raise ResolverSnapshotError(
+                f"not a {SNAPSHOT_SCHEMA} snapshot: schema is {data['schema']!r}"
+            )
+        version = data["version"]
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise ResolverSnapshotError(
+                f"resolver version must be an integer, got {version!r}"
+            )
+        if version != SNAPSHOT_VERSION:
+            raise ResolverSnapshotError(
+                f"resolver snapshot version {version!r} cannot be read by this "
+                f"build, which writes and reads version {SNAPSHOT_VERSION}"
+            )
+
+        threshold = _expect_number(data["threshold"], "resolver.threshold")
+        if not 0.0 <= threshold <= 1.0:
+            raise ResolverSnapshotError(
+                f"resolver.threshold must be between 0 and 1, got {threshold}"
+            )
+
+        canonical = _expect_str_map(data["canonical"], "resolver.canonical")
+        aliases = _expect_str_map(data["aliases"], "resolver.aliases")
+
+        raw_blocks = data["blocks"]
+        if not isinstance(raw_blocks, dict):
+            raise ResolverSnapshotError(
+                f"resolver.blocks must be an object, got {type(raw_blocks).__name__}"
+            )
+        blocks: Dict[str, Set[str]] = {}
+        for key, ids in raw_blocks.items():
+            _expect_str(key, "resolver.blocks key")
+            if not isinstance(ids, list):
+                raise ResolverSnapshotError(
+                    f"resolver.blocks[{key!r}] must be a list, got {type(ids).__name__}"
+                )
+            blocks[key] = {
+                _expect_str(i, f"resolver.blocks[{key!r}][{n}]") for n, i in enumerate(ids)
+            }
+
+        raw_log = data["log"]
+        if not isinstance(raw_log, list):
+            raise ResolverSnapshotError(
+                f"resolver.log must be a list, got {type(raw_log).__name__}"
+            )
+        log = [ResolutionRecord.from_dict(row) for row in raw_log]
+
+        # References, once every table exists. An alias or block pointing at an
+        # entity the resolver does not know would resolve a mention to an id
+        # that is not there — a KeyError on the next ask rather than on load.
+        for alias, eid in aliases.items():
+            if eid not in canonical:
+                raise ResolverSnapshotError(
+                    f"resolver.aliases[{alias!r}] names {eid!r}, which is not canonical"
+                )
+        for key, ids in blocks.items():
+            for eid in ids:
+                if eid not in canonical:
+                    raise ResolverSnapshotError(
+                        f"resolver.blocks[{key!r}] names {eid!r}, which is not canonical"
+                    )
+        for record in log:
+            if record.canonical_id is not None and record.canonical_id not in canonical:
+                raise ResolverSnapshotError(
+                    f"resolver.log names {record.canonical_id!r}, which is not canonical"
+                )
+
+        return cls(
+            threshold=threshold,
+            canonical=canonical,
+            aliases=aliases,
+            blocks=blocks,
+            log=log,
+        )
+
+    def save_json(self, path: Any) -> Any:
+        target = Path(path)
+        target.write_text(
+            json.dumps(
+                self.to_dict(),
+                sort_keys=True,
+                indent=2,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return target
+
+    @classmethod
+    def load_json(cls, path: Any) -> "Resolver":
+        text = Path(path).read_text(encoding="utf-8")
+        return cls.from_dict(json.loads(text, parse_constant=_no_resolver_constants))
 
     def resolve(self, mention: str) -> ResolutionRecord:
         if not normalise(mention):
