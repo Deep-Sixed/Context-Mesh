@@ -54,6 +54,21 @@ DISPLAY_TYPES: Tuple[NodeType, ...] = (
 # three-element "vector". A durable state format has to fail closed.
 
 
+def _require(data: Dict[str, Any], key: str, where: str) -> Any:
+    """Fetch a field that snapshot v1 always writes, or refuse the record.
+
+    Defaulting a missing field is a quieter failure than a wrong type and a
+    worse one: dropping ``invalidated`` restores a dead node as live, and
+    dropping ``embedding`` restores a node that answers differently. Since
+    ``to_dict`` writes every one of these, absence means the file was edited or
+    truncated. Defaults belong to a later schema version that has an older
+    shape to migrate from; v1 has none.
+    """
+    if key not in data:
+        raise ValueError(f"{where}: snapshot v1 requires a {key!r} field")
+    return data[key]
+
+
 def _fail(field: str, value: Any, wanted: str) -> "NoReturn":
     raise ValueError(
         f"{field}: expected {wanted}, got {type(value).__name__} {value!r}"
@@ -156,15 +171,23 @@ class Provenance:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Provenance":
         return cls(
-            source_id=_expect_str(data["source_id"], "provenance.source_id"),
+            source_id=_expect_str(
+                _require(data, "source_id", "provenance"), "provenance.source_id"
+            ),
             # A span is a tuple in memory and a list in JSON. Restoring it as a
             # list would make an otherwise identical graph compare unequal, and
             # a three-element one is not a span at all.
-            span=_expect_span(data.get("span"), "provenance.span"),
-            extractor=_expect_str(data.get("extractor", "rule"), "provenance.extractor"),
-            checks=_expect_str_list(data.get("checks"), "provenance.checks"),
+            span=_expect_span(_require(data, "span", "provenance"), "provenance.span"),
+            extractor=_expect_str(
+                _require(data, "extractor", "provenance"), "provenance.extractor"
+            ),
+            checks=_expect_str_list(
+                _require(data, "checks", "provenance"), "provenance.checks"
+            ),
             recorded_at_build=_expect_int(
-                data.get("recorded_at_build", 0), "provenance.recorded_at_build", minimum=0
+                _require(data, "recorded_at_build", "provenance"),
+                "provenance.recorded_at_build",
+                minimum=0,
             ),
         )
 
@@ -207,31 +230,29 @@ class Node:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Node":
-        node_id = _expect_str(data["id"], "node.id")
-        provenance = data.get("provenance")
+        node_id = _expect_str(_require(data, "id", "node"), "node.id")
+        where = f"node[{node_id}]"
+        provenance = _require(data, "provenance", where)
         if provenance is not None and not isinstance(provenance, dict):
-            _fail(f"node[{node_id}].provenance", provenance, "null or an object")
-        embedding = _expect_vector(data.get("embedding"), f"node[{node_id}].embedding")
-        if "embedded" in data:
-            flag = _expect_bool(data["embedded"], f"node[{node_id}].embedded")
-            # The flag is a convenience view of the vector. If they disagree the
-            # snapshot has two answers to one question, so neither is trusted.
-            if flag != (embedding is not None):
-                raise ValueError(
-                    f"node[{node_id}]: embedded={flag} disagrees with the vector"
-                )
+            _fail(f"{where}.provenance", provenance, "null or an object")
+        embedding = _expect_vector(_require(data, "embedding", where), f"{where}.embedding")
+        flag = _expect_bool(_require(data, "embedded", where), f"{where}.embedded")
+        # The flag is a convenience view of the vector. If they disagree the
+        # snapshot has two answers to one question, so neither is trusted.
+        if flag != (embedding is not None):
+            raise ValueError(f"{where}: embedded={flag} disagrees with the vector")
         return cls(
             id=node_id,
-            type=NodeType(_expect_str(data["type"], f"node[{node_id}].type")),
-            label=_expect_str(data["label"], f"node[{node_id}].label"),
-            attrs=_expect_dict(data.get("attrs"), f"node[{node_id}].attrs"),
+            type=NodeType(_expect_str(_require(data, "type", where), f"{where}.type")),
+            label=_expect_str(_require(data, "label", where), f"{where}.label"),
+            attrs=_expect_dict(_require(data, "attrs", where), f"{where}.attrs"),
             provenance=Provenance.from_dict(provenance) if provenance else None,
             embedding=embedding,
-            build=_expect_int(data.get("build", 0), f"node[{node_id}].build", minimum=0),
-            walks=_expect_int(data.get("walks", 0), f"node[{node_id}].walks", minimum=0),
-            pruned=_expect_bool(data.get("pruned", False), f"node[{node_id}].pruned"),
+            build=_expect_int(_require(data, "build", where), f"{where}.build", minimum=0),
+            walks=_expect_int(_require(data, "walks", where), f"{where}.walks", minimum=0),
+            pruned=_expect_bool(_require(data, "pruned", where), f"{where}.pruned"),
             invalidated=_expect_bool(
-                data.get("invalidated", False), f"node[{node_id}].invalidated"
+                _require(data, "invalidated", where), f"{where}.invalidated"
             ),
         )
 
@@ -270,26 +291,27 @@ class Edge:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Edge":
-        edge_id = _expect_str(data["id"], "edge.id")
-        assumption_id = data.get("assumption_id")
+        edge_id = _expect_str(_require(data, "id", "edge"), "edge.id")
+        where = f"edge[{edge_id}]"
+        assumption_id = _require(data, "assumption_id", where)
         if assumption_id is not None:
-            assumption_id = _expect_str(assumption_id, f"edge[{edge_id}].assumption_id")
+            assumption_id = _expect_str(assumption_id, f"{where}.assumption_id")
         return cls(
             id=edge_id,
-            src=_expect_str(data["src"], f"edge[{edge_id}].src"),
-            dst=_expect_str(data["dst"], f"edge[{edge_id}].dst"),
-            type=EdgeType(_expect_str(data["type"], f"edge[{edge_id}].type")),
+            src=_expect_str(_require(data, "src", where), f"{where}.src"),
+            dst=_expect_str(_require(data, "dst", where), f"{where}.dst"),
+            type=EdgeType(_expect_str(_require(data, "type", where), f"{where}.type")),
             assumption_id=assumption_id,
             evidence_ids=_expect_str_list(
-                data.get("evidence_ids"), f"edge[{edge_id}].evidence_ids"
+                _require(data, "evidence_ids", where), f"{where}.evidence_ids"
             ),
-            weight=_expect_number(data.get("weight", 1.0), f"edge[{edge_id}].weight"),
-            build=_expect_int(data.get("build", 0), f"edge[{edge_id}].build", minimum=0),
+            weight=_expect_number(_require(data, "weight", where), f"{where}.weight"),
+            build=_expect_int(_require(data, "build", where), f"{where}.build", minimum=0),
             traversals=_expect_int(
-                data.get("traversals", 0), f"edge[{edge_id}].traversals", minimum=0
+                _require(data, "traversals", where), f"{where}.traversals", minimum=0
             ),
             invalidated=_expect_bool(
-                data.get("invalidated", False), f"edge[{edge_id}].invalidated"
+                _require(data, "invalidated", where), f"{where}.invalidated"
             ),
         )
 
@@ -325,39 +347,38 @@ class Assumption:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "Assumption":
-        aid = _expect_str(data["id"], "assumption.id")
-        rejected_at = data.get("rejected_at_build")
+        aid = _expect_str(_require(data, "id", "assumption"), "assumption.id")
+        where = f"assumption[{aid}]"
+        rejected_at = _require(data, "rejected_at_build", where)
         if rejected_at is not None:
-            rejected_at = _expect_int(
-                rejected_at, f"assumption[{aid}].rejected_at_build", minimum=0
-            )
+            rejected_at = _expect_int(rejected_at, f"{where}.rejected_at_build", minimum=0)
         optional = {}
         for name in ("supersedes", "superseded_by"):
-            value = data.get(name)
+            value = _require(data, name, where)
             optional[name] = (
-                None if value is None else _expect_str(value, f"assumption[{aid}].{name}")
+                None if value is None else _expect_str(value, f"{where}.{name}")
             )
         return cls(
             id=aid,
-            statement=_expect_str(data["statement"], f"assumption[{aid}].statement"),
+            statement=_expect_str(_require(data, "statement", where), f"{where}.statement"),
             status=AssumptionStatus(
-                _expect_str(data["status"], f"assumption[{aid}].status")
+                _expect_str(_require(data, "status", where), f"{where}.status")
             ),
             version=_expect_int(
-                data.get("version", 1), f"assumption[{aid}].version", minimum=1
+                _require(data, "version", where), f"{where}.version", minimum=1
             ),
             created_by=_expect_str(
-                data.get("created_by", "system"), f"assumption[{aid}].created_by"
+                _require(data, "created_by", where), f"{where}.created_by"
             ),
             created_at_build=_expect_int(
-                data.get("created_at_build", 0),
-                f"assumption[{aid}].created_at_build",
+                _require(data, "created_at_build", where),
+                f"{where}.created_at_build",
                 minimum=0,
             ),
             supersedes=optional["supersedes"],
             superseded_by=optional["superseded_by"],
             rejected_at_build=rejected_at,
             evidence_ids=_expect_str_list(
-                data.get("evidence_ids"), f"assumption[{aid}].evidence_ids"
+                _require(data, "evidence_ids", where), f"{where}.evidence_ids"
             ),
         )

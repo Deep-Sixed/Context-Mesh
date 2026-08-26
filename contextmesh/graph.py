@@ -287,22 +287,39 @@ class ContextGraph:
         """
         if not isinstance(data, dict):
             raise SnapshotError(f"snapshot must be an object, got {type(data).__name__}")
-        schema = data.get("schema")
+        for key in ("schema", "version", "build", "nodes", "edges", "assumptions"):
+            if key not in data:
+                raise SnapshotError(f"snapshot is missing its {key!r} field")
+        schema = data["schema"]
         if schema != SNAPSHOT_SCHEMA:
             raise SnapshotError(
                 f"not a {SNAPSHOT_SCHEMA} snapshot: schema is {schema!r}"
             )
-        version = data.get("version")
+        version = data["version"]
+        # ``True == 1`` in Python, so a bool would sail through the equality
+        # check below and load as version 1.
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise SnapshotError(f"snapshot version must be an integer, got {version!r}")
         if version != SNAPSHOT_VERSION:
             raise SnapshotError(
                 f"snapshot version {version!r} cannot be read by this build, "
                 f"which writes and reads version {SNAPSHOT_VERSION}"
             )
+        build = data["build"]
+        if isinstance(build, bool) or not isinstance(build, int) or build < 0:
+            raise SnapshotError(f"snapshot build must be a non-negative integer, got {build!r}")
 
         graph = cls(ontology)
-        node_rows = list(data.get("nodes") or [])
-        edge_rows = list(data.get("edges") or [])
-        assumption_rows = list(data.get("assumptions") or [])
+        rows = {}
+        for key in ("nodes", "edges", "assumptions"):
+            if not isinstance(data[key], list):
+                raise SnapshotError(
+                    f"snapshot {key!r} must be a list, got {type(data[key]).__name__}"
+                )
+            rows[key] = data[key]
+        node_rows, edge_rows, assumption_rows = (
+            rows["nodes"], rows["edges"], rows["assumptions"]
+        )
 
         # ── nodes, in snapshot order so adjacency order survives ──────────
         seen_nodes: Set[str] = set()
@@ -406,7 +423,57 @@ class ContextGraph:
             edge.traversals = stored.traversals
             edge.invalidated = stored.invalidated
 
-        graph.build = int(data.get("build", 0))
+        # ── references between records ────────────────────────────────────
+        # Each record validated on its own above; these only make sense once
+        # every record exists. A dangling reference loads fine and fails later
+        # — ``lineage`` raising KeyError on a graph that has been live for an
+        # hour — which is exactly the delayed corruption a loader should catch.
+        for aid, assumption in graph.assumptions.items():
+            for field in ("supersedes", "superseded_by"):
+                other_id = getattr(assumption, field)
+                if other_id is None:
+                    continue
+                if other_id not in graph.assumptions:
+                    raise SnapshotError(
+                        f"assumption {aid!r}: {field} names {other_id!r}, "
+                        "which is not in the snapshot"
+                    )
+            # Supersession is a two-sided relationship, and half of it is not a
+            # weaker version of it — a lineage walk would end somewhere the
+            # other record disagrees with.
+            if assumption.superseded_by is not None:
+                successor = graph.assumptions[assumption.superseded_by]
+                if successor.supersedes != aid:
+                    raise SnapshotError(
+                        f"assumption {aid!r}: superseded_by {successor.id!r}, "
+                        f"which supersedes {successor.supersedes!r} instead"
+                    )
+            if assumption.supersedes is not None:
+                predecessor = graph.assumptions[assumption.supersedes]
+                if predecessor.superseded_by != aid:
+                    raise SnapshotError(
+                        f"assumption {aid!r}: supersedes {predecessor.id!r}, "
+                        f"which is superseded by {predecessor.superseded_by!r} instead"
+                    )
+            for evidence_id in assumption.evidence_ids:
+                if evidence_id not in graph.nodes:
+                    raise SnapshotError(
+                        f"assumption {aid!r}: evidence {evidence_id!r} is not a node"
+                    )
+
+        for edge in graph.edges.values():
+            if edge.assumption_id is not None and edge.assumption_id not in graph.assumptions:
+                raise SnapshotError(
+                    f"edge {edge.id!r}: assumption_id names {edge.assumption_id!r}, "
+                    "which is not in the snapshot"
+                )
+            for evidence_id in edge.evidence_ids:
+                if evidence_id not in graph.nodes:
+                    raise SnapshotError(
+                        f"edge {edge.id!r}: evidence {evidence_id!r} is not a node"
+                    )
+
+        graph.build = build
         return graph
 
     # ── files ────────────────────────────────────────────────────────────

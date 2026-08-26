@@ -461,6 +461,138 @@ class IntegrityTest(unittest.TestCase):
         p["assumptions"][0]["version"] = 0
         self.refuses(p, ValueError)
 
+    # ── missing fields: absence is corruption, not a default ─────────────
+    def test_a_deleted_flag_does_not_revive_a_dead_node(self):
+        """The sharpest of these: dropping a field is quieter than a bad type.
+
+        ``invalidated`` defaulting to ``False`` restores a node the graph had
+        deliberately killed, with nothing at all to show that it happened.
+        """
+        p = self.payload()
+        node = p["nodes"][0]
+        node["invalidated"] = True
+        ContextGraph.from_dict(p)          # the flag is honoured when present
+        del node["invalidated"]
+        self.refuses(p, ValueError)
+
+    def test_every_field_the_writer_emits_is_required_on_a_node(self):
+        emitted = list(self.good["nodes"][0])
+        self.assertGreaterEqual(len(emitted), 10)
+        for field in emitted:
+            with self.subTest(field=field):
+                p = self.payload()
+                del p["nodes"][0][field]
+                self.refuses(p, ValueError)
+
+    def test_every_field_the_writer_emits_is_required_on_an_edge(self):
+        for field in list(self.good["edges"][0]):
+            with self.subTest(field=field):
+                p = self.payload()
+                del p["edges"][0][field]
+                self.refuses(p, ValueError)
+
+    def test_every_field_the_writer_emits_is_required_on_an_assumption(self):
+        for field in list(self.good["assumptions"][0]):
+            with self.subTest(field=field):
+                p = self.payload()
+                del p["assumptions"][0][field]
+                self.refuses(p, ValueError)
+
+    def test_every_field_the_writer_emits_is_required_on_provenance(self):
+        node = next(n for n in self.good["nodes"] if n["provenance"])
+        for field in list(node["provenance"]):
+            with self.subTest(field=field):
+                p = self.payload()
+                del next(n for n in p["nodes"] if n["provenance"])["provenance"][field]
+                self.refuses(p, ValueError)
+
+    def test_every_container_field_is_required(self):
+        for field in ("schema", "version", "build", "nodes", "edges", "assumptions"):
+            with self.subTest(field=field):
+                p = self.payload()
+                del p[field]
+                self.refuses(p)
+
+    def test_a_dropped_embedding_is_refused(self):
+        p = self.payload()
+        node = p["nodes"][0]
+        del node["embedding"]
+        del node["embedded"]
+        self.refuses(p, ValueError)
+
+    def test_a_boolean_version_does_not_pass_as_version_one(self):
+        # True == 1, so an equality check alone would let this through.
+        p = self.payload()
+        p["version"] = True
+        self.refuses(p)
+
+    def test_a_boolean_build_is_refused(self):
+        p = self.payload()
+        p["build"] = True
+        self.refuses(p)
+
+    def test_a_record_array_that_is_not_a_list(self):
+        for field in ("nodes", "edges", "assumptions"):
+            with self.subTest(field=field):
+                p = self.payload()
+                p[field] = {"not": "a list"}
+                self.refuses(p)
+
+    # ── references between records ───────────────────────────────────────
+    def test_a_dangling_supersedes_is_refused(self):
+        p = self.payload()
+        p["assumptions"][0]["supersedes"] = "assumption:does-not-exist"
+        self.refuses(p)
+
+    def test_a_dangling_superseded_by_is_refused(self):
+        p = self.payload()
+        p["assumptions"][0]["superseded_by"] = "assumption:does-not-exist"
+        self.refuses(p)
+
+    def test_a_dangling_edge_assumption_id_is_refused(self):
+        p = self.payload()
+        p["edges"][0]["assumption_id"] = "assumption:ghost"
+        self.refuses(p)
+
+    def test_evidence_that_is_not_a_node_is_refused(self):
+        p = self.payload()
+        p["assumptions"][0]["evidence_ids"] = ["evidence:ghost"]
+        self.refuses(p)
+        p = self.payload()
+        p["edges"][0]["evidence_ids"] = ["evidence:ghost"]
+        self.refuses(p)
+
+    def test_one_sided_supersession_is_refused(self):
+        """Half a two-sided relationship is not a weaker version of it."""
+        graph = ContextGraph()
+        graph.build = 1
+        ledger = AssumptionLedger(graph)
+        first = ledger.assume("v1")
+        ledger.supersede(first.id, "v2")
+        good = json.loads(json.dumps(graph.to_dict()))
+        ContextGraph.from_dict(good)
+
+        for field in ("supersedes", "superseded_by"):
+            with self.subTest(field=field):
+                p = json.loads(json.dumps(good))
+                for row in p["assumptions"]:
+                    if row[field]:
+                        row[field] = None
+                with self.assertRaises(SnapshotError):
+                    ContextGraph.from_dict(p)
+
+    def test_a_lineage_walk_cannot_be_broken_by_a_loaded_snapshot(self):
+        # What the dangling checks above are protecting: lineage() indexes
+        # graph.assumptions directly, so a dangling id is a KeyError later.
+        graph = ContextGraph()
+        graph.build = 1
+        ledger = AssumptionLedger(graph)
+        first = ledger.assume("v1")
+        latest = ledger.supersede(first.id, "v2")
+        restored = ContextGraph.from_dict(graph.to_dict())
+        chain = AssumptionLedger(restored).lineage(latest.id)
+        self.assertEqual([a.statement for a in chain], ["v1", "v2"])
+
     # ── the assumption mirror ────────────────────────────────────────────
     def test_a_status_the_node_and_the_record_disagree_on(self):
         p = self.payload()

@@ -37,7 +37,7 @@ python -m contextmesh export --inline # regenerate the dashboard's data
 ```
 
 No dependencies. Python 3.9+. `python -m unittest discover -s tests` runs the
-suite (247 tests). CI runs it on 3.9 through 3.13, plus ruff and a set of
+suite (263 tests). CI runs it on 3.9 through 3.13, plus ruff and a set of
 end-to-end smoke checks — including that a build is byte-identical across
 `PYTHONHASHSEED`, and that `dashboard/data/mesh.json` still matches what the
 engine produces.
@@ -288,12 +288,24 @@ loader that writes straight into the internal dictionaries is faster and admits
 graphs the live API would refuse — which makes the ontology a convention that
 holds only until something is saved.
 
+Every field the writer emits is **required** on load — absence is corruption,
+not a default. Dropping `invalidated` would restore a node the graph had
+deliberately killed; dropping `embedding` would restore one that answers
+differently. Defaults belong to a schema version with an older shape to migrate
+from, and v1 has none.
+
+References between records are checked once every record exists: a lineage that
+names a missing assumption, a supersession only one side agrees with, an edge
+grounded on an assumption that is not there, evidence that is not a node. Each
+of those loads cleanly and fails much later — `lineage()` raising `KeyError` on
+a graph that has been serving for an hour.
+
 Fields are checked rather than coerced, because coercion is not harmless here:
 `bool("false")` is `True`, so a malformed flag would quietly turn a live node
 into an invalidated one; `list("abc")` would turn a string into a
 three-element "vector"; and `bool` being a subclass of `int` means a count
 written as a flag would arrive as `1`. The suite corrupts a good snapshot
-thirty ways and requires each to be refused.
+sixty ways and requires each to be refused.
 
 **Records are emitted in insertion order, never sorted.** That is load-bearing.
 The walker's frontier is a heap whose tie-breaker is an insertion counter, and
@@ -402,7 +414,7 @@ contextmesh_mcp/             read-only MCP server (optional extra, 3.10+)
 dashboard/                   the rebuilt dashboard
 docs/                        the capture spec and the architecture notes
 examples/                    the original standalone control-layer sketch
-tests/                       247 tests over the invariants above
+tests/                       263 tests over the invariants above
 ```
 
 ## Staying publishable
