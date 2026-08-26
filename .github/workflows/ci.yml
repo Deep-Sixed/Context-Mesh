@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: tests · python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      # contextmesh has no dependencies; if that ever stops being true this
+      # step is where it will show up, as an ImportError rather than a surprise.
+      - name: Run the suite
+        run: python -m unittest discover -s tests -v
+
+  lint:
+    name: ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pipx install ruff
+      - run: ruff check contextmesh tests dashboard/bundle.py
+
+  leaks:
+    name: no private data
+    # Scoped to what the pull request adds, so a PR is judged on its own commits.
+    # Run `ops/leak-check.sh` with no argument to audit the whole history.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Nothing private in what this PR adds
+        # An exact SHA, not a ref name: `git fetch origin <branch>` updates only
+        # FETCH_HEAD, so origin/<branch> need not exist in the runner's checkout
+        # and the range would silently cover the wrong commits.
+        run: ops/leak-check.sh "${{ github.event.pull_request.base.sha }}"
+
+  smoke:
+    name: cli · demo · export
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: The worked example runs end to end
+        run: python -m contextmesh --rounds 4 demo
+
+      - name: A question answers with a path
+        run: |
+          python -m contextmesh --rounds 2 ask "What made the sharding rule wrong?" \
+            | tee /tmp/ask.txt
+          grep -q "derived_from" /tmp/ask.txt
+
+      - name: An out-of-corpus question dead-ends rather than guessing
+        run: |
+          python -m contextmesh --rounds 2 ask "What is the refund policy for annual plans?" \
+            | tee /tmp/dead.txt
+          grep -q "dead end" /tmp/dead.txt
+
+      - name: The standalone control-layer example still passes its own checks
+        run: |
+          python examples/assumption_control_layer.py | tee /tmp/acl.txt
+          grep -q "ALL ACCEPTANCE CHECKS PASSED" /tmp/acl.txt
+
+      - name: The build is reproducible across hash seeds
+        run: |
+          PYTHONHASHSEED=0    python -m contextmesh export --out /tmp/a.json
+          PYTHONHASHSEED=9999 python -m contextmesh export --out /tmp/b.json
+          cmp /tmp/a.json /tmp/b.json \
+            || { echo "::error::export is not deterministic across PYTHONHASHSEED"; exit 1; }
+
+      - name: The dashboard's committed data matches what the engine produces
+        run: |
+          python -m contextmesh export --out /tmp/fresh.json
+          cmp /tmp/fresh.json dashboard/data/mesh.json || {
+            echo "::error::dashboard/data/mesh.json is stale — run: python -m contextmesh export --inline"
+            diff <(python -m json.tool /tmp/fresh.json) \
+                 <(python -m json.tool dashboard/data/mesh.json) | head -40
+            exit 1
+          }
+
+      - name: The dashboard bundles into one self-contained file
+        run: |
+          python dashboard/bundle.py /tmp/bundled.html
+          grep -q "<script id=\"mesh-data\"" /tmp/bundled.html
+          # -qv would pass on any file with a single non-matching line; the
+          # assertion is that the reference is absent from the file entirely.
+          ! grep -q "src=\"mesh.js\"" /tmp/bundled.html
+
+      - name: The committed single-file dashboard is not stale
+        # dashboard/context-mesh.html is generated from index.html, mesh.js and
+        # data/mesh.json. Committing a build product is only worth it if
+        # something notices when it drifts from its sources.
+        run: |
+          cmp /tmp/bundled.html dashboard/context-mesh.html || {
+            echo "::error::dashboard/context-mesh.html is stale — run: python dashboard/bundle.py dashboard/context-mesh.html"
+            exit 1
+          }
