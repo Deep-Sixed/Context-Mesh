@@ -42,6 +42,10 @@ hairline rules, corner brackets.
 - Rust tile with a hub-and-spoke glyph: one ringed centre node, four satellite
   nodes on the diagonals, cream spokes.
 - `Claude Graph Engineering · Context Mesh` — "Graph Engineering" in rust.
+  Recorded because it is what the frames show. The rebuild does **not** use this
+  wording, here or in the two other places the capture carries it (§3.4 sub,
+  §3.10 footer): it names an organisation this project has no connection to, and
+  reproducing it would imply one. `dashboard/README.md` lists the substitutions.
 - Kicker: `ONE GRAPH · FOUR NODE TYPES · EVERY ANSWER WALKS A PATH YOU CAN READ`
 - Three live stats: `NODES RESOLVED` (ink), `EDGES / TICK` (rust), `WALKS / MIN` (green).
 - Bar sparkline, bottom-aligned, mixed rust/grey bars, older bars fading left.

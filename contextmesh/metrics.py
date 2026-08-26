@@ -99,8 +99,11 @@ def snapshot(
 
     payload: Dict[str, Any] = {
         "header": {
-            "title": "Claude Graph Engineering",
-            "subtitle": "Context Mesh",
+            # The capture's masthead read "Claude Graph Engineering · Context
+            # Mesh". This project is unaffiliated, so it does not carry that
+            # name: see the departure noted in dashboard/README.md.
+            "title": "Context Mesh",
+            "subtitle": "a typed context graph",
             "kicker": "ONE GRAPH · FOUR NODE TYPES · EVERY ANSWER WALKS A PATH YOU CAN READ",
             "nodes_resolved": len(live_nodes),
             "edges_per_tick": max(1, len(graph.edges) // max(graph.build, 1) // 8),

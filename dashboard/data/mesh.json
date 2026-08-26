@@ -1,7 +1,7 @@
 {
   "header": {
-    "title": "Claude Graph Engineering",
-    "subtitle": "Context Mesh",
+    "title": "Context Mesh",
+    "subtitle": "a typed context graph",
     "kicker": "ONE GRAPH \u00b7 FOUR NODE TYPES \u00b7 EVERY ANSWER WALKS A PATH YOU CAN READ",
     "nodes_resolved": 137,
     "edges_per_tick": 50,

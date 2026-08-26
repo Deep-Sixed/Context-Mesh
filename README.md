@@ -1,7 +1,5 @@
 # Context Mesh
 
-**Claude Graph Engineering · Context Mesh**
-
 > One graph · four node types · every answer walks a path you can read
 
 Context Mesh is a typed context graph for long-running agents. It keeps not only
@@ -9,8 +7,10 @@ Context Mesh is a typed context graph for long-running agents. It keeps not only
 on, and what stops being true when an assumption fails.
 
 This repository is a working implementation, reverse-engineered from a screen
-capture of the dashboard. The dashboard is rebuilt too, and every number on it
-is computed by the engine rather than written into the page.
+capture of a dashboard posted publicly. It is an independent project with no
+affiliation to, or endorsement by, anyone involved in that capture. The
+dashboard is rebuilt too, and every number on it is computed by the engine
+rather than written into the page.
 
 ![The Context Mesh dashboard: build path, the live typed graph, hop budget, edge
 ledger, walk-vs-flat token cost, the traversal grid and the dead-end ledger](docs/img/dashboard.png)

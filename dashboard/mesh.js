@@ -62,6 +62,17 @@ const brackets = node => {
 };
 
 /** Draw from a discrete distribution; returns an index. */
+// The capture hardcoded "Graph Engineering" here and used only the first word
+// of the title. Both are now read from the payload, so the masthead says what
+// the engine says it is rather than carrying branding this project has no
+// claim to. First word plain, the rest in rust, matching the capture's rhythm.
+function mastheadTitle(header) {
+  const [first, ...rest] = String(header.title || "").trim().split(/\s+/);
+  const accent = rest.length ? ` <span class="g">${rest.join(" ")}</span>` : "";
+  const sub = header.subtitle ? ` · ${header.subtitle}` : "";
+  return `${first}${accent}${sub}`;
+}
+
 function sampler(weights) {
   const total = weights.reduce((a, b) => a + b, 0);
   if (total <= 0) return () => -1;
@@ -200,7 +211,7 @@ function build(d) {
       <circle cx="20" cy="20" r="1.7" fill="#c9604d"/>
     </svg>`));
   mast.appendChild(el("div", "wordmark", `
-    <h1>${d.header.title.split(" ")[0]} <span class="g">Graph Engineering</span> · ${d.header.subtitle}</h1>
+    <h1>${mastheadTitle(d.header)}</h1>
     <div class="kicker">${d.header.kicker}</div>`));
   mast.appendChild(el("div", "stats", `
     <div class="stat"><div class="label">Nodes
@@ -256,7 +267,7 @@ min</div><div class="v" id="s-walks">—</div></div>`));
   gp.appendChild(el("div", "head", `
     <div>
       <h2 class="ptitle">Context Mesh <span class="accent">· the live graph</span> · Walking</h2>
-      <div class="psub">What Claude resolved, wired to whatever shares a typed edge</div>
+      <div class="psub">What the resolver folded, wired to whatever shares a typed edge</div>
     </div>
     <div class="badge ink" id="s-phasepill">Link</div>`));
   const legend = el("div", "legend", `<div class="label">Node types</div>` +
@@ -377,7 +388,7 @@ min</div><div class="v" id="s-walks">—</div></div>`));
   sheet.appendChild(el("div", "footer", `
     <span>A typed edge beats a top-k guess · the graph is what survives into the
       <span class="accent">next question</span></span>
-    <span><b>Claude</b> · Graph engineering</span>`));
+    <span><b>Context Mesh</b> · GRAPH.md is the schema</span>`));
 }
 
 // ── force-directed graph ────────────────────────────────────────────────
