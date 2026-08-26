@@ -111,3 +111,13 @@ jobs:
           # -qv would pass on any file with a single non-matching line; the
           # assertion is that the reference is absent from the file entirely.
           ! grep -q "src=\"mesh.js\"" /tmp/bundled.html
+
+      - name: The committed single-file dashboard is not stale
+        # dashboard/context-mesh.html is generated from index.html, mesh.js and
+        # data/mesh.json. Committing a build product is only worth it if
+        # something notices when it drifts from its sources.
+        run: |
+          cmp /tmp/bundled.html dashboard/context-mesh.html || {
+            echo "::error::dashboard/context-mesh.html is stale — run: python dashboard/bundle.py dashboard/context-mesh.html"
+            exit 1
+          }

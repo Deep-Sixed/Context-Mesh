@@ -7,10 +7,20 @@ directory is the reconstruction.
 ```
 python -m contextmesh export --inline    # build the graph, write this page's data
 open dashboard/index.html                # works from file://, no server needed
-
-python dashboard/bundle.py out.html      # one self-contained file to send someone
-python dashboard/bundle.py --artifact f  # same, minus the document skeleton
 ```
+
+`context-mesh.html` in this directory is the same page as one self-contained
+file — open it, mail it, drop it on a static host, nothing else needed. It is
+generated, so regenerate it whenever the page or the data changes:
+
+```
+python dashboard/bundle.py dashboard/context-mesh.html
+python dashboard/bundle.py --artifact f  # same, minus the document skeleton,
+                                         # for hosts that supply their own
+```
+
+CI fails if the committed copy has drifted from its sources. Committing a build
+product is only worth it when something notices it going stale.
 
 `index.html` is the layout and the palette, `mesh.js` is the renderer, and
 `data/mesh.json` is a real export. `--inline` also writes that JSON into the
