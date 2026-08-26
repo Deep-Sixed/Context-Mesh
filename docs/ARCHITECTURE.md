@@ -136,10 +136,25 @@ back under the same id. An artefact the rerun stops producing stays
 invalidated — the correct answer for a thing that no longer exists.
 
 **The record is checkable, not just conventional.** Each ledger entry's digest
-covers the digest before it, so a rewritten or dropped entry breaks the chain.
-The entries carry no wall-clock time; the package promises byte-identical
-builds across processes and hash seeds, and a timestamp would be the one field
-that could not be reproduced.
+is SHA-256 over the canonical JSON of its fields and the digest before it, so a
+rewritten, reordered or dropped entry breaks the chain. The encoding matters:
+`detail` is free text, and any separator that can appear inside a field lets two
+different entries produce one payload — joined on `|`, `task="a", detail="b|c"`
+is byte-identical to `task="a|b", detail="c"`. Sorted keys and no whitespace
+make the encoding a function of the values alone, and payload values without a
+single JSON form (sets, bytes, `NaN`) are refused at the door rather than
+silently rendered. The entries carry no wall-clock time either; the package
+promises byte-identical builds across processes and hash seeds, and a timestamp
+would be the one field that could not be reproduced. What this buys is
+detection, not prevention: tampering is visible, not impossible.
+
+A disproof writes two kinds of record, deliberately. The `DISPROVED` entry is
+the atomic receipt of the whole event — assumption, evidence, auditor, every
+invalidated node with its reason chain, and the preserved set — which makes the
+blast radius replayable from `ledger.receipts()` alone, with no access to the
+graph it happened on. The per-node `INVALIDATED` entries are each node's own
+history, which is a different question and answered better by a per-node row.
+The overlap between them is intended.
 
 Until a rejected assumption is repaired, the tasks standing on it are *blocked*
 rather than run. Repair does not edit the rejection away — it grounds the task

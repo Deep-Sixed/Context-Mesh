@@ -223,7 +223,18 @@ def cmd_execute(args: argparse.Namespace) -> int:
     for entry in runner.ledger.entries:
         print(f"  {entry.seq:>3} r{entry.round} {entry.event.value:<12} "
               f"{entry.task:<12} {entry.detail[:60]}")
-    print(f"\n  head {runner.ledger.head} · chain intact: {runner.ledger.verify()}")
+    print(f"\n  head {runner.ledger.short_head} · chain intact: {runner.ledger.verify()}")
+
+    _h("RECEIPT · the whole event, read back off the ledger alone")
+    for receipt in runner.ledger.receipts():
+        print(f"  ground     {receipt['assumption']}")
+        print(f"  disproved  by {receipt['disproved_by']}, evidence {receipt['evidence_id']}")
+        print(f"  reason     {receipt['reason']}")
+        print(f"  fell       {len(receipt['invalidated'])}")
+        for node_id, chain in sorted(receipt["invalidated"].items()):
+            print(f"    ✗ {graph.node(node_id).label[:52]}")
+            print(f"        {' → '.join(chain)}")
+        print(f"  stood      {len(receipt['preserved'])} node(s) untouched")
     return 0
 
 

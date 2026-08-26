@@ -37,7 +37,7 @@ python -m contextmesh export --inline # regenerate the dashboard's data
 ```
 
 No dependencies. Python 3.9+. `python -m unittest discover -s tests` runs the
-suite (123 tests). CI runs it on 3.9 through 3.13, plus ruff and a set of
+suite (150 tests). CI runs it on 3.9 through 3.13, plus ruff and a set of
 end-to-end smoke checks — including that a build is byte-identical across
 `PYTHONHASHSEED`, and that `dashboard/data/mesh.json` still matches what the
 engine produces.
@@ -185,11 +185,26 @@ brings it back under the same id. An artefact the rerun *stops* producing — th
 Argon2 parameters, once the hasher becomes bcrypt — stays invalidated, which is
 the right answer for a thing that no longer exists.
 
-**The ledger is append-only in a way you can check.** Each entry's digest covers
-the one before it, so a rewritten or dropped entry breaks the chain and
-`ledger.verify()` says so. There are no timestamps in it: this package promises
-builds that are byte-identical across processes and hash seeds, and a clock
-would be the one field that could not be reproduced.
+**The ledger is append-only in a way you can check.** Each entry's digest is
+SHA-256 over the canonical JSON of its own fields *and* the digest before it, so
+a rewritten, reordered or dropped entry breaks the chain and `ledger.verify()`
+says so. Canonical JSON rather than joined fields because `detail` is free text:
+under a `|`-separated payload, `task="a", detail="b|c"` and `task="a|b",
+detail="c"` produce identical bytes, and one entry can forge another's digest.
+Payload values are refused unless they have a single JSON form — no sets, no
+bytes, no `NaN` — since a digest over an unstable rendering is computed but not
+meaningful. There are no timestamps either: this package promises builds that
+are byte-identical across processes and hash seeds, and a clock would be the one
+field that could not be reproduced.
+
+**A disproof is one entry, not a pile of them.** The `DISPROVED` record carries
+the whole receipt — which ground failed, what evidence disproved it, which
+auditor found it, every invalidated node *with the chain that explains it*, and
+the preserved set — so `ledger.receipts()` answers the full event without the
+graph the run was performed against. The per-node `INVALIDATED` entries stay:
+the receipt is the atomic event, those are each node's own history, and both are
+worth having. Saying three nodes fell proves half of selective invalidation;
+the preserved set is the other half, so it travels in the same record.
 
 A rejected assumption is never edited back to life. It stays rejected, and
 `repair()` grounds the task on a replacement that records what it supersedes —
@@ -273,7 +288,7 @@ contextmesh/
 dashboard/                   the rebuilt dashboard
 docs/                        the capture spec and the architecture notes
 examples/                    the original standalone control-layer sketch
-tests/                       123 tests over the invariants above
+tests/                       150 tests over the invariants above
 ```
 
 ## Staying publishable
