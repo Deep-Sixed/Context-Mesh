@@ -311,7 +311,9 @@ Fields are checked rather than coerced, because coercion is not harmless here:
 into an invalidated one; `list("abc")` would turn a string into a
 three-element "vector"; and `bool` being a subclass of `int` means a count
 written as a flag would arrive as `1`. The suite corrupts a good snapshot
-sixty-five ways and requires each to be refused.
+97 ways and requires each to be refused — a counted figure, not an
+estimate: `tests/test_persistence.py` builds and rejects that many distinct
+corrupted snapshots across 55 test methods.
 
 **Records are emitted in insertion order, never sorted.** That is load-bearing.
 The walker's frontier is a heap whose tie-breaker is an insertion counter, and
