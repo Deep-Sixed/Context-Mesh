@@ -52,7 +52,9 @@ DISPLAY_TYPES: Tuple[NodeType, ...] = (
 # writes it — ``provenance``, ``provenance.span``, ``embedding``,
 # ``assumption_id``, ``supersedes``, ``superseded_by`` and
 # ``rejected_at_build``. Everywhere else a null is corruption, and normalising
-# it to an empty list or object would quietly discard what the field named. Coercion is not a harmless convenience here:
+# it to an empty list or object would quietly discard what the field named.
+#
+# Coercion is not a harmless convenience here:
 # ``bool("false")`` is ``True``, so a malformed flag would silently turn a live
 # node into an invalidated one, and ``list("abc")`` turns a string into a
 # three-element "vector". A durable state format has to fail closed.
