@@ -12,7 +12,7 @@ its own TaskRegistry, because registry contents are deployment configuration and
 must never cross the checkpoint boundary.
 """
 
-import json
+import json  # noqa: I001
 import pathlib
 import subprocess
 import sys
