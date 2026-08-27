@@ -13,11 +13,11 @@ must never cross the checkpoint boundary.
 """
 
 import json
+import pathlib
 import subprocess
 import sys
 import tempfile
 import unittest
-from pathlib import Path
 
 
 _CREATE = r'''
@@ -192,7 +192,7 @@ print(json.dumps({
 '''
 
 
-def _process(script: str, directory: Path) -> dict:
+def _process(script: str, directory: pathlib.Path) -> dict:
     proc = subprocess.run(
         [sys.executable, "-c", script, str(directory)],
         capture_output=True,
@@ -210,7 +210,7 @@ def _process(script: str, directory: Path) -> dict:
 class CrossProcessSelectiveRerunTest(unittest.TestCase):
     def test_mid_repair_restart_reruns_only_the_stale_closure(self):
         with tempfile.TemporaryDirectory() as tmp:
-            directory = Path(tmp) / "session"
+            directory = pathlib.Path(tmp) / "session"
 
             created = _process(_CREATE, directory)
             self.assertEqual(created["generation"], 1)
