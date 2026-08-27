@@ -475,6 +475,36 @@ _ENTRY_KEYS = frozenset(
 )
 
 
+#: The fields the v1 container has — all of them, and only these. Exact for the
+#: same reason an entry record is exact: a file carrying `approved_by` or an
+#: `external_anchor` is a file whose meaning a v1 reader would silently discard,
+#: and a later version that gives those names semantics would then disagree with
+#: every v1 reader about what the same bytes said.
+_LEDGER_KEYS = frozenset({"schema", "version", "head", "entries"})
+
+
+def _strict_object(pairs: Any) -> Dict[str, Any]:
+    """json object hook. Two keys with one name have no agreed meaning.
+
+    Python keeps the last, other parsers keep the first, and some refuse the
+    document outright. That is tolerable in a config file and not tolerable
+    here: this ledger is meant to be re-checkable by an implementation that is
+    not this one, and a digest only means something if every reader agrees which
+    JSON value it was taken over. Applied through ``object_pairs_hook`` so it
+    reaches the container, each entry, and the signed ``data`` payload alike.
+    """
+    result: Dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise LedgerIntegrityError(
+                f"duplicate JSON key {key!r}; two values under one name mean "
+                "different things to different parsers, so the digest would be "
+                "taken over an object readers disagree about"
+            )
+        result[key] = value
+    return result
+
+
 def _no_ledger_constants(value: str) -> float:
     """json.load hook. ``NaN``/``Infinity`` are not JSON and do not round-trip."""
     raise LedgerIntegrityError(
@@ -717,7 +747,11 @@ class RunLedger:
         from pathlib import Path
 
         text = Path(path).read_text(encoding="utf-8")
-        data = json.loads(text, parse_constant=_no_ledger_constants)
+        data = json.loads(
+            text,
+            parse_constant=_no_ledger_constants,
+            object_pairs_hook=_strict_object,
+        )
         return cls.from_snapshot(data, expect_head=expect_head)
 
     @classmethod
@@ -746,17 +780,30 @@ class RunLedger:
         self-checking distinguishes that chain from the original. What does
         distinguish them is a head you trusted *before* the file could be
         rewritten. Pass it as ``expect_head`` and the forgery is refused,
-        because producing a different history that ends in the same digest is a
-        SHA-256 preimage. Omit it and you get tamper *evidence* — modification,
-        deletion and reordering — but not continuity.
+        because the honest history and its digest already exist, so producing a
+        *different* history ending in that same digest is a SHA-256 second
+        preimage. Omit it and you get tamper *evidence* — modification, deletion
+        and reordering — but not continuity.
         """
         if not isinstance(data, dict):
             raise LedgerIntegrityError(
                 f"ledger snapshot must be an object, got {type(data).__name__}"
             )
-        for key in ("schema", "version", "head", "entries"):
-            if key not in data:
-                raise LedgerIntegrityError(f"ledger snapshot is missing {key!r}")
+        missing = sorted(_LEDGER_KEYS - set(data))
+        if missing:
+            raise LedgerIntegrityError(
+                "ledger snapshot is missing "
+                + ", ".join(repr(key) for key in missing)
+            )
+        unknown = sorted(set(data) - _LEDGER_KEYS)
+        if unknown:
+            raise LedgerIntegrityError(
+                "ledger snapshot carries "
+                + ", ".join(repr(key) for key in unknown)
+                + ", which v1 does not define. A future version may give those "
+                "names meaning, and a v1 reader dropping them would disagree "
+                "with it about what the same file said"
+            )
         if data["schema"] != LEDGER_SCHEMA:
             raise LedgerIntegrityError(
                 f"not a {LEDGER_SCHEMA} snapshot: schema is {data['schema']!r}"

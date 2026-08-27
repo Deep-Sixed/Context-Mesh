@@ -1020,14 +1020,38 @@ jobs:
               except LedgerIntegrityError as exc:
                   print(" %-20s refused: %s" % (label, str(exc)[:58]))
 
-          # An unsigned field is refused rather than silently dropped.
+          # An unsigned field is refused rather than silently dropped, at both
+          # levels: the entry record and the container around it.
           extra = json.loads(json.dumps(good))
           extra["entries"][0]["approved_by"] = "someone"
           try:
               RunLedger.from_snapshot(extra)
-              raise SystemExit("::error::an unsigned field was accepted")
+              raise SystemExit("::error::an unsigned entry field was accepted")
           except LedgerIntegrityError as exc:
               print(" %-20s refused: %s" % ("an unsigned field", str(exc)[:58]))
+
+          outer = dict(good, external_anchor="https://example.invalid/notarised")
+          try:
+              RunLedger.from_snapshot(outer)
+              raise SystemExit("::error::an undefined container field was accepted")
+          except LedgerIntegrityError as exc:
+              print(" %-20s refused: %s" % ("an undefined v1 field", str(exc)[:58]))
+
+          # Duplicate JSON keys: one name, two values, no agreed meaning.
+          assert json.loads('{"a": 1, "a": 2}') == {"a": 2}, "python keeps the last"
+          tmp0 = Path(tempfile.mkdtemp()) / "dup.json"
+          led2 = RunLedger()
+          led2.record(1, Event.EXECUTED, "t", "d", data={"hasher": "Argon2id"})
+          dup = led2.to_json().replace(
+              '"hasher": "Argon2id"', '"hasher": "Argon2id", "hasher": "Bcrypt"', 1
+          )
+          assert '"hasher": "Bcrypt"' in dup, "the duplicate was not injected"
+          tmp0.write_text(dup)
+          try:
+              RunLedger.load_json(tmp0)
+              raise SystemExit("::error::a duplicate key in signed data was accepted")
+          except LedgerIntegrityError as exc:
+              print(" %-20s refused: %s" % ("a duplicate in data", str(exc)[:58]))
 
           # NaN never reaches a file, at either end.
           tmp = Path(tempfile.mkdtemp()) / "l.json"

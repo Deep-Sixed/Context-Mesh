@@ -224,6 +224,42 @@ class FailClosedTest(unittest.TestCase):
         self.snapshot["entries"][0]["approved_by"] = "someone"
         self.refuse("which the digest does not cover")
 
+    def test_an_unknown_container_field_is_refused_not_dropped(self):
+        """The container is exact for the same reason an entry record is.
+
+        A v1 file carrying `approved_by` or an `external_anchor` is a file whose
+        meaning a v1 reader would silently discard — and if a later version gave
+        those names semantics, every v1 reader would disagree with it about what
+        the same bytes said.
+        """
+        for field in ("approved_by", "external_anchor", "signature"):
+            with self.subTest(field=field):
+                snapshot = history().snapshot()
+                snapshot[field] = "something"
+                with self.assertRaises(LedgerIntegrityError) as caught:
+                    RunLedger.from_snapshot(snapshot)
+                message = str(caught.exception)
+                self.assertIn(field, message)
+                self.assertIn("which v1 does not define", message)
+
+    def test_several_unknown_container_fields_are_all_named(self):
+        snapshot = history().snapshot()
+        snapshot["approved_by"] = "alice"
+        snapshot["external_anchor"] = "somewhere"
+        with self.assertRaises(LedgerIntegrityError) as caught:
+            RunLedger.from_snapshot(snapshot)
+        self.assertIn("approved_by", str(caught.exception))
+        self.assertIn("external_anchor", str(caught.exception))
+
+    def test_several_missing_container_fields_are_all_named(self):
+        snapshot = history().snapshot()
+        del snapshot["head"]
+        del snapshot["version"]
+        with self.assertRaises(LedgerIntegrityError) as caught:
+            RunLedger.from_snapshot(snapshot)
+        self.assertIn("head", str(caught.exception))
+        self.assertIn("version", str(caught.exception))
+
     def test_seq_must_be_an_integer_starting_at_one_with_no_gaps(self):
         for position, value, fragment in (
             (0, 2, "this is entry 1"),
@@ -344,6 +380,74 @@ class FailClosedTest(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             ledger.to_json()
+
+
+class DuplicateJsonKeyTest(unittest.TestCase):
+    """One name, two values — no two parsers need agree which one it was.
+
+    Python's `json` keeps the last, other implementations keep the first, and
+    some refuse the document. That is tolerable in a config file and not here:
+    this ledger exists to be re-checkable by an implementation that is not this
+    one, and a digest only means something if every reader agrees which JSON
+    value it was taken over.
+    """
+
+    def write(self, text):
+        path = Path(self.tmp.name) / "ledger.json"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_a_duplicate_container_key_is_refused(self):
+        text = history().to_json().replace(
+            '"schema": "contextmesh.runledger"',
+            '"schema": "contextmesh.runledger", "schema": "contextmesh.graph"',
+            1,
+        )
+        with self.assertRaises(LedgerIntegrityError) as caught:
+            RunLedger.load_json(self.write(text))
+        self.assertIn("duplicate JSON key", str(caught.exception))
+        self.assertIn("schema", str(caught.exception))
+
+    def test_a_duplicate_entry_key_is_refused(self):
+        text = history().to_json().replace(
+            '"seq": 1,', '"seq": 1, "seq": 99,', 1
+        )
+        with self.assertRaises(LedgerIntegrityError) as caught:
+            RunLedger.load_json(self.write(text))
+        self.assertIn("duplicate JSON key", str(caught.exception))
+
+    def test_a_duplicate_key_inside_the_signed_payload_is_refused(self):
+        """The one that matters most: `data` is inside the digest.
+
+        Without this, two verifiers could hash two different objects from the
+        same bytes and both call the ledger sound.
+        """
+        text = json.dumps(history().snapshot(), separators=(",", ":"))
+        needle = '"data":{"hasher":"Argon2id"'
+        # Guard the rewrite: a needle that stopped matching would turn this
+        # test into a no-op that passes for the wrong reason.
+        self.assertIn(needle, text)
+        text = text.replace(
+            needle, '"data":{"hasher":"Argon2id","hasher":"Bcrypt"', 1
+        )
+        with self.assertRaises(LedgerIntegrityError) as caught:
+            RunLedger.load_json(self.write(text))
+        self.assertIn("duplicate JSON key", str(caught.exception))
+        self.assertIn("hasher", str(caught.exception))
+
+    def test_python_alone_would_have_kept_one_of_them_silently(self):
+        """Pins what the hook prevents, so the tests above cannot pass vacuously."""
+        loose = json.loads('{"hasher": "Argon2id", "hasher": "Bcrypt"}')
+        self.assertEqual(loose, {"hasher": "Bcrypt"})
+
+    def test_a_file_with_unique_keys_still_loads(self):
+        ledger = history()
+        path = self.write(ledger.to_json())
+        self.assertEqual(RunLedger.load_json(path).head, ledger.head)
 
 
 class TamperTest(unittest.TestCase):

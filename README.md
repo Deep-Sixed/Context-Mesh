@@ -333,8 +333,8 @@ could be rewritten:
 ```
 
 Pass it as `from_snapshot(data, expect_head=H)` and the forgery is refused,
-because producing a different history that ends in the same digest is a SHA-256
-preimage. Omit it and you get tamper *evidence* — modification, deletion,
+because the honest history and its digest already exist, so producing a
+*different* history ending in that same digest is a SHA-256 **second** preimage. Omit it and you get tamper *evidence* — modification, deletion,
 reordering — but not continuity. This is why the restored head being the *exact*
 committed head is the load-bearing invariant, rather than the restored chain
 merely hashing correctly.
@@ -344,7 +344,16 @@ schema and version exactly, `seq` contiguous from 1, `round` a non-negative
 integer, the event one this build knows, the nullable ids a string or null, the
 payload canonical JSON, and both digests 64 lowercase hex characters. An unknown
 field is refused rather than dropped — the digest covers a fixed set, so
-anything extra is content the chain does not sign.
+anything extra is content the chain does not sign. The container is exact for
+the same reason: a v1 file carrying `approved_by` or an `external_anchor` holds
+meaning a v1 reader would silently discard, and a later version giving those
+names semantics would then disagree with every v1 reader about the same bytes.
+
+Duplicate JSON keys are refused too, at every depth — container, entry and the
+signed `data` payload. Python's parser keeps the last value, others keep the
+first, and some reject the document; a digest is only meaningful if every reader
+agrees which JSON value it was taken over, and this file is meant to be
+re-checkable by an implementation that is not this one.
 
 This is the second slice of execution checkpointing. The execution snapshot
 format and a session that joins graph, resolver and execution are deliberately
