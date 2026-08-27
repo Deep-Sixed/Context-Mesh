@@ -452,8 +452,52 @@ argon2 green → CVE → recheck → hashing, routes STALE; schema, tokens DONE
 A restored plan and one carried forward in memory are compared task by task
 after `run()` — same states, same attempt counts, same outputs.
 
-This is the third slice of execution checkpointing. A session that joins graph,
-resolver and execution is deliberately not built yet.
+### One session, four companions, one commit
+
+Session v1 held a graph and the resolver that reads it. **v2 adds the execution
+plan and its run ledger**, so a restart brings back not just what is known but
+what was being done about it:
+
+```
+session/
+  session.json          the manifest, and the only thing that commits
+  graph-000003.json     what is known
+  resolver-000003.json  how a question finds it
+  execution-000003.json the plan, mid-repair
+  runledger-000003.json the record of it getting there
+```
+
+All four land in fresh files and are renamed into place; the manifest swap is
+still the single atomic commit, so a crash anywhere in between leaves the
+previous generation serving exactly as before. `execution` and `ledger` are
+`null` rather than absent when a session carries no plan — a reader can tell
+"no execution" from "field missing" — and a plan and its ledger are committed
+together or not at all.
+
+**The interesting failures are between the files.** Each companion already
+refuses its own corruption, and every one of those checks can pass while the
+four describe different runs. So the session boundary adds only what needs the
+pair:
+
+```
+graph ↔ resolver     already: every resolved id is a node of the right type
+plan  ↔ graph        already: references close, plan owns its namespace
+ledger ↔ plan        new: every entry names a task the plan holds, and no
+                     entry is recorded in a round the plan never reached
+```
+
+Kept to what the engine guarantees: the ledger holds no entry for a task that
+has not run, and many for one that has, so neither count is an invariant and
+neither is asserted.
+
+**A directory cannot carry a registry.** A key means something only because a
+running process was configured to say so, so a session holding an execution is
+restorable only by a deployment that brings one — `Session.load(path,
+registry=...)`, and a clear refusal naming the missing key otherwise.
+
+A **v1 directory still loads**, as a session with no execution, and the next
+save upgrades it. A version from the *future* is still refused: this build
+cannot know what it would be dropping.
 
 ### The standalone control layer
 

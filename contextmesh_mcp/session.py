@@ -50,6 +50,12 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from contextmesh.assumptions import AssumptionLedger
 from contextmesh.demo import run as demo_run
+from contextmesh.execute import (
+    ExecutionError,
+    RunLedger,
+    Runner,
+    TaskRegistry,
+)
 from contextmesh.graph import ContextGraph
 from contextmesh.model import NodeType
 from contextmesh.resolve import Resolver
@@ -60,7 +66,15 @@ DEFAULT_ROUNDS = 8
 #: The session directory's own format. Bump for any change that makes a
 #: directory this build writes unreadable to an older one, or vice versa.
 SESSION_SCHEMA = "contextmesh.session"
-SESSION_VERSION = 1
+SESSION_VERSION = 2
+
+#: Versions this build can *read*. It writes ``SESSION_VERSION`` and only that.
+#: v1 held a graph and a resolver; v2 adds the execution plan and its run
+#: ledger. A v1 directory is a real thing this project shipped, so it is read
+#: rather than orphaned — as a session with no execution — and the next save
+#: upgrades it. A version from the *future* is still refused: this build cannot
+#: know what it would be dropping.
+READABLE_VERSIONS = (1, 2)
 
 SESSION_FILE = "session.json"
 LOCK_FILE = "session.lock"
@@ -71,6 +85,20 @@ STAGING_PREFIX = ".staging-"
 STAGING_SUFFIX = ".tmp"
 GRAPH_STEM = "graph"
 RESOLVER_STEM = "resolver"
+EXECUTION_STEM = "execution"
+RUNLEDGER_STEM = "runledger"
+
+#: The companions a manifest can name, and the stem each generation uses. Order
+#: matters only for reading errors; the manifest is the commit point either way.
+COMPANIONS = (
+    ("graph", GRAPH_STEM),
+    ("resolver", RESOLVER_STEM),
+    ("execution", EXECUTION_STEM),
+    ("ledger", RUNLEDGER_STEM),
+)
+
+#: The two a session cannot be without.
+REQUIRED_COMPANIONS = ("graph", "resolver")
 
 #: How often a served session is written back. ``every-ask`` is the default
 #: because a question is a write here and a lost write is silent; the cost is
@@ -470,6 +498,38 @@ class WalkerConfig:
         )
 
 
+def _reconcile_execution(runner: Runner, execution: str, ledger: str) -> None:
+    """The plan and its ledger have to be about each other.
+
+    Each is checked on its own before this — the ledger's chain verifies, the
+    plan's references close against the graph — and both can pass while
+    describing different runs. These are the facts that only make sense across
+    the pair::
+
+        every ledger entry names a task the plan holds
+        no entry is recorded in a round the plan never reached
+
+    Kept to what the engine actually guarantees. The ledger does not hold an
+    entry for every task (a plan can be saved before anything runs) and a task
+    can appear many times (attempts, audits, repairs), so neither count is an
+    invariant and neither is asserted.
+    """
+    names = {task.name for task in runner.tasks}
+    for entry in runner.ledger.entries:
+        if entry.task not in names:
+            raise SessionError(
+                f"{ledger} records {entry.task!r} at entry {entry.seq}, which is "
+                f"not a task in {execution}. The plan and its history are from "
+                "different runs"
+            )
+        if entry.round > runner.round:
+            raise SessionError(
+                f"{ledger} records entry {entry.seq} in round {entry.round}, but "
+                f"{execution} has only reached round {runner.round}. The history "
+                "runs ahead of the plan it belongs to"
+            )
+
+
 def check_agreement(graph: ContextGraph, resolver: Resolver) -> None:
     """The invariants that span both files, and so live in neither.
 
@@ -521,6 +581,13 @@ class Session:
     #: The generation this session was loaded at, or last committed. 0 means
     #: it has never been on disk.
     generation: int = 0
+    #: The execution plan this session carries, if any. Optional because a
+    #: session is useful without one — the MCP server reads a graph and answers
+    #: questions, and never executes anything. A session that has one carries
+    #: its run ledger too: the plan is what happened, the ledger is the record
+    #: of it happening, and splitting them across two saves would let a restore
+    #: hold a plan whose history it cannot show.
+    runner: Optional[Runner] = None
 
     @classmethod
     def build(cls, rounds: int = DEFAULT_ROUNDS) -> "Session":
@@ -544,15 +611,25 @@ class Session:
 
     # ── persistence ──────────────────────────────────────────────────────
     def manifest(self, generation: int) -> Dict[str, Any]:
-        return {
+        """The commit point. Names every companion this generation holds.
+
+        ``execution`` and ``ledger`` are ``null`` when the session carries no
+        plan — present-and-null rather than absent, so a reader can tell "this
+        session has no execution" from "this manifest is missing a field".
+        """
+        keyed = {
             "schema": SESSION_SCHEMA,
             "version": SESSION_VERSION,
             "generation": generation,
-            "graph": generation_name(GRAPH_STEM, generation),
-            "resolver": generation_name(RESOLVER_STEM, generation),
             "rounds": self.rounds,
             "walker": WalkerConfig.of(self.walker).to_dict(),
         }
+        for field_name, stem in COMPANIONS:
+            if field_name in REQUIRED_COMPANIONS or self.runner is not None:
+                keyed[field_name] = generation_name(stem, generation)
+            else:
+                keyed[field_name] = None
+        return keyed
 
     @staticmethod
     def _live_generation(directory: Path) -> int:
@@ -621,6 +698,13 @@ class Session:
         # sitting under the name. See ``write_in_place``.
         write_in_place(target, payload["graph"], self.graph.to_json())
         write_in_place(target, payload["resolver"], self.resolver.to_json())
+        if self.runner is not None:
+            # Both or neither, in the same transaction as the graph they refer
+            # into. The manifest is still the only thing that makes any of them
+            # live, so a crash between these two leaves the old generation
+            # serving exactly as it did before.
+            write_in_place(target, payload["execution"], self.runner.to_json())
+            write_in_place(target, payload["ledger"], self.runner.ledger.to_json())
         write_in_place(
             target,
             SESSION_FILE,
@@ -633,7 +717,8 @@ class Session:
 
         self._sweep(
             target,
-            keep={SESSION_FILE, LOCK_FILE, payload["graph"], payload["resolver"]},
+            keep={SESSION_FILE, LOCK_FILE}
+            | {payload[name] for name, _ in COMPANIONS if payload[name] is not None},
         )
         self.generation = generation
         return target
@@ -652,8 +737,8 @@ class Session:
             name = entry.name
             if name in keep or not entry.is_file():
                 continue
-            superseded = name.endswith(".json") and (
-                name.startswith(f"{GRAPH_STEM}-") or name.startswith(f"{RESOLVER_STEM}-")
+            superseded = name.endswith(".json") and any(
+                name.startswith(f"{stem}-") for _, stem in COMPANIONS
             )
             abandoned = name.startswith(STAGING_PREFIX) and name.endswith(STAGING_SUFFIX)
             if superseded or abandoned:
@@ -683,7 +768,9 @@ class Session:
         return self.save(self.path)
 
     @classmethod
-    def load(cls, directory: Any) -> "Session":
+    def load(
+        cls, directory: Any, *, registry: Optional[TaskRegistry] = None
+    ) -> "Session":
         """Restore a session from a directory, or refuse it.
 
         Two things are rebuilt rather than restored, and both are deliberate:
@@ -717,7 +804,7 @@ class Session:
         for attempt in range(LOAD_ATTEMPTS):
             before = cls._live_generation(target)
             try:
-                return cls._load_once(target)
+                return cls._load_once(target, registry)
             except _Swept as swept:
                 if cls._live_generation(target) == before:
                     # Nothing committed while we read. The file is simply not
@@ -737,7 +824,9 @@ class Session:
         raise AssertionError("unreachable")  # pragma: no cover
 
     @classmethod
-    def _load_once(cls, target: Path) -> "Session":
+    def _load_once(
+        cls, target: Path, registry: Optional[TaskRegistry] = None
+    ) -> "Session":
         """One attempt. Raises ``_Swept`` if a writer removed what we named."""
         session_path = target / SESSION_FILE
         if not session_path.is_file():
@@ -758,15 +847,7 @@ class Session:
             raise SessionError(
                 f"{SESSION_FILE} must contain an object, got {type(data).__name__}"
             )
-        for key in (
-            "schema",
-            "version",
-            "generation",
-            "graph",
-            "resolver",
-            "rounds",
-            "walker",
-        ):
+        for key in ("schema", "version", "generation", "rounds", "walker"):
             if key not in data:
                 raise SessionError(f"{SESSION_FILE} is missing {key!r}")
         if data["schema"] != SESSION_SCHEMA:
@@ -776,18 +857,37 @@ class Session:
         version = data["version"]
         if isinstance(version, bool) or not isinstance(version, int):
             raise SessionError(f"session version must be an integer, got {version!r}")
-        if version != SESSION_VERSION:
+        if version not in READABLE_VERSIONS:
             raise SessionError(
                 f"session version {version!r} cannot be read by this build, "
-                f"which writes and reads version {SESSION_VERSION}"
+                f"which writes {SESSION_VERSION} and reads "
+                f"{', '.join(str(v) for v in READABLE_VERSIONS)}"
             )
 
         rounds = _session_int(data["rounds"], "rounds", minimum=0)
         generation = _session_int(data["generation"], "generation", minimum=1)
         config = WalkerConfig.from_dict(data["walker"])
 
-        paths = {}
-        for field_name, stem in (("graph", GRAPH_STEM), ("resolver", RESOLVER_STEM)):
+        # v1 named a graph and a resolver; v2 names four, two of which may be
+        # null. Both required companions are required in either version.
+        expected_fields = [name for name, _ in COMPANIONS]
+        if version == 1:
+            expected_fields = list(REQUIRED_COMPANIONS)
+        for field_name in expected_fields:
+            if field_name not in data:
+                raise SessionError(f"{SESSION_FILE} is missing {field_name!r}")
+
+        paths: Dict[str, Optional[Path]] = {name: None for name, _ in COMPANIONS}
+        for field_name, stem in COMPANIONS:
+            if field_name not in expected_fields:
+                continue
+            if data[field_name] is None:
+                if field_name in REQUIRED_COMPANIONS:
+                    raise SessionError(
+                        f"{SESSION_FILE} names no {field_name}; a session "
+                        "without one is not a session"
+                    )
+                continue
             name = _bare_name(data[field_name], field_name)
             expected = generation_name(stem, generation)
             # Not pedantry about naming. The next save computes its filenames
@@ -804,7 +904,20 @@ class Session:
             if not path.is_file():
                 raise _Swept(name, field_name)
             paths[field_name] = path
+
+        # A plan and its history travel together. One without the other would
+        # restore an execution whose events cannot be shown, or a history with
+        # nothing it describes.
+        if (paths["execution"] is None) != (paths["ledger"] is None):
+            present = "execution" if paths["execution"] is not None else "ledger"
+            missing = "ledger" if present == "execution" else "execution"
+            raise SessionError(
+                f"{SESSION_FILE} names the {present} but no {missing}; a plan "
+                "and the record of it running are committed together or not "
+                "at all"
+            )
         graph_path, resolver_path = paths["graph"], paths["resolver"]
+        assert graph_path is not None and resolver_path is not None
 
         # SnapshotError and ResolverSnapshotError are both ValueError, and both
         # already say precisely what is wrong. Re-raising as SessionError keeps
@@ -826,6 +939,13 @@ class Session:
 
         check_agreement(graph, resolver)
 
+        runner = None
+        if paths["execution"] is not None:
+            assert paths["ledger"] is not None
+            runner = cls._load_execution(
+                paths["execution"], paths["ledger"], graph=graph, registry=registry
+            )
+
         return cls(
             graph=graph,
             resolver=resolver,
@@ -835,7 +955,55 @@ class Session:
             source=f"session directory {target}",
             path=target,
             generation=generation,
+            runner=runner,
         )
+
+    @staticmethod
+    def _load_execution(
+        execution_path: Path,
+        ledger_path: Path,
+        *,
+        graph: ContextGraph,
+        registry: Optional[TaskRegistry],
+    ) -> Runner:
+        """Rebuild the plan and its history, and check they describe each other.
+
+        The registry is the one thing a session directory cannot carry: a key
+        means something only because a running process was configured to say so.
+        So a session holding an execution can only be restored by a deployment
+        that brought one, and saying that plainly beats a ``NoneType`` further
+        in.
+        """
+        if registry is None:
+            raise SessionError(
+                f"{execution_path.name} holds an execution plan, but no "
+                "TaskRegistry was given. A checkpoint names its workers and "
+                "this process has to say what those names mean; pass "
+                "registry= to Session.load"
+            )
+        try:
+            ledger = RunLedger.load_json(ledger_path)
+        except FileNotFoundError:
+            raise _Swept(ledger_path.name, "ledger") from None
+        except (ExecutionError, ValueError) as exc:
+            # ExecutionError is not a ValueError, unlike SnapshotError and
+            # ResolverSnapshotError above. Both are caught so every companion
+            # fails at this boundary with one exception type.
+            raise SessionError(f"{ledger_path.name}: {exc}") from exc
+
+        try:
+            runner = Runner.load_json(
+                execution_path, graph=graph, registry=registry, ledger=ledger
+            )
+        except FileNotFoundError:
+            raise _Swept(execution_path.name, "execution") from None
+        except ExecutionError as exc:
+            raise SessionError(f"{execution_path.name}: {exc}") from exc
+        except ValueError as exc:
+            raise SessionError(f"{execution_path.name}: {exc}") from exc
+
+        _reconcile_execution(runner, execution_path.name, ledger_path.name)
+        return runner
 
     def assumption_ids(self) -> list:
         return sorted(self.graph.assumptions)

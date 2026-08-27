@@ -663,6 +663,166 @@ jobs:
           EOF
           grep -q "READER SURVIVED A CONCURRENT SWEEP" /tmp/reader.txt
 
+      - name: A session carries the plan it was mid-repair on
+        run: |
+          python - <<'EOF' | tee /tmp/v2.txt
+          import json, subprocess, sys, tempfile
+          from pathlib import Path
+          from contextmesh.execute import Runner, TaskRegistry
+          from contextmesh_mcp.session import Session
+
+          class Advisory:
+              def __init__(self): self.published = False
+              def __call__(self, ctx):
+                  if self.published and ctx.output.get("impl") == "argon2":
+                      return ctx.disproved("CVE-2026-9999 published for argon2id")
+                  return True
+
+          def deployment(advisory=None):
+              r = TaskRegistry()
+              r.register_worker("auth.schema.v1", lambda c: {"ok": True})
+              r.register_worker("auth.hash.argon2.v1", lambda c: {"impl": "argon2"})
+              r.register_worker("auth.hash.bcrypt.v1", lambda c: {"impl": "bcrypt"})
+              r.register_worker("auth.tokens.v1", lambda c: {"ok": True})
+              r.register_auditor("auth.hash.audit.v1", advisory or Advisory())
+              return r
+
+          base = Session.build(rounds=2)
+          adv = Advisory()
+          run = Runner("auth", graph=base.graph, registry=deployment(adv))
+          run.task("schema", worker_key="auth.schema.v1", assumes="sqlite is fine", produces=("Schema",))
+          run.task("hashing", worker_key="auth.hash.argon2.v1", auditor_key="auth.hash.audit.v1",
+                   assumes="Argon2 has no open advisory", needs=("schema",), produces=("Password Hasher",))
+          run.task("tokens", worker_key="auth.tokens.v1", assumes="JWT is fine",
+                   needs=("schema",), produces=("Tokens",))
+          run.run()
+          adv.published = True
+          run.recheck()
+          run.repair("hashing", assumes="bcrypt has no open advisory",
+                     worker_key="auth.hash.bcrypt.v1")
+          base.runner = run
+
+          tmp = Path(tempfile.mkdtemp()) / "session"
+          base.save(tmp)
+          manifest = json.loads((tmp / "session.json").read_text())
+          print(" manifest version:", manifest["version"])
+          assert manifest["version"] == 2
+          for field in ("graph", "resolver", "execution", "ledger"):
+              assert manifest[field] and (tmp / manifest[field]).is_file(), field
+              print("   %-10s %s" % (field, manifest[field]))
+          print(" ready at the checkpoint:", run._ready())
+
+          # A separate process restores the whole session and finishes the work.
+          script = (
+              "import json,sys\n"
+              "exec(open(sys.argv[2]).read())\n"
+              "from contextmesh_mcp.session import Session\n"
+              "adv = Advisory(); adv.published = True\n"
+              "s = Session.load(sys.argv[1], registry=deployment(adv))\n"
+              "assert s.runner is not None\n"
+              "assert s.runner._ready() == ['hashing'], s.runner._ready()\n"
+              "assert s.runner.ledger.verify()\n"
+              "head = s.runner.ledger.head\n"
+              "s.runner.run()\n"
+              "print(json.dumps({'restored_head': head, "
+              "'tasks': {t.name: [t.state.value, t.attempt, t.output] for t in s.runner.tasks}}))\n"
+          )
+          helper = tmp.parent / "defs.py"
+          helper.write_text(
+              "class Advisory:\n"
+              "    def __init__(self): self.published = False\n"
+              "    def __call__(self, ctx):\n"
+              "        if self.published and ctx.output.get('impl') == 'argon2':\n"
+              "            return ctx.disproved('CVE')\n"
+              "        return True\n"
+              "def deployment(advisory=None):\n"
+              "    from contextmesh.execute import TaskRegistry\n"
+              "    r = TaskRegistry()\n"
+              "    r.register_worker('auth.schema.v1', lambda c: {'ok': True})\n"
+              "    r.register_worker('auth.hash.argon2.v1', lambda c: {'impl': 'argon2'})\n"
+              "    r.register_worker('auth.hash.bcrypt.v1', lambda c: {'impl': 'bcrypt'})\n"
+              "    r.register_worker('auth.tokens.v1', lambda c: {'ok': True})\n"
+              "    r.register_auditor('auth.hash.audit.v1', advisory or Advisory())\n"
+              "    return r\n"
+          )
+          out = subprocess.run([sys.executable, "-c", script, str(tmp), str(helper)],
+                               capture_output=True, text=True, timeout=120)
+          if out.returncode != 0:
+              raise SystemExit("::error::" + out.stderr.strip().splitlines()[-1])
+          result = json.loads(out.stdout)
+          assert result["restored_head"] == run.ledger.head, "the ledger head moved"
+          print(" restored ledger head:", result["restored_head"][:32], "...")
+          for name, (state, attempt, output) in sorted(result["tasks"].items()):
+              print("   %-8s %-6s attempt %s  %s" % (name, state, attempt, output))
+          assert result["tasks"]["hashing"][2] == {"impl": "bcrypt"}
+          assert result["tasks"]["hashing"][1] == 2
+          for untouched in ("schema", "tokens"):
+              assert result["tasks"][untouched][1] == 1, untouched
+          print("A SESSION RESTORES THE WORK IN PROGRESS")
+          EOF
+          grep -q "A SESSION RESTORES THE WORK IN PROGRESS" /tmp/v2.txt
+
+      - name: Four companions that were never one session are refused
+        run: |
+          python - <<'EOF' | tee /tmp/v2refuse.txt
+          import json, tempfile
+          from pathlib import Path
+          from contextmesh.execute import Event, RunLedger, Runner, TaskRegistry
+          from contextmesh_mcp.session import Session, SessionError
+
+          def deployment():
+              r = TaskRegistry()
+              r.register_worker("w.v1", lambda c: {"ok": True})
+              return r
+
+          base = Session.build(rounds=2)
+          run = Runner("plan", graph=base.graph, registry=deployment())
+          run.task("only", worker_key="w.v1", assumes="x", produces=("Thing",))
+          run.run()
+          base.runner = run
+
+          tmp = Path(tempfile.mkdtemp()) / "session"
+          base.save(tmp)
+          manifest = json.loads((tmp / "session.json").read_text())
+
+          def refused(label, registry=deployment()):
+              try:
+                  Session.load(tmp, registry=registry)
+              except SessionError as exc:
+                  print(" %-30s refused: %s" % (label, str(exc)[:48]))
+                  return True
+              print(" %-30s ACCEPTED" % label)
+              return False
+
+          # A ledger that verifies perfectly, about a different run.
+          stranger = RunLedger()
+          stranger.record(1, Event.EXECUTED, "a_task_from_elsewhere", "ran")
+          assert stranger.verify(), "the stranger ledger should verify on its own"
+          (tmp / manifest["ledger"]).write_text(json.dumps(stranger.snapshot()))
+          if not refused("a ledger from another run"):
+              raise SystemExit("::error::a foreign ledger was accepted")
+          (tmp / manifest["ledger"]).write_text(json.dumps(run.ledger.snapshot()))
+
+          # A plan with no history, and a history with no plan.
+          for dropped, kept in (("ledger", "execution"), ("execution", "ledger")):
+              broken = dict(manifest); broken[dropped] = None
+              (tmp / "session.json").write_text(json.dumps(broken, indent=2))
+              if not refused("%s with no %s" % (kept, dropped)):
+                  raise SystemExit("::error::a half-committed pair was accepted")
+          (tmp / "session.json").write_text(json.dumps(manifest, indent=2))
+
+          # And the one a directory can never supply.
+          try:
+              Session.load(tmp)
+              raise SystemExit("::error::a keyed session loaded with no registry")
+          except SessionError as exc:
+              print(" %-30s refused: %s" % ("no registry at all", str(exc)[:48]))
+          if not refused("a deployment missing the key", registry=TaskRegistry()):
+              raise SystemExit("::error::a deployment without the key was accepted")
+          print("A MISMATCHED SESSION FAILS CLOSED")
+          EOF
+          grep -q "A MISMATCHED SESSION FAILS CLOSED" /tmp/v2refuse.txt
+
       - name: A graph and a resolver that were never a session together
         run: |
           rm -rf /tmp/mixed && cp -r /tmp/session /tmp/mixed
