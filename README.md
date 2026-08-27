@@ -483,12 +483,35 @@ pair:
 graph ↔ resolver     already: every resolved id is a node of the right type
 plan  ↔ graph        already: references close, plan owns its namespace
 ledger ↔ plan        new: every entry names a task the plan holds, and no
-                     entry is recorded in a round the plan never reached
+                     entry sits in a round the plan never reached
+ledger ↔ graph       new: every node_id and assumption_id an entry cites
+                     exists — a verified chain says nothing about that
 ```
 
-Kept to what the engine guarantees: the ledger holds no entry for a task that
-has not run, and many for one that has, so neither count is an invariant and
-neither is asserted.
+Kept to what the engine guarantees. The ledger holds no entry for a task that
+has not run, and many for one that has, so neither count is an invariant. Nor is
+there an event-shape matrix: which events carry which ids is not universal, so
+only the ids that are *present* are required to resolve.
+
+**The manifest commits to a history, not a filename.** 7B showed a whole chain
+can be rewritten and still verify, so `"ledger": "runledger-000003.json"` on its
+own commits to nothing — swap the file for another internally perfect ledger and
+the session loads a different history under the same generation. The manifest
+records `ledger_head` and restores with `expect_head=`:
+
+```
+session.json
+     ├── graph-N          ┐
+     ├── resolver-N       │ one generation
+     ├── execution-N      │
+     └── ledger-N ────────┘  and it must end at ledger_head
+```
+
+To be exact about what that buys: **this is not authentication.** A writer who
+can rewrite the ledger can rewrite the manifest beside it, and a plausible
+resealed history whose ids all resolve is accepted — there is a test asserting
+that, so nobody reads the guard as stronger than it is. What the head stops is a
+change to *one* companion quietly redefining a committed generation.
 
 **A directory cannot carry a registry.** A key means something only because a
 running process was configured to say so, so a session holding an execution is

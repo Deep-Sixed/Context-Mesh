@@ -803,6 +803,31 @@ jobs:
               raise SystemExit("::error::a foreign ledger was accepted")
           (tmp / manifest["ledger"]).write_text(json.dumps(run.ledger.snapshot()))
 
+          # The manifest commits to a history, not a filename: swapping only
+          # the ledger for another internally perfect one is refused.
+          resealed = RunLedger()
+          resealed.record(1, Event.EXECUTED, "only", "a different history")
+          assert resealed.verify(), "the replacement should verify on its own"
+          assert resealed.head != manifest["ledger_head"]
+          (tmp / manifest["ledger"]).write_text(json.dumps(resealed.snapshot()))
+          if not refused("a resealed ledger, same name"):
+              raise SystemExit("::error::a swapped ledger was accepted")
+
+          # And with the head updated too, the references still have to close.
+          for label, kwargs in (
+              ("a ledger citing no such node", {"node_id": "decision:gone"}),
+              ("a ledger citing no such ground", {"assumption_id": "assumption:gone"}),
+          ):
+              dangling = RunLedger()
+              dangling.record(1, Event.EXECUTED, "only", "ran", **kwargs)
+              (tmp / manifest["ledger"]).write_text(json.dumps(dangling.snapshot()))
+              moved = dict(manifest); moved["ledger_head"] = dangling.head
+              (tmp / "session.json").write_text(json.dumps(moved, indent=2))
+              if not refused(label):
+                  raise SystemExit("::error::%s was accepted" % label)
+          (tmp / manifest["ledger"]).write_text(json.dumps(run.ledger.snapshot()))
+          (tmp / "session.json").write_text(json.dumps(manifest, indent=2))
+
           # A plan with no history, and a history with no plan.
           for dropped, kept in (("ledger", "execution"), ("execution", "ledger")):
               broken = dict(manifest); broken[dropped] = None

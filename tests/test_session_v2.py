@@ -241,9 +241,27 @@ class SeamTest(unittest.TestCase):
         self.manifest = json.loads((self.dir / SESSION_FILE).read_text())
 
     def rewrite(self, field, payload):
+        """Replace a companion, and keep the manifest honest about it.
+
+        When the companion is the ledger, the manifest's ``ledger_head`` is
+        updated to match. That is not softening the test — it is the only way
+        to reach the checks below. Otherwise the head check refuses first and
+        every seam test here passes without exercising the seam.
+
+        It is also the realistic adversary: anyone who can rewrite a companion
+        in the directory can rewrite the manifest beside it. What the head
+        commits to is that a change to *one* file cannot quietly redefine the
+        generation; what these checks add is that even a coordinated rewrite
+        has to describe this graph and this plan.
+        """
         (self.dir / self.manifest[field]).write_text(
             json.dumps(payload, indent=2) + "\n", encoding="utf-8"
         )
+        if field == "ledger":
+            self.manifest["ledger_head"] = payload["head"]
+            (self.dir / SESSION_FILE).write_text(
+                json.dumps(self.manifest, indent=2) + "\n", encoding="utf-8"
+            )
 
     def refuses(self, fragment, registry=None):
         with self.assertRaises(SessionError) as caught:
@@ -300,6 +318,157 @@ class SeamTest(unittest.TestCase):
         plan["tasks"][0]["state"] = "invented"
         self.rewrite("execution", plan)
         self.refuses("not a state this build knows")
+
+
+class LedgerHeadTest(unittest.TestCase):
+    """The manifest commits to a history, not to a filename.
+
+    7B established that a whole chain can be rewritten and still verify. So a
+    manifest that names ``runledger-000001.json`` and nothing more commits to
+    nothing: swap the file for another internally perfect ledger and the session
+    loads a different history under the same generation. Recording the head is
+    what lets the session use ``expect_head`` at its own boundary.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name) / "session"
+        self.session = session_with_a_plan()
+        self.session.save(self.dir)
+        self.manifest = json.loads((self.dir / SESSION_FILE).read_text())
+
+    def test_the_manifest_records_the_head_it_committed(self):
+        self.assertEqual(
+            self.manifest["ledger_head"], self.session.runner.ledger.head
+        )
+
+    def test_a_session_with_no_plan_records_a_null_head(self):
+        plain = Path(self.tmp.name) / "plain"
+        Session.build(rounds=2).save(plain)
+        self.assertIsNone(
+            json.loads((plain / SESSION_FILE).read_text())["ledger_head"]
+        )
+
+    def test_a_v2_manifest_without_a_head_is_refused(self):
+        del self.manifest["ledger_head"]
+        (self.dir / SESSION_FILE).write_text(json.dumps(self.manifest, indent=2))
+        with self.assertRaises(SessionError) as caught:
+            Session.load(self.dir, registry=deployment())
+        self.assertIn("ledger_head", str(caught.exception))
+
+    def test_swapping_only_the_ledger_is_refused_even_though_it_verifies(self):
+        """The attack the head exists for: one file, internally perfect."""
+        from contextmesh.execute import Event, RunLedger
+
+        replacement = RunLedger()
+        replacement.record(1, Event.EXECUTED, "schema", "a different history")
+        replacement.record(2, Event.EXECUTED, "hashing", "and another")
+        self.assertTrue(replacement.verify())
+        self.assertNotEqual(replacement.head, self.manifest["ledger_head"])
+
+        (self.dir / self.manifest["ledger"]).write_text(
+            json.dumps(replacement.snapshot()), encoding="utf-8"
+        )
+        with self.assertRaises(SessionError) as caught:
+            Session.load(self.dir, registry=deployment())
+        self.assertIn("does not continue the history", str(caught.exception))
+
+    def test_a_head_that_does_not_match_the_committed_ledger_is_refused(self):
+        self.manifest["ledger_head"] = "0" * 64
+        (self.dir / SESSION_FILE).write_text(json.dumps(self.manifest, indent=2))
+        with self.assertRaises(SessionError) as caught:
+            Session.load(self.dir, registry=deployment())
+        self.assertIn("does not continue the history", str(caught.exception))
+
+    def test_what_the_head_does_not_buy(self):
+        """Stated as a fact, so nobody reads this as authentication.
+
+        A writer who can rewrite the ledger can rewrite the manifest beside it.
+        A resealed history whose entries all name real tasks, plausible rounds
+        and ids this graph holds is accepted, and no amount of self-consistency
+        inside the directory can distinguish it. What the head stops is a change
+        to *one* companion silently redefining a committed generation.
+        """
+        from contextmesh.execute import Event, RunLedger
+
+        plausible = RunLedger()
+        plausible.record(1, Event.EXECUTED, "schema", "a fabricated but tidy run")
+        self.manifest["ledger_head"] = plausible.head
+        (self.dir / self.manifest["ledger"]).write_text(
+            json.dumps(plausible.snapshot()), encoding="utf-8"
+        )
+        (self.dir / SESSION_FILE).write_text(json.dumps(self.manifest, indent=2))
+
+        restored = Session.load(self.dir, registry=deployment())
+        self.assertEqual(restored.runner.ledger.head, plausible.head)
+
+
+class LedgerReferenceTest(unittest.TestCase):
+    """A verified chain says nothing about whether its ids point anywhere."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name) / "session"
+        session_with_a_plan().save(self.dir)
+        self.manifest = json.loads((self.dir / SESSION_FILE).read_text())
+
+    def install(self, ledger):
+        """Write the ledger *and* the head, so the reference checks are reached."""
+        (self.dir / self.manifest["ledger"]).write_text(
+            json.dumps(ledger.snapshot()), encoding="utf-8"
+        )
+        self.manifest["ledger_head"] = ledger.head
+        (self.dir / SESSION_FILE).write_text(json.dumps(self.manifest, indent=2))
+
+    def refuses(self, ledger, fragment):
+        self.install(ledger)
+        with self.assertRaises(SessionError) as caught:
+            Session.load(self.dir, registry=deployment())
+        self.assertIn(fragment, str(caught.exception))
+
+    def test_a_ledger_citing_a_node_this_graph_lacks_is_refused(self):
+        from contextmesh.execute import Event, RunLedger
+
+        ledger = RunLedger()
+        ledger.record(1, Event.EXECUTED, "hashing", "ran",
+                      node_id="decision:does-not-exist")
+        self.assertTrue(ledger.verify())
+        self.refuses(ledger, "which is not in this session's graph")
+
+    def test_a_ledger_citing_an_assumption_this_graph_lacks_is_refused(self):
+        from contextmesh.execute import Event, RunLedger
+
+        ledger = RunLedger()
+        ledger.record(1, Event.DISPROVED, "hashing", "fell",
+                      assumption_id="assumption:does-not-exist")
+        self.refuses(ledger, "is not in this session's graph")
+
+    def test_ids_that_do_close_are_accepted(self):
+        """The control: real ids from this very graph load fine."""
+        from contextmesh.execute import Event, RunLedger
+
+        session = Session.load(self.dir, registry=deployment())
+        task = session.runner["schema"]
+        self.assertIsNotNone(task.node_id)
+
+        ledger = RunLedger()
+        ledger.record(1, Event.EXECUTED, "schema", "ran",
+                      node_id=task.node_id, assumption_id=task.assumption_id)
+        self.install(ledger)
+        restored = Session.load(self.dir, registry=deployment())
+        self.assertEqual(len(restored.runner.ledger), 1)
+
+    def test_only_the_ids_that_are_present_are_required_to_resolve(self):
+        """No event-shape matrix: which events carry which ids is not universal."""
+        from contextmesh.execute import Event, RunLedger
+
+        ledger = RunLedger()
+        ledger.record(1, Event.EXECUTED, "schema", "no ids at all")
+        self.install(ledger)
+        restored = Session.load(self.dir, registry=deployment())
+        self.assertEqual(len(restored.runner.ledger), 1)
 
 
 class VersionOneTest(unittest.TestCase):

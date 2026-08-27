@@ -498,7 +498,9 @@ class WalkerConfig:
         )
 
 
-def _reconcile_execution(runner: Runner, execution: str, ledger: str) -> None:
+def _reconcile_execution(
+    runner: Runner, execution: str, ledger: str, graph: ContextGraph
+) -> None:
     """The plan and its ledger have to be about each other.
 
     Each is checked on its own before this — the ledger's chain verifies, the
@@ -509,13 +511,35 @@ def _reconcile_execution(runner: Runner, execution: str, ledger: str) -> None:
         every ledger entry names a task the plan holds
         no entry is recorded in a round the plan never reached
 
-    Kept to what the engine actually guarantees. The ledger does not hold an
-    entry for every task (a plan can be saved before anything runs) and a task
-    can appear many times (attempts, audits, repairs), so neither count is an
-    invariant and neither is asserted.
+    Reference existence, and no more. Which *events* carry which ids is not a
+    universal the engine guarantees — a DISPROVED entry names an assumption, an
+    EXECUTED one names a decision, and neither shape is enforced anywhere — so
+    only the ids that are present are required to point at something.
+
+    Kept to what the engine actually guarantees in the other direction too. The
+    ledger does not hold an entry for every task (a plan can be saved before
+    anything runs) and a task can appear many times (attempts, audits, repairs),
+    so neither count is an invariant and neither is asserted.
     """
     names = {task.name for task in runner.tasks}
     for entry in runner.ledger.entries:
+        # The ledger carries ids into the graph as well as task names, and its
+        # hash chain says nothing about whether they point at anything. A
+        # history whose decisions and grounds are gone is not this session's.
+        if entry.node_id is not None and entry.node_id not in graph.nodes:
+            raise SessionError(
+                f"{ledger} entry {entry.seq} cites node {entry.node_id!r}, "
+                "which is not in this session's graph. The history refers to "
+                "provenance this graph does not hold"
+            )
+        if (
+            entry.assumption_id is not None
+            and entry.assumption_id not in graph.assumptions
+        ):
+            raise SessionError(
+                f"{ledger} entry {entry.seq} cites assumption "
+                f"{entry.assumption_id!r}, which is not in this session's graph"
+            )
         if entry.task not in names:
             raise SessionError(
                 f"{ledger} records {entry.task!r} at entry {entry.seq}, which is "
@@ -629,6 +653,19 @@ class Session:
                 keyed[field_name] = generation_name(stem, generation)
             else:
                 keyed[field_name] = None
+        # The head, not just the filename. 7B showed that a whole chain can be
+        # rewritten and still verify, so naming a file commits to nothing: swap
+        # the companion for another internally perfect ledger and the session
+        # loads a different history under the same manifest. Recording the head
+        # here is what makes ``expect_head`` usable at the session boundary.
+        #
+        # This does not authenticate the session. A writer who can rewrite the
+        # ledger can rewrite the manifest beside it. What it stops is a change
+        # to *one* companion quietly turning one committed generation into
+        # another — which is the contradiction a manifest exists to catch.
+        keyed["ledger_head"] = (
+            self.runner.ledger.head if self.runner is not None else None
+        )
         return keyed
 
     @staticmethod
@@ -863,6 +900,11 @@ class Session:
                 f"which writes {SESSION_VERSION} and reads "
                 f"{', '.join(str(v) for v in READABLE_VERSIONS)}"
             )
+        # v1 had no ledger to commit to. From v2 the field is required even
+        # when it is null, for the same reason the companion names are: absent
+        # is a malformed manifest, null is "this session has no execution".
+        if version >= 2 and "ledger_head" not in data:
+            raise SessionError(f"{SESSION_FILE} is missing 'ledger_head'")
 
         rounds = _session_int(data["rounds"], "rounds", minimum=0)
         generation = _session_int(data["generation"], "generation", minimum=1)
@@ -943,7 +985,11 @@ class Session:
         if paths["execution"] is not None:
             assert paths["ledger"] is not None
             runner = cls._load_execution(
-                paths["execution"], paths["ledger"], graph=graph, registry=registry
+                paths["execution"],
+                paths["ledger"],
+                graph=graph,
+                registry=registry,
+                expect_head=data.get("ledger_head"),
             )
 
         return cls(
@@ -965,6 +1011,7 @@ class Session:
         *,
         graph: ContextGraph,
         registry: Optional[TaskRegistry],
+        expect_head: Optional[str] = None,
     ) -> Runner:
         """Rebuild the plan and its history, and check they describe each other.
 
@@ -982,7 +1029,7 @@ class Session:
                 "registry= to Session.load"
             )
         try:
-            ledger = RunLedger.load_json(ledger_path)
+            ledger = RunLedger.load_json(ledger_path, expect_head=expect_head)
         except FileNotFoundError:
             raise _Swept(ledger_path.name, "ledger") from None
         except (ExecutionError, ValueError) as exc:
@@ -1002,7 +1049,7 @@ class Session:
         except ValueError as exc:
             raise SessionError(f"{execution_path.name}: {exc}") from exc
 
-        _reconcile_execution(runner, execution_path.name, ledger_path.name)
+        _reconcile_execution(runner, execution_path.name, ledger_path.name, graph)
         return runner
 
     def assumption_ids(self) -> list:
