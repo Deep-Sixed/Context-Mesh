@@ -111,6 +111,573 @@ jobs:
           # If the server tests skipped here, the mcp job is not testing the SDK.
           ! grep -qi "skipped" /tmp/suite.txt
 
+      - name: The server serves the session it loaded, not a fresh demo
+        run: |
+          contextmesh-mcp --demo --rounds 4 --save /tmp/served
+          python - <<'EOF' | tee /tmp/adopt.txt
+          from contextmesh_mcp import server, session as sessionmod
+          # Stop before the transport: what is under test is which graph the
+          # tool handlers would answer from, not stdio.
+          server.mcp.run = lambda **kw: None
+          assert server.main(["--session", "/tmp/served"]) == 0
+          served = sessionmod.session()
+          described = served.describe()
+          print("persistent:", described["persistent"], "| path:", served.path)
+          assert described["persistent"], "the server built a demo instead of loading"
+          assert str(served.path) == "/tmp/served", served.path
+          print("ADOPTED THE LOADED SESSION")
+          EOF
+          grep -q "ADOPTED THE LOADED SESSION" /tmp/adopt.txt
+
+      - name: The server refuses a bad session before opening the transport
+        run: |
+          contextmesh-mcp --demo --rounds 2 --save /tmp/bad
+          python -c "import json,pathlib;p=pathlib.Path('/tmp/bad/session.json');d=json.loads(p.read_text());d['version']=99;p.write_text(json.dumps(d))"
+          if contextmesh-mcp --session /tmp/bad 2>/tmp/bad.txt; then
+            echo "::error::the server accepted a session it cannot restore"; exit 1
+          fi
+          grep -q "cannot be read by this build" /tmp/bad.txt
+
+  session:
+    name: session · survives a restart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # The oldest supported version: writing and reading a session must
+          # not quietly need the MCP extra, or 3.10.
+          python-version: "3.9"
+
+      - name: One process writes the session
+        run: |
+          python -m contextmesh_mcp --demo --rounds 4 --save /tmp/session | tee /tmp/wrote.txt
+          test -f /tmp/session/session.json
+          python - <<'EOF'
+          import json, pathlib
+          root = pathlib.Path("/tmp/session")
+          data = json.loads((root / "session.json").read_text())
+          assert data["generation"] == 1, data["generation"]
+          assert data["graph"] == "graph-000001.json", data["graph"]
+          assert data["resolver"] == "resolver-000001.json", data["resolver"]
+          for key in ("graph", "resolver"):
+              assert (root / data[key]).is_file(), data[key]
+          assert (root / "session.lock").is_file(), "no writer lock"
+          print("committed generation 1:", sorted(p.name for p in root.iterdir()))
+          EOF
+
+      - name: Another process reads it, and gets the same graph
+        run: |
+          python -m contextmesh_mcp --session /tmp/session > /tmp/read.json
+          python - <<'EOF' | tee /tmp/same.txt
+          import json
+          from contextmesh_mcp.session import Session
+          read = json.load(open("/tmp/read.json"))
+          fresh = Session.build(rounds=4).describe()
+          assert read["persistent"] is True, read
+          for key in ("nodes_live", "nodes_total", "edges_live", "edges_total",
+                      "assumptions", "build", "rounds"):
+              assert read[key] == fresh[key], (key, read[key], fresh[key])
+          print(f"{read['nodes_live']}/{read['nodes_total']} nodes, "
+                f"{read['edges_live']}/{read['edges_total']} edges, restored")
+          print("SESSION CROSSED THE PROCESS BOUNDARY")
+          EOF
+          grep -q "SESSION CROSSED THE PROCESS BOUNDARY" /tmp/same.txt
+
+      - name: A resolution the graph never stored survives the restart
+        run: |
+          python - <<'EOF' | tee /tmp/alias.txt
+          import json, pathlib
+          from contextmesh.resolve import Resolver
+          from contextmesh_mcp.session import Session
+          root = pathlib.Path("/tmp/session")
+          names = json.loads((root / "session.json").read_text())
+          saved = json.loads((root / names["resolver"]).read_text())
+          registered = Resolver()
+          for eid, label in saved["canonical"].items():
+              registered.register(eid, label)
+          learned = sorted(set(saved["aliases"]) - set(registered.aliases))
+          assert learned, "the demo should learn aliases while it walks"
+          restored = Session.load("/tmp/session")
+          record = restored.resolver.resolve(learned[0])
+          print(f"{len(learned)} learned aliases; {learned[0]!r} -> "
+                f"{record.canonical_id} via {record.reason}")
+          assert record.reason == "alias table", record.reason
+          assert record.canonical_id == saved["aliases"][learned[0]]
+          print("LEARNED ALIAS SURVIVED")
+          EOF
+          grep -q "LEARNED ALIAS SURVIVED" /tmp/alias.txt
+
+      - name: Re-saving a restored session reproduces it byte for byte
+        run: |
+          python -m contextmesh_mcp --session /tmp/session --save /tmp/again > /dev/null
+          python - <<'EOF'
+          import json, pathlib
+          a, b = pathlib.Path("/tmp/session"), pathlib.Path("/tmp/again")
+          ma = json.loads((a / "session.json").read_text())
+          mb = json.loads((b / "session.json").read_text())
+          # A save into a fresh directory commits generation 1, so the whole
+          # manifest must match: the counter belongs to the directory.
+          assert ma == mb, "manifests differ across a save/load/save cycle"
+          for key in ("graph", "resolver"):
+              assert (a / ma[key]).read_bytes() == (b / mb[key]).read_bytes(), key
+          print("save/load/save is byte-identical at generation", ma["generation"])
+          EOF
+
+      - name: A session this build cannot restore is refused, not half-loaded
+        run: |
+          set +e
+          break_it() {
+            rm -rf /tmp/broken && cp -r /tmp/session /tmp/broken
+            python - "$1" <<'EOF'
+          import json, pathlib, sys
+          how = sys.argv[1]
+          root = pathlib.Path("/tmp/broken")
+          sfile = root / "session.json"
+          data = json.loads(sfile.read_text())
+          if how == "version":
+              data["version"] = 99
+          elif how == "escape":
+              data["graph"] = "../../etc/passwd"
+          elif how == "rounds":
+              data["rounds"] = True
+          elif how == "policy":
+              data["walker"]["policy"] = ["teleports_to"]
+          elif how == "missing":
+              (root / data["graph"]).unlink()
+          elif how == "foreign":
+              r = json.loads((root / data["resolver"]).read_text())
+              r["canonical"]["entity:ghost"] = "Ghost"
+              (root / data["resolver"]).write_text(json.dumps(r))
+          elif how == "renamed":
+              # A resolver that is internally consistent and still disagrees
+              # with the graph: same id, right type, different name. Only the
+              # session can see it, so the log is renamed to match and the
+              # refusal has to come from check_agreement.
+              r = json.loads((root / data["resolver"]).read_text())
+              entity = next(iter(r["canonical"]))
+              r["canonical"][entity] = "Not What The Graph Calls It"
+              for row in r["log"]:
+                  if row["canonical_id"] == entity:
+                      row["canonical_label"] = "Not What The Graph Calls It"
+              (root / data["resolver"]).write_text(json.dumps(r))
+          elif how == "generation":
+              data["generation"] = 9
+          elif how == "symlink":
+              companion = root / data["graph"]
+              elsewhere = root.parent / "escaped-graph.json"
+              elsewhere.write_text(companion.read_text())
+              companion.unlink()
+              companion.symlink_to(elsewhere)
+          sfile.write_text(json.dumps(data))
+          EOF
+            python -m contextmesh_mcp --session /tmp/broken >/dev/null 2>/tmp/why.txt
+            code=$?
+            if [ "$code" -eq 0 ]; then
+              echo "::error::a session broken by '$1' loaded anyway"; exit 1
+            fi
+            echo "  refused ($1): $(head -c 110 /tmp/why.txt)"
+          }
+          for how in version escape rounds policy missing foreign renamed generation symlink; do
+            break_it "$how" || exit 1
+          done
+          echo "EVERY BROKEN SESSION REFUSED"
+
+      - name: A question asked after startup outlives the process that asked it
+        run: |
+          python - <<'EOF' | tee /tmp/served.txt
+          import json, pathlib, subprocess, sys
+          from contextmesh_mcp.session import Session
+
+          root = "/tmp/session"
+          named = json.loads((pathlib.Path(root) / "session.json").read_text())
+          saved = json.loads((pathlib.Path(root) / named["resolver"]).read_text())
+          mention = "PG Vector"
+          assert mention.lower() not in saved["aliases"], "fixture already knows it"
+
+          # A separate interpreter asks, checkpoints, and exits. Nothing but
+          # the directory crosses between it and the assertions below.
+          script = (
+              "import sys\n"
+              "from contextmesh_mcp.session import Session, Checkpointer\n"
+              "from contextmesh_mcp import tools\n"
+              "s = Session.load(sys.argv[1])\n"
+              "c = Checkpointer(s)\n"
+              "for q in sys.argv[2:]:\n"
+              "    tools.call(s, 'mesh_ask', {'question': q})\n"
+              "    c.record_mutation()\n"
+              "print(c.commits)\n"
+          )
+          before = Session.load(root)
+          state = lambda s: (
+              len(s.resolver.aliases),
+              len(s.resolver.log),
+              sum(n.walks for n in s.graph.nodes.values()),
+              sum(e.traversals for e in s.graph.edges.values()),
+          )
+          was = state(before)
+
+          proc = subprocess.run(
+              [sys.executable, "-c", script, root,
+               f"What does {mention} depend on?",
+               "What contradicts the sharding assumption?"],
+              capture_output=True, text=True,
+          )
+          assert proc.returncode == 0, proc.stderr
+          assert proc.stdout.strip() == "2", proc.stdout
+
+          after = Session.load(root)
+          now = state(after)
+          print("aliases/log/walks/traversals", was, "->", now)
+          assert all(b > a for a, b in zip(was, now)), (was, now)
+          assert after.generation > before.generation, after.generation
+
+          record = after.resolver.resolve(mention)
+          print(f"{mention!r} -> {record.canonical_id} via {record.reason}")
+          assert record.reason == "alias table", record.reason
+          print("SERVED MUTATIONS SURVIVED THE PROCESS")
+          EOF
+          grep -q "SERVED MUTATIONS SURVIVED THE PROCESS" /tmp/served.txt
+
+      - name: A save never writes to a file the live manifest names
+        run: |
+          python - <<'EOF' | tee /tmp/atomic.txt
+          import json, os, pathlib, shutil
+          from contextmesh_mcp.session import Session
+
+          shutil.rmtree("/tmp/gen", ignore_errors=True)
+          shutil.copytree("/tmp/session", "/tmp/gen")
+          root = pathlib.Path("/tmp/gen")
+          live = root / "session.json"
+          session = Session.load(root)
+
+          # A reader holding the manifest across the commit must still see the
+          # previous generation, whole. That is what os.replace buys, and an
+          # in-place rewrite of the same bytes would not.
+          inode = live.stat().st_ino
+          with open(live, encoding="utf-8") as reader:
+              session.checkpoint()
+              held = json.loads(reader.read())
+          assert live.stat().st_ino != inode, "the manifest was written in place"
+          assert held["generation"] == session.generation - 1, held["generation"]
+          assert (root / held["graph"]).name == held["graph"]
+
+          committed = json.loads(live.read_text())
+          assert committed["generation"] == held["generation"] + 1
+          leftovers = sorted(p.name for p in root.iterdir())
+          assert leftovers == sorted(
+              ["session.json", "session.lock", committed["graph"], committed["resolver"]]
+          ), leftovers
+          print("generation", held["generation"], "->", committed["generation"], leftovers)
+          print("COMMIT IS ATOMIC AND SWEPT")
+          EOF
+          grep -q "COMMIT IS ATOMIC AND SWEPT" /tmp/atomic.txt
+
+      - name: An interrupted save leaves the previous generation serving
+        run: |
+          python - <<'EOF' | tee /tmp/interrupted.txt
+          import json, pathlib, shutil
+          from contextmesh_mcp.session import Session
+
+          shutil.rmtree("/tmp/torn", ignore_errors=True)
+          shutil.copytree("/tmp/session", "/tmp/torn")
+          root = pathlib.Path("/tmp/torn")
+          data = json.loads((root / "session.json").read_text())
+          nxt = data["generation"] + 1
+
+          # Exactly what a crash between the companions and the swap leaves:
+          # a complete new graph, a half-written new resolver, old manifest.
+          Session.load(root).graph.save_json(root / f"graph-{nxt:06d}.json")
+          (root / f"resolver-{nxt:06d}.json").write_text('{"schema": "contextmes')
+
+          back = Session.load(root)
+          assert back.generation == data["generation"], back.generation
+          print("still serving generation", back.generation)
+
+          # And the next real save clears the wreckage rather than tripping on it.
+          back.checkpoint()
+          after = json.loads((root / "session.json").read_text())
+          leftovers = sorted(p.name for p in root.iterdir())
+          assert leftovers == sorted(
+              ["session.json", "session.lock", after["graph"], after["resolver"]]
+          ), leftovers
+          print("recovered to generation", after["generation"], leftovers)
+          print("INTERRUPTED SAVE DID NOT MIX GENERATIONS")
+          EOF
+          grep -q "INTERRUPTED SAVE DID NOT MIX GENERATIONS" /tmp/interrupted.txt
+
+      - name: Two writers cannot corrupt one session directory
+        run: |
+          python - <<'EOF' | tee /tmp/concurrent.txt
+          import json, pathlib, shutil, subprocess, sys, time
+          from contextmesh_mcp.session import Session
+
+          shutil.rmtree("/tmp/race", ignore_errors=True)
+          shutil.copytree("/tmp/session", "/tmp/race")
+          root = pathlib.Path("/tmp/race")
+          gate = pathlib.Path("/tmp/race-gate")
+          done = pathlib.Path("/tmp/race-done")
+          for path in (gate, done):
+              if path.exists():
+                  path.unlink()
+          start = json.loads((root / "session.json").read_text())["generation"]
+
+          # A stalls in the window between the manifest swap and the sweep --
+          # the interleaving that used to leave a manifest naming files the
+          # other writer had already had deleted out from under it.
+          stall = (
+              "import sys, time\n"
+              "from pathlib import Path\n"
+              "from contextmesh_mcp.session import Session\n"
+              "root, gate, done = (Path(a) for a in sys.argv[1:4])\n"
+              "original = Session._sweep\n"
+              "def stalling(directory, keep):\n"
+              "    gate.write_text('committed')\n"
+              "    limit = time.time() + 60\n"
+              "    while not done.exists() and time.time() < limit:\n"
+              "        time.sleep(0.02)\n"
+              "    original(directory, keep)\n"
+              "Session._sweep = staticmethod(stalling)\n"
+              "Session.load(root).checkpoint()\n"
+              "print('A-DONE')\n"
+          )
+          contend = (
+              "import sys, time\n"
+              "from pathlib import Path\n"
+              "from contextmesh_mcp.session import Session, SessionLockedError\n"
+              "root, gate, done = (Path(a) for a in sys.argv[1:4])\n"
+              "limit = time.time() + 60\n"
+              "while not gate.exists() and time.time() < limit:\n"
+              "    time.sleep(0.02)\n"
+              "try:\n"
+              "    Session.load(root).checkpoint()\n"
+              "    print('B-COMMITTED-IN-WINDOW')\n"
+              "except SessionLockedError as exc:\n"
+              "    print('B-REFUSED')\n"
+              "finally:\n"
+              "    done.write_text('done')\n"
+              "time.sleep(1.0)\n"
+              "again = Session.load(root)\n"
+              "again.checkpoint()\n"
+              "print('B-RETRY', again.generation)\n"
+          )
+          args = [str(root), str(gate), str(done)]
+          a = subprocess.Popen([sys.executable, "-c", stall, *args],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+          b = subprocess.Popen([sys.executable, "-c", contend, *args],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+          ao, ae = a.communicate(timeout=180)
+          bo, be = b.communicate(timeout=180)
+          print("A:", ao.strip() or ae.strip()[-200:])
+          print("B:", bo.strip() or be.strip()[-200:])
+          assert a.returncode == 0, ae
+          assert b.returncode == 0, be
+          assert "A-DONE" in ao, ao
+          assert "B-REFUSED" in bo, bo
+          assert "B-COMMITTED-IN-WINDOW" not in bo, bo
+          assert f"B-RETRY {start + 2}" in bo, bo
+
+          # The directory has to be intact: manifest loads, both companions
+          # present, generation monotonic, nothing committed swept.
+          final = json.loads((root / "session.json").read_text())
+          assert final["generation"] == start + 2, final["generation"]
+          for key in ("graph", "resolver"):
+              assert (root / final[key]).is_file(), final[key]
+          assert Session.load(root).generation == start + 2
+          print("generations", start, "->", final["generation"],
+                sorted(p.name for p in root.iterdir()))
+          print("CONCURRENT WRITERS SERIALISED")
+          EOF
+          grep -q "CONCURRENT WRITERS SERIALISED" /tmp/concurrent.txt
+
+      - name: A writer killed mid-transaction does not hold the lock
+        run: |
+          python - <<'EOF' | tee /tmp/killed.txt
+          import json, pathlib, shutil, subprocess, sys, time
+          from contextmesh_mcp.session import Session, SessionLockedError
+
+          shutil.rmtree("/tmp/killed", ignore_errors=True)
+          shutil.copytree("/tmp/session", "/tmp/killed")
+          root = pathlib.Path("/tmp/killed")
+          gate = pathlib.Path("/tmp/killed-gate")
+          if gate.exists():
+              gate.unlink()
+          before = json.loads((root / "session.json").read_text())["generation"]
+
+          holder = subprocess.Popen(
+              [sys.executable, "-c",
+               "import sys, time\n"
+               "from pathlib import Path\n"
+               "from contextmesh_mcp.session import writer_lock\n"
+               "root, gate = Path(sys.argv[1]), Path(sys.argv[2])\n"
+               "with writer_lock(root):\n"
+               "    gate.write_text('held')\n"
+               "    time.sleep(300)\n",
+               str(root), str(gate)],
+              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+          )
+          limit = time.time() + 60
+          while not gate.exists() and time.time() < limit:
+              time.sleep(0.02)
+          assert gate.exists(), "the holder never took the lock"
+
+          try:
+              Session.load(root).checkpoint()
+              raise SystemExit("::error::a save ran while another writer held the lock")
+          except SessionLockedError as exc:
+              print("refused while held:", str(exc)[:100])
+
+          # The lock is kernel-held, so SIGKILL releases it. No stale-lock
+          # heuristic, no pid liveness guessing.
+          holder.kill()
+          holder.communicate(timeout=60)
+          Session.load(root).checkpoint()
+          after = json.loads((root / "session.json").read_text())["generation"]
+          assert after == before + 1, (before, after)
+          print("generation", before, "->", after, "after the holder was killed")
+          print("KERNEL LOCK RELEASED ON DEATH")
+          EOF
+          grep -q "KERNEL LOCK RELEASED ON DEATH" /tmp/killed.txt
+
+      - name: A hostile directory cannot make a checkpoint write outside it
+        run: |
+          python - <<'EOF' | tee /tmp/symlink.txt
+          import json, os, pathlib, shutil
+          from contextmesh_mcp.session import Session, SessionError
+
+          def fresh(case):
+              root = pathlib.Path(f"/tmp/hostile-{case}")
+              shutil.rmtree(root, ignore_errors=True)
+              shutil.copytree("/tmp/session", root, symlinks=True)
+              outside = pathlib.Path(f"/tmp/PRECIOUS-{case}.txt")
+              outside.write_text("precious")
+              return root, outside, json.loads((root / "session.json").read_text())
+
+          results = []
+          # The three names a save writes. A rename replaces a planted link
+          # rather than following it, so the outside file is never touched.
+          for case, key in (("graph", "graph"), ("resolver", "resolver")):
+              root, outside, manifest = fresh(case)
+              nxt = manifest["generation"] + 1
+              stem = "graph" if key == "graph" else "resolver"
+              planted = root / f"{stem}-{nxt:06d}.json"
+              planted.symlink_to(outside)
+              Session.load(root).checkpoint()
+              assert outside.read_text() == "precious", f"{case}: wrote through the link"
+              assert not planted.is_symlink(), f"{case}: link survived"
+              results.append(f"{case}: link replaced, outside intact")
+
+          # The lock cannot be replaced -- it must keep one inode for the
+          # kernel lock -- so it is refused instead.
+          for case, plant in (
+              ("lock-symlink", lambda root, outside: root.joinpath("session.lock").symlink_to(outside)),
+              ("lock-fifo", lambda root, outside: os.mkfifo(str(root / "session.lock"))),
+          ):
+              root, outside, _ = fresh(case)
+              (root / "session.lock").unlink()
+              plant(root, outside)
+              try:
+                  Session.load(root).checkpoint()
+                  raise SystemExit(f"::error::{case} was accepted as a session lock")
+              except SessionError as exc:
+                  assert "regular file" in str(exc), str(exc)
+              assert outside.read_text() == "precious", f"{case}: outside was written"
+              results.append(f"{case}: refused, outside intact")
+
+          for line in results:
+              print(" ", line)
+          print("HOSTILE DIRECTORY CONTAINED")
+          EOF
+          grep -q "HOSTILE DIRECTORY CONTAINED" /tmp/symlink.txt
+
+      - name: A checkpoint mid-read does not make a live session look broken
+        run: |
+          python - <<'EOF' | tee /tmp/reader.txt
+          import pathlib, shutil, subprocess, sys, threading, time
+          from contextmesh.graph import ContextGraph
+          from contextmesh_mcp.session import Session
+
+          shutil.rmtree("/tmp/reader", ignore_errors=True)
+          shutil.copytree("/tmp/session", "/tmp/reader")
+          root = pathlib.Path("/tmp/reader")
+          start = Session.load(root).generation
+
+          # Stall the reader after it has the manifest but before it opens the
+          # companions, then commit and sweep underneath it. Without the retry
+          # this is a FileNotFoundError on a perfectly healthy directory.
+          original = ContextGraph.load_json.__func__
+          paused, resume = threading.Event(), threading.Event()
+          attempts = []
+
+          def stalling(cls, path, **kwargs):
+              attempts.append(path)
+              if len(attempts) == 1:
+                  paused.set()
+                  resume.wait(60)
+              return original(cls, path, **kwargs)
+
+          outcome = {}
+
+          def read():
+              try:
+                  session = Session.load(root)
+                  outcome["generation"] = session.generation
+                  outcome["nodes"] = len(session.graph.nodes)
+              except BaseException as exc:
+                  outcome["error"] = f"{type(exc).__name__}: {exc}"
+
+          ContextGraph.load_json = classmethod(stalling)
+          reader = threading.Thread(target=read)
+          reader.start()
+          assert paused.wait(60), "the reader never started"
+
+          ContextGraph.load_json = classmethod(original)
+          Session.load(root).checkpoint()
+          ContextGraph.load_json = classmethod(stalling)
+          resume.set()
+          reader.join(120)
+          ContextGraph.load_json = classmethod(original)
+
+          assert "error" not in outcome, outcome["error"]
+          assert outcome["generation"] == start + 1, outcome
+          assert len(attempts) > 1, "the read never retried"
+          print(f"  read retried {len(attempts)} times, landed on generation "
+                f"{outcome['generation']} with {outcome['nodes']} nodes")
+
+          # And a directory that is genuinely broken must still fail at once.
+          shutil.rmtree("/tmp/broken-reader", ignore_errors=True)
+          shutil.copytree(str(root), "/tmp/broken-reader")
+          broken = pathlib.Path("/tmp/broken-reader")
+          import json as _json
+          (broken / _json.loads((broken / "session.json").read_text())["graph"]).unlink()
+          began = time.time()
+          try:
+              Session.load(broken)
+              raise SystemExit("::error::a directory missing its graph loaded")
+          except Exception as exc:
+              assert "no such file" in str(exc), str(exc)
+          waited = time.time() - began
+          assert waited < 1.0, f"a broken directory took {waited:.2f}s to fail"
+          print(f"  a genuinely missing companion still fails in {waited * 1000:.0f} ms")
+          print("READER SURVIVED A CONCURRENT SWEEP")
+          EOF
+          grep -q "READER SURVIVED A CONCURRENT SWEEP" /tmp/reader.txt
+
+      - name: A graph and a resolver that were never a session together
+        run: |
+          rm -rf /tmp/mixed && cp -r /tmp/session /tmp/mixed
+          python - <<'EOF'
+          import json, pathlib
+          from contextmesh.graph import ContextGraph
+          root = pathlib.Path("/tmp/mixed")
+          named = json.loads((root / "session.json").read_text())["graph"]
+          ContextGraph().save_json(root / named)
+          EOF
+          if python -m contextmesh_mcp --session /tmp/mixed >/dev/null 2>/tmp/mixed.txt; then
+            echo "::error::a resolver was loaded against a graph it does not match"; exit 1
+          fi
+          grep -q "not a node in this session's graph" /tmp/mixed.txt
+
   smoke:
     name: cli · demo · export
     runs-on: ubuntu-latest

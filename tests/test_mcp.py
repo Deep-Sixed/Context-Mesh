@@ -319,10 +319,17 @@ class SurfaceTest(unittest.TestCase):
         with self.assertRaises(tools.MeshToolError):
             resources.read(self.session, "contextmesh://nope")
 
-    def test_the_session_admits_it_does_not_persist(self):
+    def test_a_demo_session_says_it_will_not_survive_a_restart(self):
+        """It used to say why: ``ContextGraph`` could not reload.
+
+        It can now, so the note points at ``--session`` instead. The assertion
+        stays because the claim is the same one — a client is told, in the
+        payload, whether what it is reading outlives the server.
+        """
         described = self.session.describe()
         self.assertFalse(described["persistent"])
-        self.assertIn("from_dict", described["note"])
+        self.assertIn("--session", described["note"])
+        self.assertIn("per process", described["note"])
 
     def test_the_session_reports_live_and_total_separately(self):
         described = self.session.describe()

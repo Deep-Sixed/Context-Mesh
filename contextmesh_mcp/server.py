@@ -1,9 +1,12 @@
 """Context Mesh MCP server — stdio transport.
 
     pip install 'contextmesh[mcp]'
-    contextmesh-mcp
+    contextmesh-mcp --demo --rounds 8 --save ./session   # write one
+    contextmesh-mcp --session ./session                  # serve it
 
-Requires Python 3.10+, because the MCP SDK does. Everything the tools actually
+Requires Python 3.10+, because the MCP SDK does. Writing and inspecting a
+session needs neither the SDK nor 3.10, which is why that lives in
+``session.py`` and is reachable as ``python -m contextmesh_mcp``. Everything the tools actually
 do lives in ``tools.py`` and ``resources.py``, which do not, so the behaviour
 this server exposes is tested without the SDK on every version the core
 supports. This file is transport and nothing else.
@@ -31,7 +34,14 @@ except ImportError as exc:  # pragma: no cover - depends on the optional extra
     ) from exc
 
 from . import resources, tools
-from .session import DEFAULT_ROUNDS, session
+from .session import (
+    Checkpointer,
+    SessionError,
+    add_source_arguments,
+    adopt,
+    open_session,
+    session,
+)
 
 SERVER_NAME = "context-mesh"
 INSTRUCTIONS = """\
@@ -47,8 +57,9 @@ mesh_blast_radius is a dry run: it tells you what would fall if an assumption
 turned out to be false, and what would survive. It changes nothing. This server
 is read-only; it cannot reject an assumption, repair, or execute.
 
-This instance serves a bundled demo graph rebuilt for each process. Nothing you
-see here persists.
+This instance may be serving a saved session directory or a demo graph rebuilt
+for this process. contextmesh://session says which, and whether anything you see
+here outlives the server.
 
 Independent project. No affiliation with, or endorsement by, anyone involved in
 the screen capture the dashboard was reverse-engineered from.
@@ -61,21 +72,46 @@ def _payload(value: Any) -> str:
     return json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False, default=str)
 
 
-def _run(name: str, arguments: Optional[Dict[str, Any]] = None) -> str:
+#: Set by ``main`` once the session is open. ``None`` while the module is
+#: merely imported, which is how the tool handlers stay callable in tests.
+_CHECKPOINTER: Optional[Checkpointer] = None
+
+
+def _run(
+    name: str, arguments: Optional[Dict[str, Any]] = None, *, mutates: bool = False
+) -> str:
+    """Answer a tool call, and commit afterwards if the call changed anything.
+
+    ``mutates`` is passed at the call site rather than inferred, so adding a
+    sixth tool forces a decision about whether it writes. Only ``mesh_ask``
+    does today: a walk moves ``node.walks`` and ``edge.traversals``, and the
+    resolver learns aliases on a scored match.
+
+    The commit happens after a successful answer and never inside the error
+    paths — a question that failed has nothing worth persisting, and a failing
+    checkpoint must not turn a good answer into a dead channel.
+    """
     try:
-        return _payload(tools.call(session(), name, arguments))
+        result = tools.call(session(), name, arguments)
     except tools.MeshToolError as exc:
         return _payload({"error": "not_found", "tool": name, "message": str(exc)})
     except Exception as exc:  # surface engine errors as data, not a dead channel
         return _payload(
             {"error": type(exc).__name__, "tool": name, "message": str(exc)}
         )
+    if mutates and _CHECKPOINTER is not None:
+        try:
+            _CHECKPOINTER.record_mutation()
+        except Exception as exc:  # a failed write is reported, not fatal
+            print(f"context-mesh: checkpoint failed: {exc}", file=sys.stderr)
+    return _payload(result)
 
 
 # ── tools ────────────────────────────────────────────────────────────────
 @mcp.tool(name="mesh_ask", description=tools.TOOLS["mesh_ask"]["description"])
 def mesh_ask(question: str) -> str:
-    return _run("mesh_ask", {"question": question})
+    # The one tool that writes. See ``_run``.
+    return _run("mesh_ask", {"question": question}, mutates=True)
 
 
 @mcp.tool(name="mesh_get_node", description=tools.TOOLS["mesh_get_node"]["description"])
@@ -133,27 +169,63 @@ def resource_assumption(assumption_id: str) -> str:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="contextmesh-mcp",
-        description="Read-only MCP server over a Context Mesh graph.",
-    )
-    parser.add_argument(
-        "--rounds",
-        type=int,
-        default=DEFAULT_ROUNDS,
-        help=f"walk rounds to build the demo graph with (default: {DEFAULT_ROUNDS})",
+    parser = add_source_arguments(
+        argparse.ArgumentParser(
+            prog="contextmesh-mcp",
+            description="Read-only MCP server over a Context Mesh graph.",
+            epilog=(
+                "contextmesh-mcp --demo --rounds 8 --save ./session   write one\n"
+                "contextmesh-mcp --session ./session                  serve it"
+            ),
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+        )
     )
     args = parser.parse_args(argv)
 
-    # Build before serving so the first tool call is not the slow one.
-    described = session(rounds=args.rounds).describe()
+    # Build or load before serving, so the first tool call is not the slow one
+    # and a session this build cannot restore fails at the shell rather than
+    # halfway through a client's first question.
+    try:
+        opened = open_session(args)
+    except SessionError as exc:
+        print(f"contextmesh-mcp: {exc}", file=sys.stderr)
+        return 2
+
+    if args.save is not None:
+        target = opened.save(args.save)
+        print(f"contextmesh-mcp: wrote {target}", file=sys.stderr)
+        return 0
+
+    global _CHECKPOINTER
+    adopt(opened)
+    _CHECKPOINTER = Checkpointer(opened, args.checkpoint)
+    described = opened.describe()
+    where = (
+        f"from {opened.path} gen {described['generation']}, checkpoint {args.checkpoint}"
+        if described["persistent"]
+        else "not persistent"
+    )
     print(
         f"context-mesh MCP: {described['nodes_live']}/{described['nodes_total']} nodes live, "
         f"{described['edges_live']}/{described['edges_total']} edges live, "
-        "read-only, not persistent",
+        f"read-only, {where}",
         file=sys.stderr,
     )
-    mcp.run(transport="stdio")
+    try:
+        mcp.run(transport="stdio")
+    finally:
+        # A clean shutdown is the last chance for on-exit, and the safety net
+        # for every-ask if a mutation landed after the final commit. Reported
+        # the same way a per-question checkpoint failure is: a shutdown that
+        # cannot write is worth saying out loud, and worth saying *once*, not
+        # worth replacing the exit code of whatever stopped the server.
+        try:
+            written = _CHECKPOINTER.close()
+        except Exception as exc:
+            print(f"context-mesh: final checkpoint failed: {exc}", file=sys.stderr)
+        else:
+            if written is not None:
+                print(f"context-mesh: checkpointed {written}", file=sys.stderr)
     return 0
 
 

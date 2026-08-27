@@ -339,17 +339,199 @@ two disagree — and enforcing that surfaced a real bug, since two paths bumped
 `version` on the record alone and left the mirror stale. `graph.sync_assumption`
 is now the one place that writes it.
 
-What persistence does **not** yet cover: the resolver, and the execution state
-in `Runner`. A reloaded graph answers, invalidates and reports health
-identically; rebuilding a `Walker` still needs a resolver, and resuming a
-selective re-execution still needs the task registry. Those are the next two
-milestones.
+What persistence does **not** yet cover: the execution state in `Runner`.
+Resuming a selective re-execution still needs the task registry and the run
+ledger's history. That is the next milestone.
+
+### Sessions — a graph *and* the resolver that reads it
+
+```bash
+python -m contextmesh_mcp --demo --rounds 8 --save ./session   # write one
+python -m contextmesh_mcp --session ./session                  # inspect it
+```
+
+A restored graph answers questions only if something can turn *"pgvector"* into
+`entity:pgvector-6db608`, and that is the resolver's job. So a session is a
+directory of three separately versioned files:
+
+```
+session/
+  session.json           contextmesh.session  v1  — the manifest, and the commit
+  session.lock           the writer lock, created once and never deleted
+  graph-000003.json      contextmesh.graph    v1
+  resolver-000003.json   contextmesh.resolver v1
+```
+
+Three formats rather than one because graph snapshot v1 is **closed**. Query
+resolution is not graph state, and folding the resolver in would mean reopening
+a settled format every time the resolver learns a new field. The session file is
+the join.
+
+**A save never writes to a file the current manifest names.** Writing three
+files in sequence is safe the first time and unsafe every time after: crash
+between the graph and the resolver and the directory holds a new graph beside an
+old resolver — a pairing that never existed, and one that can still pass every
+check made on it. So each save commits a whole new *generation* under new names
+and then replaces `session.json` in a single `os.replace`:
+
+```
+crash before the swap  →  the previous generation is still named, intact
+crash during the swap  →  one manifest or the other, never half of one
+crash after the swap   →  the new generation is named, and complete
+```
+
+Superseded files are swept after the commit, so an interrupted save costs disk
+rather than correctness. The guarantee is reader-visible and tested as such: a
+process holding `session.json` open across a save still reads the previous
+generation whole, because `os.replace` gives the manifest a new inode rather
+than rewriting the old one in place.
+
+**Generations are atomic against a crash. They do nothing against a second
+writer**, and that failure is nastier because nothing about it looks torn. Two
+processes reading generation 5 both choose 6 and overwrite each other's
+companions. Worse, one can commit 6 and sweep while the other has already
+written 7 but not yet swapped — leaving a manifest that is atomically valid and
+names files the first process just deleted:
+
+```
+end   : ['session.json']
+manifest -> generation 3   graph-000003.json exists: False
+```
+
+That is a real reproduction, staged across two processes, and it is now a test.
+So a save takes the directory's writer lock for the **whole** transaction —
+from reading the current generation to sweeping the superseded one. Locking only
+the swap would still allow both races above. The lock is `flock`/`msvcrt`, held
+by the kernel rather than by convention, so it is released when the holder dies
+however it dies; there is no stale-lock heuristic to guess wrong under exactly
+the load that made a save slow. A second writer is refused, not queued:
+
+```
+SessionLockedError: … is already being written by pid 4127 on host; one writer at a time
+```
+
+Readers never take it. The manifest swap already gives them a consistent view,
+and a read that had to wait behind a checkpoint would be a worse trade.
+
+Serialising writers stops corruption; it does not stop the second writer from
+silently discarding the first one's work. So a session that has a home also
+checks that home before committing: if the directory has moved on since this
+session last committed there, the save is refused rather than clobbering. The
+`Checkpointer` treats lock contention as a skipped commit — the mutation stays
+pending for the next one — and counts it, because a server that keeps losing
+the race is a configuration problem worth being able to see.
+
+Multi-writer *coordination* is out of scope: two servers on one directory get
+one clear refusal each time they collide, not a merge.
+
+**Untrusted on the way out, too.** The read side refuses a companion that
+resolves outside the directory. Making the directory *writable* opened the
+mirror-image hole: writing by name follows whatever is already under that name,
+so a directory handed over with the next generation's filename already present
+as a symlink would have the next save write straight through it — and with
+`--checkpoint every-ask`, merely asking a question is the trigger. Four names
+were reachable that way, the lock file among them.
+
+One mechanism rather than four patches: every write lands in a fresh `O_EXCL`
+file under a random name — which cannot already exist, so cannot already be a
+link — and is moved into place with `os.replace`. Rename replaces a symlink
+*itself* instead of following it, so a planted link is destroyed and the file it
+pointed at is never touched. The same rename is what makes the write atomic, so
+the manifest's commit and the symlink defence are the same line of code.
+
+The lock is the exception, because it has to keep one inode for its whole life —
+that inode is what the kernel lock attaches to, and replacing it each save would
+hand two processes locks on two different inodes. So it is opened `O_NOFOLLOW`
+and checked with `fstat` to be a regular file, which also rules out a fifo or a
+device left under the name.
+
+**A checkpoint must not make a live session look broken.** Readers take no lock
+and do not need one for correctness — the manifest swap is atomic and committed
+companions are immutable, so a pair that reads successfully is always a coherent
+generation, at worst a slightly old one. What the swap alone does not cover is
+the *sweep*: a reader holding the manifest for generation 5 can find
+`graph-000005.json` already deleted and fail on a perfectly healthy directory.
+So a read that loses that race is re-read rather than reported, and the retry
+fires only when the directory's generation actually moved during the attempt —
+which keeps a genuinely missing file failing immediately, with its own message,
+instead of after a wait.
+
+**The resolver cannot be rebuilt from the graph, and that is the point.**
+`resolve()` writes a scored match back into its alias table, so a run learns
+surface forms no entity label contains: in the bundled demo, 72 of the
+resolver's 120 aliases are learned that way rather than registered. Restart
+without them and the same mention costs a full block scan and a scored match
+instead of a table hit.
+
+`blocks` is persisted rather than rebuilt, which is where the analogy with
+`_out`/`_in` breaks. Those are a function of the edge list. `blocks` is a
+function of *how* an alias arrived: `register` adds block keys for every name it
+is given, a match learned at query time adds none, and the alias table does not
+record which is which. Rebuilding from `canonical` alone loses keys; rebuilding
+from `canonical` plus `aliases` invents keys the resolver never had. Blocks
+decide the candidate set, so either version silently changes what resolves —
+`tests/test_session.py` measures both and shows them differing.
+
+Walker settings ride along in `session.json` for the same reason: restore a
+session saved with `hop_budget=3` into the default `6` and the same question
+comes back with a different answer, with nothing in the output to say why.
+
+**A session directory is untrusted input.** `Session.load` refuses one it cannot
+faithfully restore — wrong schema, unreadable version, a missing or mistyped
+field, a `rounds` written as `true`, a policy naming an edge type this ontology
+does not have, a manifest whose filenames run ahead of its generation counter.
+The two filenames must be plain names, so a directory you were handed cannot
+point the loader at `../../etc/passwd`, and the files they name must resolve
+*inside* the directory — a correctly named `graph-000001.json` that is a symlink
+to somewhere else is refused too.
+
+Three checks live here because neither file can make them alone. Every entity
+the resolver resolves *to* must exist in the graph, must be an entity, and must
+carry **the same label**. The first two fail loudly; the third is the quiet one.
+`Resolver.canonical` is not a display string — it is scored against every
+mention that reaches `near_miss` — so a resolver holding `entity:pgvector ->
+"HNSW"` over a graph holding `"pgvector"` keeps resolving, resolves differently,
+and both files are individually valid. The resolver's own log is held to the
+same standard: a record naming an id must carry the label that id has, and a
+resolution has both an id and a label while a miss has neither.
+
+### Checkpoints — because asking is a write
+
+A saved session that is never written back is a durable *starting* snapshot, not
+a durable session. Asking a question moves `node.walks` and `edge.traversals`,
+grows the resolver's log, and teaches it aliases it did not have — so without a
+checkpoint every question asked after startup is discarded on restart, silently,
+including exactly the learned aliases the format exists to keep.
+
+```bash
+contextmesh-mcp --session ./session                       # commit after each ask
+contextmesh-mcp --session ./session --checkpoint on-exit  # commit once, on a clean stop
+contextmesh-mcp --session ./session --checkpoint never    # serve it, never write to it
+```
+
+`every-ask` is the default and it is the expensive one on purpose: one full
+serialisation per question is a real cost, and a silently lost question is a
+worse one. `on-exit` is cheaper and worth nothing if the process is killed
+rather than asked to stop. `never` is the honest choice for a directory you were
+handed and do not own. `mesh_ask` is the only tool that triggers a commit —
+which is asserted at the call site rather than inferred, so a sixth tool forces
+a decision about whether it writes.
+
+**What a restart still does not restore**, stated plainly because the suite pins
+it: the walker's in-process walk list, and the assumption ledger's event log.
+`mesh_lineage` and `mesh_blast_radius` come back identical — both read the
+graph's own assumption records — and every *count* in `mesh_health` restores
+exactly. The one field that does not is health's `dead_ends` signal, computed
+from the walk list and so absent until the new process has walked. That is a
+cold start, not a lost capability, and `SurfaceEquivalenceTest` asserts it is
+the *only* one.
 
 ## MCP — read-only, experimental
 
 ```bash
 pip install 'contextmesh[mcp]'
-contextmesh-mcp
+contextmesh-mcp --demo               # a graph rebuilt for this process
+contextmesh-mcp --session ./session  # a graph that outlives it
 ```
 
 An MCP server over the graph, so an agent can query it as memory instead of
@@ -360,7 +542,7 @@ being handed chunks. Five tools — `mesh_ask`, `mesh_get_node`, `mesh_health`,
 ```json
 {
   "mcpServers": {
-    "context-mesh": { "command": "contextmesh-mcp" }
+    "context-mesh": { "command": "contextmesh-mcp", "args": ["--demo"] }
   }
 }
 ```
@@ -388,11 +570,34 @@ that no read changes graph structure, ontology state, assumptions, supersession
 or invalidation, while telemetry is free to move. `tests/test_mcp.py` asserts
 both halves separately.
 
-**It does not persist.** The server builds the bundled demo graph per process,
-because `ContextGraph` serialises but has no `from_dict`. This version is worth
-having to prove the protocol surface and how an agent consumes evidence paths;
-it is not agent memory yet. Lossless graph persistence is the next core
-milestone, and it is what makes an MCP server that loads real state possible.
+**It can now serve a saved session**, and it makes you say which:
+
+```bash
+contextmesh-mcp --demo --rounds 8 --save ./session   # write one
+contextmesh-mcp --session ./session                  # serve it
+```
+
+`--demo` used to be what you got by saying nothing. It has to be said now,
+because the alternative is no longer *nothing* but a real session on disk, and
+silently serving a throwaway graph when someone meant to serve theirs is the one
+failure the format exists to prevent. `contextmesh://session` reports which it
+is and whether anything a client reads outlives the server.
+
+```json
+{
+  "mcpServers": {
+    "context-mesh": {
+      "command": "contextmesh-mcp",
+      "args": ["--session", "/path/to/session"]
+    }
+  }
+}
+```
+
+What a client does to a served session now survives it — see **Checkpoints**
+above. What is still missing before this is agent memory: nothing writes
+*structure or belief* into a session from the client side. Those change only
+through the engine, and execution state does not persist at all.
 
 The core stays untouched by all of this: `contextmesh` remains Python 3.9+ with
 zero dependencies, the MCP SDK arrives only through the `[mcp]` extra, and
@@ -407,7 +612,8 @@ contextmesh/
   ontology.py                GRAPH.md → the schema every write is checked against
   model.py  graph.py         typed nodes, typed edges, no untyped code path
                              and the versioned snapshot it saves and reloads as
-  resolve.py                 entity resolution — one id per real-world thing
+  resolve.py                 entity resolution — one id per real-world thing,
+                             and the alias table it learns and reloads
   pipeline.py                CHUNK → EXTRACT → RESOLVE → LINK → EMBED → PRUNE
   traverse.py                walks, evidence paths, the four dead-end reasons
   assumptions.py             versioned assumptions, blast radius, rejection
@@ -417,12 +623,14 @@ contextmesh/
   metrics.py                 the dashboard payload
   corpus.py  demo.py  cli.py the worked example
 contextmesh_mcp/             read-only MCP server (optional extra, 3.10+)
-  session.py  tools.py       plain Python over the engine; no SDK import
-  resources.py  server.py    server.py is the only file that needs the SDK
+  session.py                 durable sessions: graph + resolver, on disk
+  tools.py  resources.py     plain Python over the engine; no SDK import
+  __main__.py                write or inspect a session without the SDK
+  server.py                  the only file that needs the SDK
 dashboard/                   the rebuilt dashboard
 docs/                        the capture spec and the architecture notes
 examples/                    the original standalone control-layer sketch
-tests/                       266 tests over the invariants above
+tests/                       422 tests over the invariants above
 ```
 
 ## Staying publishable

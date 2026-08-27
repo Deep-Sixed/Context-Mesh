@@ -477,21 +477,32 @@ class ContextGraph:
         return graph
 
     # ── files ────────────────────────────────────────────────────────────
+    def to_json(self) -> str:
+        """The snapshot as text. Object keys sorted; record arrays left alone.
+
+        Separate from ``save_json`` so a caller that needs to place the bytes
+        itself — atomically, or through a file descriptor it already owns —
+        does not have to reproduce these arguments and risk drifting from them.
+        """
+        return (
+            json.dumps(
+                self.to_dict(),
+                sort_keys=True,
+                indent=2,
+                ensure_ascii=False,
+                # NaN and Infinity are Python's, not JSON's. Refusing them here
+                # means a snapshot that saves is a snapshot other tools can read.
+                allow_nan=False,
+            )
+            + "\n"
+        )
+
     def save_json(self, path: Any) -> Any:
-        """Write the snapshot. Object keys sorted; record arrays left alone."""
+        """Write the snapshot to ``path``."""
         from pathlib import Path
 
         target = Path(path)
-        payload = json.dumps(
-            self.to_dict(),
-            sort_keys=True,
-            indent=2,
-            ensure_ascii=False,
-            # NaN and Infinity are Python's, not JSON's. Refusing them here
-            # means a snapshot that saves is a snapshot other tools can read.
-            allow_nan=False,
-        )
-        target.write_text(payload + "\n", encoding="utf-8")
+        target.write_text(self.to_json(), encoding="utf-8")
         return target
 
     @classmethod
