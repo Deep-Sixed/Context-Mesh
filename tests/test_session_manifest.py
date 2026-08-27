@@ -7,8 +7,65 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from contextmesh.execute import Runner, TaskRegistry
 from contextmesh_mcp.session import Session, SessionError
-from test_session_v2 import deployment, session_with_a_plan
+
+
+class Advisory:
+    def __init__(self) -> None:
+        self.published = False
+
+    def __call__(self, ctx):
+        if self.published and ctx.output.get("impl") == "argon2":
+            return ctx.disproved("CVE-2026-9999 published for argon2id")
+        return True
+
+
+def deployment(advisory=None):
+    registry = TaskRegistry()
+    registry.register_worker("auth.schema.v1", lambda ctx: {"ok": True})
+    registry.register_worker("auth.hash.argon2.v1", lambda ctx: {"impl": "argon2"})
+    registry.register_worker("auth.hash.bcrypt.v1", lambda ctx: {"impl": "bcrypt"})
+    registry.register_worker("auth.tokens.v1", lambda ctx: {"ok": True})
+    registry.register_auditor("auth.hash.audit.v1", advisory or Advisory())
+    return registry
+
+
+def session_with_a_plan():
+    base = Session.build(rounds=2)
+    advisory = Advisory()
+    runner = Runner("auth", graph=base.graph, registry=deployment(advisory))
+    runner.task(
+        "schema",
+        worker_key="auth.schema.v1",
+        assumes="sqlite is fine",
+        produces=("Schema",),
+    )
+    runner.task(
+        "hashing",
+        worker_key="auth.hash.argon2.v1",
+        auditor_key="auth.hash.audit.v1",
+        assumes="Argon2 has no open advisory",
+        needs=("schema",),
+        produces=("Password Hasher",),
+    )
+    runner.task(
+        "tokens",
+        worker_key="auth.tokens.v1",
+        assumes="JWT is fine",
+        needs=("schema",),
+        produces=("Tokens",),
+    )
+    runner.run()
+    advisory.published = True
+    runner.recheck()
+    runner.repair(
+        "hashing",
+        assumes="bcrypt has no open advisory",
+        worker_key="auth.hash.bcrypt.v1",
+    )
+    base.runner = runner
+    return base
 
 
 def _save_plan() -> Path:
@@ -23,7 +80,7 @@ def _save_graph_only() -> Path:
     return target
 
 
-def _rewrite(directory: Path, **updates):
+def _rewrite(directory: Path, **updates) -> None:
     path = directory / "session.json"
     data = json.loads(path.read_text(encoding="utf-8"))
     data.update(updates)
@@ -78,7 +135,11 @@ class DuplicateManifestKeyTest(unittest.TestCase):
         path = directory / "session.json"
         text = path.read_text(encoding="utf-8")
         self.assertIn('"ledger_head":', text)
-        text = text.replace('"ledger_head":', '"ledger_head": null,\n  "ledger_head":', 1)
+        text = text.replace(
+            '"ledger_head":',
+            '"ledger_head": null,\n  "ledger_head":',
+            1,
+        )
         path.write_text(text, encoding="utf-8")
         with self.assertRaises(SessionError) as caught:
             Session.load(directory, registry=deployment())
