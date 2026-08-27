@@ -388,18 +388,37 @@ parallel provenance trail beside the one it claims to continue.
 
 **References are closed at load, not left to fail later.** The assumption must
 exist in the graph, the decision must be a `DECISION`, the artefacts must be
-`ENTITY` nodes, and every `needs` must name a task in the same file. One state
-rule joins the two records:
+`ENTITY` nodes, and every `needs` must name a task in the same file. Two facts written twice have to
+agree: `assumes` is what the task reports and `assumption_id` is what the
+scheduler and the auditor read, so a file holding them in disagreement would
+restore a plan that shows one ground and runs on another. Ids are content
+slugged (sha1 of the statement), so a real binding cannot drift there by
+accident — and `assumption_id` is not nullable, because `Runner.task` binds one
+at declaration and an unbound task could only ever block.
+
+**DONE is a claim about provenance**, so it carries obligations the other states
+do not:
 
 ```
-task says DONE  +  its decision is invalidated   → REFUSED
-task says STALE +  its decision is invalidated   → fine, that is what
-                                                   invalidation leaves behind
+DONE    → must name a decision, attempt ≥ 1, ground not rejected,
+          decision not invalidated
+STALE   → may point at an invalidated decision — that is exactly what
+          selective invalidation leaves behind
+PENDING → no decision, no attempts
+FAILED  → no decision, no attempts
 ```
 
-That asymmetry is measured against the live lifecycle rather than assumed: a
-stale task pointing at an invalidated decision is the normal post-CVE state, and
-the restore below depends on it being allowed.
+That asymmetry is measured against the live lifecycle rather than assumed. Only
+DONE is constrained: `_commit` creates the decision and only then marks the task
+done, so done-without-one is unreachable — and dangerous, since `_ready` skips
+DONE tasks and a restored plan would cache work as complete that the graph has
+no record of. Over-constraining the others would refuse plans the engine really
+produces.
+
+**A plan that cannot be scheduled is not a plan.** Dependency cycles are refused
+at load rather than left for `run()` to discover, and the check happens before
+the Runner is constructed, so a refused snapshot does not even leave its source
+node behind in the graph.
 
 The load-bearing case is the awkward one — repaired but not yet rerun:
 

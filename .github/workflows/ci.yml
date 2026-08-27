@@ -1224,12 +1224,40 @@ jobs:
           cases.append(("a task named twice", bad, None, None))
           bad = copy.deepcopy(good); bad["approved_by"] = "alice"
           cases.append(("an undefined v1 field", bad, None, None))
+          bad = copy.deepcopy(good); bad["tasks"][0]["assumption_id"] = None
+          cases.append(("a task with no ground", bad, None, None))
+          bad = copy.deepcopy(good); bad["tasks"][0]["assumes"] = "something else entirely"
+          cases.append(("ground text vs binding", bad, None, None))
+          bad = copy.deepcopy(good); bad["tasks"][0]["node_id"] = None
+          cases.append(("done with no decision", bad, None, None))
+          bad = copy.deepcopy(good); bad["tasks"][0]["attempt"] = 0
+          cases.append(("done after no attempts", bad, None, None))
           cases.append(("a different graph entirely", copy.deepcopy(good), ContextGraph(), None))
           cases.append(("a deployment without the key", copy.deepcopy(good), None, TaskRegistry()))
 
           for label, snap, graph, reg in cases:
               if not refused(label, snap, graph, reg):
                   raise SystemExit("::error::%s was accepted" % label)
+
+          # A cycle is refused at load, not left for run() to discover -- and
+          # the refusal happens before the Runner exists, so nothing lands.
+          from contextmesh.model import slug
+          two = Runner("cyc", registry=registry)
+          two.task("a", worker_key="w.v1", assumes="alpha")
+          two.task("b", worker_key="w.v1", assumes="beta")
+          cyc = two.snapshot()
+          cyc["tasks"][0]["needs"] = ["b"]
+          cyc["tasks"][1]["needs"] = ["a"]
+          cyc["plan"] = "cyc-restored"
+          source = slug("execution plan: cyc-restored", "source")
+          assert source not in two.graph.nodes
+          try:
+              Runner.from_snapshot(cyc, graph=two.graph, registry=registry)
+              raise SystemExit("::error::a dependency cycle was accepted")
+          except ExecutionSnapshotError as exc:
+              print(" %-26s refused: %s" % ("a dependency cycle", str(exc)[:54]))
+          assert source not in two.graph.nodes, "the refused plan still left a source node"
+          print(" %-26s nothing landed in the graph" % "and before construction:")
           print("A BAD PLAN FAILS CLOSED")
           EOF
           grep -q "A BAD PLAN FAILS CLOSED" /tmp/execrefuse.txt

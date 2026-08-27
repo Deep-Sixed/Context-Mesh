@@ -39,7 +39,7 @@ from contextmesh.execute import (
     TaskState,
 )
 from contextmesh.graph import ContextGraph
-from contextmesh.model import NodeType
+from contextmesh.model import AssumptionStatus, NodeType
 
 
 class Advisory:
@@ -422,6 +422,166 @@ class ReferenceClosureTest(unittest.TestCase):
         self.assertTrue(self.runner.graph.node(stale["node_id"]).invalidated)
         stale["state"] = "done"
         self.refuse("says done, but decision")
+
+    # ── the two records of one fact have to agree ────────────────────────
+    def test_a_task_whose_ground_text_disagrees_with_its_binding_is_refused(self):
+        """`assumes` and `assumption_id` are the same fact written twice.
+
+        The reporting side reads the text; the scheduler and the auditor read
+        the bound assumption. A file can hold them disagreeing, and then the
+        restored plan shows one ground and runs on another. Ids are content
+        slugged (sha1 of the statement), so a real binding cannot drift here.
+        """
+        rows = {r["name"]: r for r in self.snapshot["tasks"]}
+        rows["schema"]["assumption_id"] = rows["tokens"]["assumption_id"]
+        self.refuse("cannot report one ground and be scheduled on another")
+
+    def test_a_task_with_no_assumption_id_is_refused(self):
+        """`Runner.task` binds one at declaration, so unbound is unreachable."""
+        self.row("schema")["assumption_id"] = None
+        self.refuse("has no assumption_id")
+
+    def test_the_ids_are_content_slugged_so_agreement_is_checkable(self):
+        """Why exact equality is safe rather than brittle."""
+        from contextmesh.model import slug
+
+        for task in self.runner.tasks:
+            self.assertEqual(task.assumption_id, slug(task.assumes, "assumption"))
+
+    # ── done is a claim about provenance ─────────────────────────────────
+    def test_a_task_claiming_done_with_no_decision_is_refused(self):
+        """`_commit` creates the decision and only then marks the task done.
+
+        Dangerous as well as impossible: `_ready` skips DONE tasks, so a
+        restored plan would cache work as complete that the graph has no record
+        of ever happening.
+        """
+        row = self.row("schema")
+        self.assertEqual(row["state"], "done")
+        row["node_id"] = None
+        self.refuse("says done, but names no decision")
+
+    def test_a_task_claiming_done_after_no_attempts_is_refused(self):
+        self.row("schema")["attempt"] = 0
+        self.refuse("says done after 0 attempts")
+
+    def test_a_task_claiming_done_on_rejected_ground_is_refused(self):
+        """The disproved argon2 ground, worn by a task that says it finished.
+
+        Note it is the *superseded* assumption that carries REJECTED — after the
+        repair, `hashing` points at the new bcrypt one, which is active. An
+        earlier version of this test reached for `hashing`'s current binding and
+        proved nothing.
+        """
+        rejected = next(
+            a for a in self.runner.graph.assumptions.values()
+            if a.status is AssumptionStatus.REJECTED
+        )
+        settled = self.row("tokens")
+        self.assertEqual(settled["state"], "done")
+        settled["assumption_id"] = rejected.id
+        settled["assumes"] = rejected.statement
+        self.refuse("is rejected")
+
+    def test_done_with_provenance_is_exactly_what_the_lifecycle_produces(self):
+        """Pins the rule against the engine, so it cannot drift into fiction."""
+        for task in self.runner.tasks:
+            if task.state is TaskState.DONE:
+                self.assertIsNotNone(task.node_id, task.name)
+                self.assertGreaterEqual(task.attempt, 1, task.name)
+                ground = self.runner.graph.assumptions[task.assumption_id]
+                self.assertIsNot(ground.status, AssumptionStatus.REJECTED, task.name)
+
+    def test_the_other_states_are_left_alone(self):
+        """Only DONE is constrained; the rest are measured, not guessed.
+
+        PENDING and FAILED legitimately have no decision and no attempts, and
+        STALE legitimately points at an invalidated one. Over-constraining any
+        of them would refuse plans the engine really produces.
+        """
+        rows = {r["name"]: r for r in self.snapshot["tasks"]}
+        rows["routes"]["state"] = "pending"
+        rows["routes"]["attempt"] = 0
+        rows["routes"]["node_id"] = None
+        rows["routes"]["artefacts"] = []
+        restored = Runner.from_snapshot(
+            self.snapshot, graph=self.runner.graph, registry=deployment()
+        )
+        self.assertIs(restored.state("routes"), TaskState.PENDING)
+
+    # ── a plan that cannot be scheduled is not a plan ────────────────────
+    def test_a_dependency_cycle_is_refused_at_load_not_at_run(self):
+        """`_validate` finds it too, but not until `run()`.
+
+        Without this the restore succeeds, the Runner looks healthy, and the
+        contradiction surfaces later in code that has no idea a file existed.
+        """
+        rows = {r["name"]: r for r in self.snapshot["tasks"]}
+        for row in self.snapshot["tasks"]:
+            row["state"], row["attempt"] = "pending", 0
+            row["node_id"], row["artefacts"] = None, []
+        rows["schema"]["needs"] = ["tokens"]
+        rows["tokens"]["needs"] = ["schema"]
+        self.refuse("dependency cycle")
+
+    def test_a_longer_cycle_is_refused_too(self):
+        rows = {r["name"]: r for r in self.snapshot["tasks"]}
+        for row in self.snapshot["tasks"]:
+            row["state"], row["attempt"] = "pending", 0
+            row["node_id"], row["artefacts"] = None, []
+        rows["schema"]["needs"] = ["tokens"]
+        rows["hashing"]["needs"] = ["schema"]
+        rows["tokens"]["needs"] = ["hashing"]
+        with self.assertRaises(ExecutionSnapshotError) as caught:
+            Runner.from_snapshot(
+                self.snapshot, graph=self.runner.graph, registry=deployment()
+            )
+        message = str(caught.exception)
+        for name in ("schema", "hashing", "tokens"):
+            self.assertIn(name, message)
+
+    def test_a_refused_cycle_leaves_no_source_node_behind(self):
+        """Checked before the Runner exists, so not even a source node lands.
+
+        The observation has to be chosen carefully. Against a *fresh* graph the
+        assumption check fires first and the cycle check is never reached — an
+        earlier version of this test did that and passed without exercising the
+        ordering at all. So: the real graph, so every reference closes, but a
+        plan name whose source node does not exist yet. If the cycle check ran
+        after construction, `Runner.__init__` would have created it on the way.
+        """
+        from contextmesh.model import slug
+
+        for row in self.snapshot["tasks"]:
+            row["state"], row["attempt"] = "pending", 0
+            row["node_id"], row["artefacts"] = None, []
+        rows = {r["name"]: r for r in self.snapshot["tasks"]}
+        rows["schema"]["needs"] = ["tokens"]
+        rows["tokens"]["needs"] = ["schema"]
+        self.snapshot["plan"] = "auth-restored"
+
+        source_id = slug("execution plan: auth-restored", "source")
+        self.assertNotIn(source_id, self.runner.graph.nodes)
+
+        with self.assertRaises(ExecutionSnapshotError):
+            Runner.from_snapshot(
+                self.snapshot, graph=self.runner.graph, registry=deployment()
+            )
+        self.assertNotIn(
+            source_id, self.runner.graph.nodes,
+            "the refused snapshot still put its source node in the graph",
+        )
+
+    def test_an_accepted_plan_does_create_its_source_node(self):
+        """The control, so the assertion above cannot pass by never being true."""
+        from contextmesh.model import slug
+
+        self.snapshot["plan"] = "auth-restored"
+        source_id = slug("execution plan: auth-restored", "source")
+        Runner.from_snapshot(
+            self.snapshot, graph=self.runner.graph, registry=deployment()
+        )
+        self.assertIn(source_id, self.runner.graph.nodes)
 
     def test_a_stale_task_on_an_invalidated_decision_restores_fine(self):
         restored = Runner.from_snapshot(

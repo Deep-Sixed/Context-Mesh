@@ -1110,6 +1110,15 @@ def _task_from_row(row: Any, index: int) -> Task:
                 f"{where}: {field_name} must be a non-empty string or null, "
                 f"got {value!r}"
             )
+    if row["assumption_id"] is None:
+        # ``Runner.task`` binds one through ``_assume`` before the task joins the
+        # plan, so an unbound task is not a state this engine can produce. A
+        # restored one would be permanently blocked on "no assumption bound".
+        raise ExecutionSnapshotError(
+            f"{where}: has no assumption_id. Every task in a plan is bound to "
+            "its ground when it is declared, so an unbound one could only ever "
+            "block"
+        )
 
     output = row["output"]
     if not isinstance(output, dict):
@@ -1157,6 +1166,31 @@ def _unbound(ctx: "RunContext") -> Dict[str, Any]:
     )
 
 
+def _refuse_dependency_cycles(tasks: List[Task]) -> None:
+    """A plan that cannot be scheduled is not a plan this loader hands back.
+
+    ``Runner._validate`` finds cycles too, but not until ``run()`` — so without
+    this a restore succeeds, the Runner looks healthy, and the contradiction
+    surfaces later in code that has no idea a file was involved. Checked on the
+    parsed rows, before the Runner exists, so a refused snapshot does not even
+    dedupe a source node into the graph on its way out.
+    """
+    remaining = {task.name: set(task.needs) for task in tasks}
+    settled: Set[str] = set()
+    while True:
+        ready = [n for n in remaining if n not in settled and not remaining[n] - settled]
+        if not ready:
+            break
+        settled.update(ready)
+    if len(settled) != len(remaining):
+        stuck = sorted(set(remaining) - settled)
+        raise ExecutionSnapshotError(
+            "execution snapshot has a dependency cycle among "
+            + ", ".join(repr(name) for name in stuck)
+            + "; no order runs these, so the plan could never be scheduled"
+        )
+
+
 def _close_task_references(task: Task, *, tasks: Set[str], graph: ContextGraph) -> None:
     """Every id a restored task names has to point at something, now.
 
@@ -1172,9 +1206,22 @@ def _close_task_references(task: Task, *, tasks: Set[str], graph: ContextGraph) 
     if task.name in task.needs:
         raise ExecutionSnapshotError(f"{where}: needs itself")
 
-    if task.assumption_id is not None and task.assumption_id not in graph.assumptions:
+    assert task.assumption_id is not None  # _task_from_row proved it
+    assumption = graph.assumptions.get(task.assumption_id)
+    if assumption is None:
         raise ExecutionSnapshotError(
             f"{where}: assumption {task.assumption_id!r} is not in this graph"
+        )
+    if assumption.statement != task.assumes:
+        # Two records of the same fact, and a file can hold them disagreeing.
+        # The reporting side reads ``assumes`` while the scheduler and the
+        # auditor read the bound assumption, so a plan restored like this shows
+        # one ground and runs on another. Ids are content-slugged, so a genuine
+        # binding cannot drift into this by accident.
+        raise ExecutionSnapshotError(
+            f"{where}: says its ground is {task.assumes!r}, but assumption "
+            f"{task.assumption_id!r} states {assumption.statement!r}. A task "
+            "cannot report one ground and be scheduled on another"
         )
     if task.node_id is not None:
         node = graph.nodes.get(task.node_id)
@@ -1186,7 +1233,7 @@ def _close_task_references(task: Task, *, tasks: Set[str], graph: ContextGraph) 
             raise ExecutionSnapshotError(
                 f"{where}: {task.node_id!r} is a {node.type.value}, not a decision"
             )
-        if task.state is TaskState.DONE and node.invalidated:
+        if task.state is TaskState.DONE and node.invalidated:  # noqa: SIM102
             # Measured against the live lifecycle rather than assumed: a STALE
             # task legitimately points at an invalidated decision — that is what
             # selective invalidation leaves behind. A DONE one does not, and a
@@ -1196,6 +1243,28 @@ def _close_task_references(task: Task, *, tasks: Set[str], graph: ContextGraph) 
                 f"{where}: says done, but decision {task.node_id!r} is invalidated. "
                 "A task whose ground fell is stale, not done"
             )
+    if task.state is TaskState.DONE:
+        # Measured against the lifecycle rather than assumed. `_commit` creates
+        # the decision and only then marks the task done, so done-without-one is
+        # a state this engine never reaches — and a dangerous one to accept,
+        # because `_ready` skips DONE tasks. A restored plan would cache work as
+        # complete that the graph has no record of ever happening.
+        if task.node_id is None:
+            raise ExecutionSnapshotError(
+                f"{where}: says done, but names no decision. Done is a claim "
+                "about provenance, and the graph has none for this task"
+            )
+        if task.attempt < 1:
+            raise ExecutionSnapshotError(
+                f"{where}: says done after {task.attempt} attempts. Work that "
+                "never ran cannot be complete"
+            )
+        if assumption.status is AssumptionStatus.REJECTED:
+            raise ExecutionSnapshotError(
+                f"{where}: says done, but its ground {assumption.statement!r} "
+                "is rejected. A task whose ground fell is stale, not done"
+            )
+
     for artefact_id in task.artefacts:
         node = graph.nodes.get(artefact_id)
         if node is None:
@@ -1824,6 +1893,7 @@ class Runner:
         # Then references, which need the whole set and the live graph.
         for task in tasks:
             _close_task_references(task, tasks=seen, graph=graph)
+        _refuse_dependency_cycles(tasks)
 
         # Then code, which is the one thing the file never carried.
         for task in tasks:
