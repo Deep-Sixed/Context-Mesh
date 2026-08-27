@@ -108,7 +108,7 @@ class ThreeWayInvariantTest(unittest.TestCase):
             Session.load(directory, registry=deployment())
         message = str(caught.exception)
         self.assertIn("ledger_head", message)
-        self.assertIn("not null", message)
+        self.assertIn("must not be null", message)
 
     def test_head_without_execution_is_refused(self):
         directory = _save_graph_only()
