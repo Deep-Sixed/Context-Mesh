@@ -290,11 +290,66 @@ identifier survives a log line, a shell word and a diff unsplit.
 answer "this checkpoint cannot resume here because I lack
 `auth.hash.bcrypt.v1`" without exposing a route back to the code.
 
-This is the first slice of execution checkpointing. The serialiser itself — the
-run ledger's restore, the execution snapshot format, and a session that joins
-graph, resolver and execution — is deliberately not built yet: the binding
-boundary is proved first so the format is not designed around an unproven model
-of how code is named.
+### A restored ledger has to be *the* ledger, not *a* ledger
+
+`ledger.snapshot()` writes a versioned container — `contextmesh.runledger` v1 —
+carrying the schema, the version, every entry, and the head:
+
+```json
+{ "schema": "contextmesh.runledger", "version": 1,
+  "head": "b881a2c2…", "entries": [ … ] }
+```
+
+The head is stored even though it is the last entry's digest, so a truncated
+array is a contradiction the loader names rather than a shorter history it would
+accept. `RunLedger.from_snapshot()` takes each entry **exactly as written** and
+then checks it. It does not replay `record()`, and that distinction is the whole
+design: replaying recomputes each digest from whatever the file says, so an
+edited entry comes back with a freshly consistent digest and a chain that
+verifies — the loader meant to catch the tamper would launder it.
+
+What the chain proves, and what it does not:
+
+```
+edit an entry     → its digest no longer recomputes      REFUSED
+delete an entry   → the next one's previous is wrong     REFUSED
+reorder entries   → seq and previous both disagree       REFUSED
+rebuild the lot   → internally perfect                   ACCEPTED
+```
+
+That last row is not a hole; it is what a hash chain is. Anyone who can rewrite
+every entry can recompute every digest, and no amount of self-checking
+distinguishes that chain from the original — a fully reforged ledger passes
+`verify()`. What distinguishes them is a head you trusted *before* the file
+could be rewritten:
+
+```
+        trusted head H
+              │
+   A → B  → C  → D          the history that ran
+   A → B' → C' → D'         every entry and digest rewritten
+              │
+        head H' ≠ H
+```
+
+Pass it as `from_snapshot(data, expect_head=H)` and the forgery is refused,
+because producing a different history that ends in the same digest is a SHA-256
+preimage. Omit it and you get tamper *evidence* — modification, deletion,
+reordering — but not continuity. This is why the restored head being the *exact*
+committed head is the load-bearing invariant, rather than the restored chain
+merely hashing correctly.
+
+Everything the digest covers is validated before an entry is constructed: the
+schema and version exactly, `seq` contiguous from 1, `round` a non-negative
+integer, the event one this build knows, the nullable ids a string or null, the
+payload canonical JSON, and both digests 64 lowercase hex characters. An unknown
+field is refused rather than dropped — the digest covers a fixed set, so
+anything extra is content the chain does not sign.
+
+This is the second slice of execution checkpointing. The execution snapshot
+format and a session that joins graph, resolver and execution are deliberately
+not built yet: the ledger's restore is proved first so the larger format is not
+designed around an unproven model of how history is carried.
 
 ### The standalone control layer
 

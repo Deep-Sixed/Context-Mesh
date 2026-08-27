@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
@@ -51,6 +52,16 @@ from .model import Assumption, AssumptionStatus, EdgeType, NodeType, slug
 
 class ExecutionError(Exception):
     """Raised when a plan cannot be scheduled, or an auditor misbehaves."""
+
+
+class LedgerIntegrityError(ExecutionError):
+    """Raised when a serialised ledger is not the history it claims to be.
+
+    Separate from :class:`ExecutionCheckpointError`, which is about *identity*
+    — a key this deployment cannot bind. This one is about *history*: the file
+    parses, but its entries, its ordering or its digests do not add up, or it
+    is a perfectly self-consistent chain that is simply not the one committed.
+    """
 
 
 class ExecutionCheckpointError(ExecutionError):
@@ -434,6 +445,44 @@ class Task:
 
 
 # ── the ledger ───────────────────────────────────────────────────────────
+#: The durable ledger format. Versioned separately from the graph snapshot and
+#: the session manifest, because these three change for different reasons and a
+#: single version number would force a rewrite of all of them to move one.
+LEDGER_SCHEMA = "contextmesh.runledger"
+LEDGER_VERSION = 1
+
+#: A SHA-256 digest as it is written down: 64 lowercase hex characters. Matched
+#: exactly rather than parsed loosely, so an uppercase or truncated digest is a
+#: refusal at the door instead of a mismatch three checks later.
+_DIGEST = re.compile(r"\A[0-9a-f]{64}\Z")
+
+#: The fields a serialised entry has — all of them, and only these. An unknown
+#: key is refused rather than dropped: the digest is taken over a fixed set of
+#: fields, so anything extra in the file is content the chain does not cover,
+#: and a later reader that started honouring it would be trusting unsigned data.
+_ENTRY_KEYS = frozenset(
+    {
+        "seq",
+        "round",
+        "event",
+        "task",
+        "detail",
+        "node_id",
+        "assumption_id",
+        "data",
+        "digest",
+    }
+)
+
+
+def _no_ledger_constants(value: str) -> float:
+    """json.load hook. ``NaN``/``Infinity`` are not JSON and do not round-trip."""
+    raise LedgerIntegrityError(
+        f"ledger contains the non-JSON constant {value!r}; a digest taken over "
+        "a value other parsers refuse is not a digest anyone can re-check"
+    )
+
+
 #: Values a ledger entry's structured payload may contain. Anything else has no
 #: single canonical JSON form — a set has no order, bytes have no encoding, NaN
 #: is not JSON at all — so a digest taken over it would depend on how Python
@@ -618,10 +667,244 @@ class RunLedger:
         )
 
     def to_dict(self) -> List[Dict[str, Any]]:
+        """The entries as rows, for a report or a dashboard.
+
+        Not the durable format — see :meth:`snapshot`, which adds the schema,
+        the version and the head that make a file checkable on the way back in.
+        """
         return [e.to_dict() for e in self._entries]
+
+    # ── the durable format ───────────────────────────────────────────────
+    def snapshot(self) -> Dict[str, Any]:
+        """The ledger as a versioned, self-describing container.
+
+        The head is written down even though it is the last entry's digest and
+        could be read off the array. Storing it makes the file state what it
+        claims to be, so a truncated array is a contradiction the loader can
+        name rather than a shorter history it would happily accept.
+        """
+        return {
+            "schema": LEDGER_SCHEMA,
+            "version": LEDGER_VERSION,
+            "head": self.head,
+            "entries": [e.to_dict() for e in self._entries],
+        }
+
+    def to_json(self) -> str:
+        """The snapshot as text, in the exact form :meth:`save_json` writes."""
+        return (
+            json.dumps(
+                self.snapshot(),
+                sort_keys=True,
+                indent=2,
+                ensure_ascii=False,
+                # NaN and Infinity are Python's, not JSON's. A ledger that saves
+                # is one another tool can read and re-check.
+                allow_nan=False,
+            )
+            + "\n"
+        )
+
+    def save_json(self, path: Any) -> Any:
+        from pathlib import Path
+
+        target = Path(path)
+        target.write_text(self.to_json(), encoding="utf-8")
+        return target
+
+    @classmethod
+    def load_json(cls, path: Any, *, expect_head: Optional[str] = None) -> "RunLedger":
+        from pathlib import Path
+
+        text = Path(path).read_text(encoding="utf-8")
+        data = json.loads(text, parse_constant=_no_ledger_constants)
+        return cls.from_snapshot(data, expect_head=expect_head)
+
+    @classmethod
+    def from_snapshot(
+        cls, data: Any, *, expect_head: Optional[str] = None
+    ) -> "RunLedger":
+        """Rebuild a ledger from a snapshot, or refuse it.
+
+        Every entry is taken **exactly as written** and then checked. It is not
+        replayed through :meth:`record`, and that is the whole point: replaying
+        would recompute each digest from whatever the file happened to say, so
+        an edited entry would come back with a freshly consistent digest and a
+        chain that verifies. Tampering would be laundered by the loader that was
+        supposed to catch it. Here the stored digest is evidence, not a field to
+        be regenerated, and the load fails if it does not hold up.
+
+        What this proves, and what it does not::
+
+            edit an entry     → its digest no longer recomputes      REFUSED
+            delete an entry   → the next one's previous is wrong     REFUSED
+            reorder entries   → seq and previous both disagree       REFUSED
+            rebuild the lot   → internally perfect                   ACCEPTED
+
+        That last row is not a hole; it is what a hash chain is. Anyone who can
+        rewrite every entry can recompute every digest, and no amount of
+        self-checking distinguishes that chain from the original. What does
+        distinguish them is a head you trusted *before* the file could be
+        rewritten. Pass it as ``expect_head`` and the forgery is refused,
+        because producing a different history that ends in the same digest is a
+        SHA-256 preimage. Omit it and you get tamper *evidence* — modification,
+        deletion and reordering — but not continuity.
+        """
+        if not isinstance(data, dict):
+            raise LedgerIntegrityError(
+                f"ledger snapshot must be an object, got {type(data).__name__}"
+            )
+        for key in ("schema", "version", "head", "entries"):
+            if key not in data:
+                raise LedgerIntegrityError(f"ledger snapshot is missing {key!r}")
+        if data["schema"] != LEDGER_SCHEMA:
+            raise LedgerIntegrityError(
+                f"not a {LEDGER_SCHEMA} snapshot: schema is {data['schema']!r}"
+            )
+        version = data["version"]
+        # ``True == 1`` in Python, so a bool would sail through the equality
+        # check below and load as version 1.
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise LedgerIntegrityError(
+                f"ledger version must be an integer, got {version!r}"
+            )
+        if version != LEDGER_VERSION:
+            raise LedgerIntegrityError(
+                f"ledger version {version!r} cannot be read by this build, "
+                f"which writes and reads version {LEDGER_VERSION}"
+            )
+        declared = data["head"]
+        if not isinstance(declared, str) or not _DIGEST.match(declared):
+            raise LedgerIntegrityError(
+                f"ledger head must be 64 lowercase hex characters, got {declared!r}"
+            )
+        rows = data["entries"]
+        if not isinstance(rows, list):
+            raise LedgerIntegrityError(
+                f"ledger entries must be an array, got {type(rows).__name__}"
+            )
+
+        ledger = cls()
+        previous = cls.GENESIS
+        for index, row in enumerate(rows, start=1):
+            entry = _entry_from_row(row, index)
+            if entry.compute_digest(previous) != entry.digest:
+                raise LedgerIntegrityError(
+                    f"ledger entry {index}: digest does not match its contents. "
+                    "The entry was edited after it was written, or the entry "
+                    "before it was changed, removed or moved"
+                )
+            ledger._entries.append(entry)
+            previous = entry.digest
+
+        if previous != declared:
+            raise LedgerIntegrityError(
+                f"ledger head says {declared} but the entries end at {previous}; "
+                "the file disagrees with itself about how much history it holds"
+            )
+        if expect_head is not None and ledger.head != expect_head:
+            raise LedgerIntegrityError(
+                f"ledger does not continue the history it was checked against: "
+                f"expected head {expect_head}, restored {ledger.head}. The chain "
+                "may verify perfectly and still be a different chain"
+            )
+        return ledger
 
     def __len__(self) -> int:
         return len(self._entries)
+
+
+def _entry_from_row(row: Any, index: int) -> LedgerEntry:
+    """One serialised entry, checked field by field before it becomes an object.
+
+    Every check here is about a value the digest is taken over. A row that got
+    this far and then fails its digest is tampering; a row that fails *here* is
+    something that could never have been written by this build at all, and
+    saying which field is wrong beats reporting a hash mismatch and leaving the
+    reader to find it.
+    """
+    where = f"ledger entry {index}"
+    if not isinstance(row, dict):
+        raise LedgerIntegrityError(f"{where} must be an object, got {type(row).__name__}")
+    missing = sorted(_ENTRY_KEYS - set(row))
+    if missing:
+        raise LedgerIntegrityError(f"{where} is missing {', '.join(repr(k) for k in missing)}")
+    unknown = sorted(set(row) - _ENTRY_KEYS)
+    if unknown:
+        raise LedgerIntegrityError(
+            f"{where} carries {', '.join(repr(k) for k in unknown)}, which the "
+            "digest does not cover; a durable entry holds only signed fields"
+        )
+
+    seq = row["seq"]
+    if isinstance(seq, bool) or not isinstance(seq, int):
+        raise LedgerIntegrityError(f"{where}: seq must be an integer, got {seq!r}")
+    if seq != index:
+        raise LedgerIntegrityError(
+            f"{where}: seq is {seq}, but this is entry {index}. A ledger is "
+            "numbered from 1 with no gaps, so a jump is a removal or a reorder"
+        )
+
+    round_ = row["round"]
+    if isinstance(round_, bool) or not isinstance(round_, int) or round_ < 0:
+        raise LedgerIntegrityError(
+            f"{where}: round must be a non-negative integer, got {round_!r}"
+        )
+
+    event = row["event"]
+    if not isinstance(event, str):
+        raise LedgerIntegrityError(f"{where}: event must be a string, got {event!r}")
+    try:
+        parsed = Event(event)
+    except ValueError:
+        known = ", ".join(sorted(e.value for e in Event))
+        raise LedgerIntegrityError(
+            f"{where}: {event!r} is not an event this build knows; it reads {known}"
+        ) from None
+
+    for name in ("task", "detail"):
+        if not isinstance(row[name], str):
+            raise LedgerIntegrityError(
+                f"{where}: {name} must be a string, got {row[name]!r}"
+            )
+    for name in ("node_id", "assumption_id"):
+        if row[name] is not None and not isinstance(row[name], str):
+            raise LedgerIntegrityError(
+                f"{where}: {name} must be a string or null, got {row[name]!r}"
+            )
+
+    data = row["data"]
+    if not isinstance(data, dict):
+        raise LedgerIntegrityError(
+            f"{where}: data must be an object, got {type(data).__name__}"
+        )
+    try:
+        # Not cosmetic. ``from_snapshot`` also accepts a dict that never went
+        # through JSON, and a payload holding a set or a NaN would produce a
+        # digest that depends on how this interpreter rendered it.
+        canonical = _canonical(data)
+    except ExecutionError as exc:
+        raise LedgerIntegrityError(f"{where}: {exc}") from None
+
+    digest = row["digest"]
+    if not isinstance(digest, str) or not _DIGEST.match(digest):
+        raise LedgerIntegrityError(
+            f"{where}: digest must be 64 lowercase hex characters, got {digest!r}"
+        )
+
+    return LedgerEntry(
+        seq=seq,
+        round=round_,
+        event=parsed,
+        task=row["task"],
+        detail=row["detail"],
+        node_id=row["node_id"],
+        assumption_id=row["assumption_id"],
+        data=canonical,
+        # Kept exactly as the file wrote it. Recomputing here instead would make
+        # every entry consistent by construction and the chain unfalsifiable.
+        digest=digest,
+    )
 
 
 @dataclass

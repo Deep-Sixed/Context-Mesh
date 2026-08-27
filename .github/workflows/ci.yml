@@ -871,6 +871,177 @@ jobs:
           EOF
           grep -q "MISSING KEYS FAIL CLOSED" /tmp/missing.txt
 
+  ledger:
+    name: ledger · restore and continuity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: A restored ledger continues the exact committed history
+        run: |
+          python - <<'EOF' | tee /tmp/cont.txt
+          import json, subprocess, sys, tempfile
+          from pathlib import Path
+          from contextmesh.execute import RunLedger, Event
+
+          led = RunLedger()
+          led.record(1, Event.EXECUTED, "hash_password", "argon2id", data={"hasher": "Argon2id"})
+          led.record(1, Event.DISPROVED, "hash_password", "CVE-2026-9999")
+          led.record(2, Event.REPAIRED, "hash_password", "reground on bcrypt")
+          led.record(2, Event.EXECUTED, "hash_password", "bcrypt", data={"hasher": "Bcrypt"})
+          committed = led.head
+          print(" process A committed head:", committed[:32], "...")
+
+          tmp = Path(tempfile.mkdtemp())
+          led.save_json(tmp / "ledger.json")
+          before = json.loads((tmp / "ledger.json").read_text())["entries"]
+
+          # A genuinely separate process restores it and appends one event.
+          script = (
+              "import json,sys\n"
+              "from contextmesh.execute import RunLedger, Event\n"
+              "led = RunLedger.load_json(sys.argv[1], expect_head=sys.argv[2])\n"
+              "assert led.head == sys.argv[2]\n"
+              "assert led.verify()\n"
+              "h = led.head\n"
+              "e = led.record(3, Event.AUDITED, 'hash_password', 'bcrypt holds')\n"
+              "assert e.compute_digest(h) == e.digest, 'new entry did not chain from the old head'\n"
+              "led.save_json(sys.argv[1])\n"
+              "print(json.dumps({'restored': h, 'new_head': led.head}))\n"
+          )
+          out = subprocess.run([sys.executable, "-c", script, str(tmp / "ledger.json"), committed],
+                               capture_output=True, text=True, timeout=60)
+          if out.returncode != 0:
+              raise SystemExit("::error::" + out.stderr.strip().splitlines()[-1])
+          result = json.loads(out.stdout)
+          print(" process B restored head:  ", result["restored"][:32], "...")
+          assert result["restored"] == committed
+
+          after = json.loads((tmp / "ledger.json").read_text())["entries"]
+          assert after[: len(before)] == before, "the restored prefix was rewritten"
+          print(" prefix after the append:  ", len(before), "entries, byte-identical")
+          print(" head moved on to:         ", result["new_head"][:32], "...")
+          print("RESTORED THE EXACT COMMITTED HEAD")
+          EOF
+          grep -q "RESTORED THE EXACT COMMITTED HEAD" /tmp/cont.txt
+
+      - name: Edit, delete and reorder are refused; a reforged chain needs the anchor
+        run: |
+          python - <<'EOF' | tee /tmp/tamper.txt
+          from contextmesh.execute import (
+              RunLedger, LedgerEntry, Event, LedgerIntegrityError,
+          )
+
+          def build():
+              led = RunLedger()
+              led.record(1, Event.EXECUTED, "hash_password", "argon2id", data={"hasher": "Argon2id"})
+              led.record(1, Event.DISPROVED, "hash_password", "CVE-2026-9999")
+              led.record(1, Event.INVALIDATED, "auth_routes", "ground removed")
+              led.record(2, Event.EXECUTED, "hash_password", "bcrypt", data={"hasher": "Bcrypt"})
+              return led
+
+          def reseal(snap):
+              """What an attacker with write access does: recompute everything."""
+              prev = RunLedger.GENESIS
+              for i, row in enumerate(snap["entries"], start=1):
+                  row["seq"] = i
+                  e = LedgerEntry(seq=i, round=row["round"], event=Event(row["event"]),
+                                  task=row["task"], detail=row["detail"],
+                                  node_id=row["node_id"], assumption_id=row["assumption_id"],
+                                  data=row["data"])
+                  row["digest"] = e.compute_digest(prev)
+                  prev = row["digest"]
+              snap["head"] = prev
+              return snap
+
+          trusted = build().head
+
+          def refused(label, snap, anchor=None):
+              try:
+                  RunLedger.from_snapshot(snap, expect_head=anchor)
+              except LedgerIntegrityError as exc:
+                  print(" %-34s REFUSED - %s" % (label, str(exc)[:64]))
+                  return True
+              print(" %-34s ACCEPTED" % label)
+              return False
+
+          a = build().snapshot()
+          a["entries"][0]["data"]["hasher"] = "Bcrypt"
+          assert refused("A. edit a historical entry", a)
+
+          b = build().snapshot()
+          del b["entries"][2]
+          for i, row in enumerate(b["entries"], start=1):
+              row["seq"] = i
+          assert refused("B. delete + renumber", b)
+
+          c = build().snapshot()
+          c["entries"][1], c["entries"][2] = c["entries"][2], c["entries"][1]
+          for i, row in enumerate(c["entries"], start=1):
+              row["seq"] = i
+          assert refused("C. reorder", c)
+
+          # D. The one internal consistency cannot see.
+          d = build().snapshot()
+          d["entries"][0]["data"]["hasher"] = "Bcrypt"
+          d = reseal(d)
+          forged = RunLedger.from_snapshot(d)
+          assert forged.verify(), "the forged chain should verify - that is the point"
+          print(" D. reforge every digest            ACCEPTED by verify(), head %s..." % d["head"][:16])
+          assert refused("D. reforge, against trusted head", d, anchor=trusted)
+          print(" trusted head was               %s..." % trusted[:16])
+          print("TAMPER EVIDENT, CONTINUITY ANCHORED")
+          EOF
+          grep -q "TAMPER EVIDENT, CONTINUITY ANCHORED" /tmp/tamper.txt
+
+      - name: A corrupt or foreign ledger file is refused, not half-loaded
+        run: |
+          python - <<'EOF' | tee /tmp/refuse.txt
+          import json, tempfile
+          from pathlib import Path
+          from contextmesh.execute import RunLedger, Event, LedgerIntegrityError
+
+          led = RunLedger()
+          led.record(1, Event.EXECUTED, "t", "d")
+          good = led.snapshot()
+
+          cases = {}
+          cases["another schema"] = dict(good, schema="contextmesh.graph")
+          cases["a future version"] = dict(good, version=99)
+          cases["a boolean version"] = dict(good, version=True)
+          cases["a truncated head"] = dict(good, head="abc")
+          for label, snap in list(cases.items()):
+              try:
+                  RunLedger.from_snapshot(snap)
+                  raise SystemExit("::error::%s was accepted" % label)
+              except LedgerIntegrityError as exc:
+                  print(" %-20s refused: %s" % (label, str(exc)[:58]))
+
+          # An unsigned field is refused rather than silently dropped.
+          extra = json.loads(json.dumps(good))
+          extra["entries"][0]["approved_by"] = "someone"
+          try:
+              RunLedger.from_snapshot(extra)
+              raise SystemExit("::error::an unsigned field was accepted")
+          except LedgerIntegrityError as exc:
+              print(" %-20s refused: %s" % ("an unsigned field", str(exc)[:58]))
+
+          # NaN never reaches a file, at either end.
+          tmp = Path(tempfile.mkdtemp()) / "l.json"
+          bad = json.loads(json.dumps(good))
+          tmp.write_text(json.dumps(bad).replace('"data": {}', '"data": {"x": NaN}', 1))
+          try:
+              RunLedger.load_json(tmp)
+              raise SystemExit("::error::NaN was parsed")
+          except LedgerIntegrityError as exc:
+              print(" %-20s refused: %s" % ("NaN in the file", str(exc)[:58]))
+          print("A BAD LEDGER FAILS CLOSED")
+          EOF
+          grep -q "A BAD LEDGER FAILS CLOSED" /tmp/refuse.txt
+
   smoke:
     name: cli · demo · export
     runs-on: ubuntu-latest
