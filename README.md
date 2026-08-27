@@ -383,8 +383,23 @@ schedule could assert one its own contents contradict.
 tasks that become ready in the same round it decides which runs first. Sorting
 the array would reorder a restored plan's execution without changing a field.
 `plan` is stored for a related reason — the source node's id and every decision
-id are derived from it, so restoring under a different string would append a
-parallel provenance trail beside the one it claims to continue.
+id are derived from it — and it is checked on the way back in. The graph must
+already hold the source that name derives to, and every decision the snapshot
+restores must cite it:
+
+```
+snapshot.plan  ──slug──►  source:execution-plan-<name>
+                                    ▲
+                                    │ CITES
+                          every restored decision
+```
+
+Change nothing but that one string and the old decisions come back under a newly
+created source; the next rerun then writes `decision:other|hashing|v2`
+superseding `decision:auth|hashing|v1`, and one lineage crosses two plans, each
+internally consistent. Both halves are native invariants rather than invented
+ones: `Runner.__init__` derives the source from `plan`, and `DecisionLog.decide`
+always draws that `CITES` edge.
 
 **References are closed at load, not left to fail later.** The assumption must
 exist in the graph, the decision must be a `DECISION`, the artefacts must be

@@ -563,25 +563,131 @@ class ReferenceClosureTest(unittest.TestCase):
         source_id = slug("execution plan: auth-restored", "source")
         self.assertNotIn(source_id, self.runner.graph.nodes)
 
-        with self.assertRaises(ExecutionSnapshotError):
+        with self.assertRaises(ExecutionSnapshotError) as caught:
             Runner.from_snapshot(
                 self.snapshot, graph=self.runner.graph, registry=deployment()
             )
+        # Assert the reason too: with a plan the graph does not know, the
+        # namespace check would also refuse this, and then the test would prove
+        # nothing about ordering. Cycles are rows-only and go first.
+        self.assertIn("dependency cycle", str(caught.exception))
         self.assertNotIn(
             source_id, self.runner.graph.nodes,
             "the refused snapshot still put its source node in the graph",
         )
 
-    def test_an_accepted_plan_does_create_its_source_node(self):
-        """The control, so the assertion above cannot pass by never being true."""
+    # ── the plan names a provenance namespace ────────────────────────────
+    def test_a_snapshot_restored_under_a_different_plan_is_refused(self):
+        """`plan` is durable because ids are derived from it — so it is checked.
+
+        Changing nothing else, the old decisions would come back under a newly
+        created source, and the next rerun would write into a second namespace
+        while superseding the first::
+
+            decision:auth|hashing|v1        the history that ran
+            decision:other|hashing|v2       supersedes it, different plan
+
+        Both look internally consistent; one lineage now crosses two plans.
+        """
         from contextmesh.model import slug
 
-        self.snapshot["plan"] = "auth-restored"
-        source_id = slug("execution plan: auth-restored", "source")
-        Runner.from_snapshot(
+        self.snapshot["plan"] = "different-plan"
+        bogus = slug("execution plan: different-plan", "source")
+        self.assertNotIn(bogus, self.runner.graph.nodes)
+
+        with self.assertRaises(ExecutionSnapshotError) as caught:
+            Runner.from_snapshot(
+                self.snapshot, graph=self.runner.graph, registry=deployment()
+            )
+        self.assertIn("different-plan", str(caught.exception))
+        self.assertNotIn(
+            bogus, self.runner.graph.nodes,
+            "the refused snapshot still created its source node",
+        )
+
+    def test_the_untouched_plan_still_restores(self):
+        """The control: the rule refuses the tampered plan, not every plan."""
+        restored = Runner.from_snapshot(
             self.snapshot, graph=self.runner.graph, registry=deployment()
         )
-        self.assertIn(source_id, self.runner.graph.nodes)
+        self.assertEqual(restored.plan, "auth")
+        self.assertIs(restored.source, self.runner.source)
+
+    def test_a_decision_produced_under_another_plan_is_refused(self):
+        """The second half: the source exists, but this decision is not its.
+
+        Reached by giving one task a decision that belongs to a different plan
+        in the same graph — the source check alone would pass.
+        """
+        elsewhere = Runner("elsewhere", graph=self.runner.graph, registry=deployment())
+        elsewhere.task("schema", worker_key="auth.schema.v1",
+                       assumes="sqlite is fine", produces=("Schema",))
+        elsewhere.run()
+
+        self.row("schema")["node_id"] = elsewhere["schema"].node_id
+        with self.assertRaises(ExecutionSnapshotError) as caught:
+            Runner.from_snapshot(
+                self.snapshot, graph=self.runner.graph, registry=deployment()
+            )
+        self.assertIn("does not cite plan", str(caught.exception))
+
+    def test_a_non_source_node_squatting_the_plan_slug_is_refused(self):
+        """The graph is untrusted input, and the slug is not reserved.
+
+        `add_node` takes an explicit id, so a node of any type can occupy
+        `source:execution-plan-<name>`. Checking the type costs nothing and the
+        alternative is a plan that restores against something that merely has
+        the right name.
+        """
+        from contextmesh.model import slug
+
+        graph = ContextGraph()
+        impostor = graph.add_node(
+            NodeType.ENTITY, "impostor", id=slug("execution plan: auth", "source")
+        )
+        self.assertIs(impostor.type, NodeType.ENTITY)
+
+        for row in self.snapshot["tasks"]:
+            row["node_id"], row["artefacts"] = None, []
+            row["state"], row["attempt"] = "pending", 0
+        for task in self.runner.tasks:
+            ground = self.runner.graph.assumptions[task.assumption_id]
+            graph.assumptions[ground.id] = ground
+
+        with self.assertRaises(ExecutionSnapshotError) as caught:
+            Runner.from_snapshot(self.snapshot, graph=graph, registry=deployment())
+        self.assertIn("is a entity, not a source", str(caught.exception))
+
+    def test_the_provenance_link_is_read_as_history_not_as_a_live_query(self):
+        """Why the cite check passes `live_only=False`.
+
+        `out_edges(live_only=True)` hides an edge whose *target* is not live, and
+        a node stops being live once it is invalidated or pruned. A decision
+        citing this plan is a fact about what happened; invalidating something
+        afterwards does not unmake it, and a restore should not start failing
+        because of it.
+        """
+        self.runner.source.invalidated = True
+        self.assertFalse(self.runner.source.live)
+
+        restored = Runner.from_snapshot(
+            self.snapshot, graph=self.runner.graph, registry=deployment()
+        )
+        self.assertEqual(restored.plan, "auth")
+
+    def test_the_source_link_is_a_native_invariant_not_an_invented_one(self):
+        """`DecisionLog.decide` always draws it, so checking it checks the engine."""
+        from contextmesh.model import EdgeType
+
+        for task in self.runner.tasks:
+            if task.node_id is None:
+                continue
+            cited = [
+                edge.dst for edge in self.runner.graph.out_edges(
+                    task.node_id, [EdgeType.CITES], live_only=False
+                )
+            ]
+            self.assertIn(self.runner.source.id, cited, task.name)
 
     def test_a_stale_task_on_an_invalidated_decision_restores_fine(self):
         restored = Runner.from_snapshot(

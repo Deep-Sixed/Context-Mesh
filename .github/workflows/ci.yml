@@ -1232,12 +1232,28 @@ jobs:
           cases.append(("done with no decision", bad, None, None))
           bad = copy.deepcopy(good); bad["tasks"][0]["attempt"] = 0
           cases.append(("done after no attempts", bad, None, None))
+          bad = copy.deepcopy(good); bad["plan"] = "a-different-plan"
+          cases.append(("a plan the graph never ran", bad, None, None))
           cases.append(("a different graph entirely", copy.deepcopy(good), ContextGraph(), None))
           cases.append(("a deployment without the key", copy.deepcopy(good), None, TaskRegistry()))
 
           for label, snap, graph, reg in cases:
               if not refused(label, snap, graph, reg):
                   raise SystemExit("::error::%s was accepted" % label)
+
+          # `plan` is durable because ids are derived from it, so changing only
+          # that string must not graft the old decisions onto a new namespace.
+          from contextmesh.model import slug as _slug
+          bogus = _slug("execution plan: a-different-plan", "source")
+          assert bogus not in runner.graph.nodes
+          renamed = copy.deepcopy(good); renamed["plan"] = "a-different-plan"
+          try:
+              Runner.from_snapshot(renamed, graph=runner.graph, registry=registry)
+              raise SystemExit("::error::a renamed plan was accepted")
+          except ExecutionSnapshotError:
+              pass
+          assert bogus not in runner.graph.nodes, "the renamed plan still created a source"
+          print(" %-26s and no source node landed" % "a renamed plan:")
 
           # A cycle is refused at load, not left for run() to discover -- and
           # the refusal happens before the Runner exists, so nothing lands.

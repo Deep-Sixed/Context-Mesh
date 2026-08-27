@@ -1166,6 +1166,26 @@ def _unbound(ctx: "RunContext") -> Dict[str, Any]:
     )
 
 
+def _close_dependencies(tasks: List[Task]) -> None:
+    """Resolve every ``needs`` against this same file, before anything else.
+
+    Rows only — no graph. Ordered ahead of the cycle check on purpose: a task
+    naming a dependency that is not in the snapshot would otherwise never become
+    ready in the topological walk and be reported as a cycle, which is true but
+    not the reason.
+    """
+    known = {task.name for task in tasks}
+    for task in tasks:
+        where = f"execution task {task.name!r}"
+        for need in task.needs:
+            if need not in known:
+                raise ExecutionSnapshotError(
+                    f"{where}: needs {need!r}, which is not a task in this snapshot"
+                )
+        if task.name in task.needs:
+            raise ExecutionSnapshotError(f"{where}: needs itself")
+
+
 def _refuse_dependency_cycles(tasks: List[Task]) -> None:
     """A plan that cannot be scheduled is not a plan this loader hands back.
 
@@ -1191,21 +1211,63 @@ def _refuse_dependency_cycles(tasks: List[Task]) -> None:
         )
 
 
-def _close_task_references(task: Task, *, tasks: Set[str], graph: ContextGraph) -> None:
+def _close_plan_namespace(plan: str, tasks: List[Task], graph: ContextGraph) -> None:
+    """The plan names a provenance namespace, so the graph has to agree it owns it.
+
+    ``plan`` is persisted because ids are derived from it — the source node and,
+    through ``_commit``, every decision::
+
+        slug(f"{plan}|{task.name}|v{attempt}", "decision")
+
+    So changing nothing but this one string restores the old decisions under a
+    newly created source, and the next rerun writes into a different namespace
+    while superseding the previous one. One task's lineage would then cross two
+    plans, each of which looks internally consistent.
+
+    Both halves are native invariants, not new ones: ``Runner.__init__`` derives
+    the source from ``plan``, and ``DecisionLog.decide`` always links its
+    decision to that source with CITES.
+    """
+    source_id = slug(f"execution plan: {plan}", "source")
+    source = graph.nodes.get(source_id)
+    if source is None:
+        raise ExecutionSnapshotError(
+            f"execution snapshot names plan {plan!r}, whose source {source_id!r} "
+            "is not in this graph. Ids are derived from the plan, so restoring "
+            "under a name the graph never recorded would start a second "
+            "provenance namespace beside the one this plan already has"
+        )
+    if source.type is not NodeType.SOURCE:
+        raise ExecutionSnapshotError(
+            f"execution snapshot names plan {plan!r}, but {source_id!r} is a "
+            f"{source.type.value}, not a source"
+        )
+    for task in tasks:
+        if task.node_id is None:
+            continue
+        # live_only=False on purpose: a stale task's decision is invalidated,
+        # and its provenance link is still the fact being checked.
+        cited = [
+            edge.dst
+            for edge in graph.out_edges(
+                task.node_id, [EdgeType.CITES], live_only=False
+            )
+        ]
+        if source_id not in cited:
+            raise ExecutionSnapshotError(
+                f"execution task {task.name!r}: decision {task.node_id!r} does "
+                f"not cite plan {plan!r}. It was produced under a different "
+                "plan, so this snapshot would graft one lineage onto another"
+            )
+
+
+def _close_task_references(task: Task, *, graph: ContextGraph) -> None:
     """Every id a restored task names has to point at something, now.
 
     A dangling reference that loads quietly becomes a crash three rounds later,
     in code that has no idea a file was involved.
     """
     where = f"execution task {task.name!r}"
-    for need in task.needs:
-        if need not in tasks:
-            raise ExecutionSnapshotError(
-                f"{where}: needs {need!r}, which is not a task in this snapshot"
-            )
-    if task.name in task.needs:
-        raise ExecutionSnapshotError(f"{where}: needs itself")
-
     assert task.assumption_id is not None  # _task_from_row proved it
     assumption = graph.assumptions.get(task.assumption_id)
     if assumption is None:
@@ -1890,10 +1952,17 @@ class Runner:
             seen.add(task.name)
             tasks.append(task)
 
-        # Then references, which need the whole set and the live graph.
-        for task in tasks:
-            _close_task_references(task, tasks=seen, graph=graph)
+        # Rows-only checks first, each ordered so a failure reports its own
+        # cause: a dependency on nothing is not a cycle, and a cycle is not a
+        # dangling reference.
+        _close_dependencies(tasks)
         _refuse_dependency_cycles(tasks)
+
+        # Then the graph: each task's own ids, then the plan that has to own
+        # the provenance all of them sit in.
+        for task in tasks:
+            _close_task_references(task, graph=graph)
+        _close_plan_namespace(plan, tasks, graph)
 
         # Then code, which is the one thing the file never carried.
         for task in tasks:
