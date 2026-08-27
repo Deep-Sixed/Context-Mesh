@@ -747,8 +747,15 @@ class RefusalTest(unittest.TestCase):
     def test_wrong_schema(self):
         self.refuses(self.edit_session(schema="contextmesh.graph"), "not a")
 
-    def test_unsupported_version(self):
-        self.refuses(self.edit_session(version=2), "cannot be read by this build")
+    def test_a_version_from_the_future_is_refused(self):
+        """v1 and v2 are readable; anything beyond is not.
+
+        A newer file could hold companions this build knows nothing about, and
+        reading it would silently drop them — the same reason an unknown field
+        is refused rather than ignored.
+        """
+        self.refuses(self.edit_session(version=3), "cannot be read by this build")
+        self.refuses(self.edit_session(version=99), "cannot be read by this build")
 
     def test_version_true_is_not_version_one(self):
         self.refuses(self.edit_session(version=True), "must be an integer")
@@ -814,7 +821,13 @@ class RefusalTest(unittest.TestCase):
         self.refuses(mutate, "outside the session directory")
 
     def test_filename_must_be_a_string(self):
-        self.refuses(self.edit_session(graph=None), "must be a string")
+        self.refuses(self.edit_session(graph=7), "must be a string")
+        self.refuses(self.edit_session(resolver=["graph-000001.json"]), "must be a string")
+
+    def test_a_required_companion_cannot_be_null(self):
+        """Null is how v2 says "no execution"; it is not a thing a graph may be."""
+        self.refuses(self.edit_session(graph=None), "names no graph")
+        self.refuses(self.edit_session(resolver=None), "names no resolver")
 
     def test_a_name_that_is_not_this_generation_is_refused(self):
         """Caught before existence: the name itself is wrong for the counter."""

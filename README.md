@@ -212,6 +212,316 @@ so `lineage()` still answers "what did we used to believe, and why did we stop".
 Until that repair happens the task is *blocked*, not run: nothing executes on
 ground the graph knows to be false.
 
+### Durable identity — a checkpoint holds a name, not a callable
+
+A task's `run` is a Python function, and a function dies with the process that
+made it. So a task can also carry a *key*: a string a later process looks up in
+its own `TaskRegistry` to get a callable back.
+
+```python
+registry = TaskRegistry()
+registry.register_worker("auth.hash.argon2.v1", argon2_hasher)
+registry.register_auditor("auth.hash.audit.v1", advisory_auditor)
+
+runner = Runner("auth", registry=registry)
+runner.task(
+    "hash_password",
+    worker_key="auth.hash.argon2.v1",
+    auditor_key="auth.hash.audit.v1",
+    assumes="Argon2 has no open advisory",
+)
+```
+
+**One Runner, one registry.** The registry belongs to the Runner, and there is
+deliberately no per-task or per-repair `registry=`. A checkpoint records the key
+and not the table it was resolved through, so two tables in one plan would let
+the same string mean argon2 in the file and bcrypt at runtime — and a restore
+would pick whichever one it was handed. `rebind(new_registry)` is the one way to
+change it: every task is resolved first, and only if all of them succeed are the
+callables and the registry adopted together. A task inside a Runner rebinds
+through that Runner for the same reason — pointing one task at a foreign table
+is the same hole reached one task at a time. To run different code, use a
+different key.
+
+**A key never becomes an import.** The route from string to callable is a table
+this process filled in deliberately — no module path, no qualified name, no
+pickle, no fallback to a similar key. A deployment that never registered
+`auth.hash.bcrypt.v1` cannot resume a checkpoint naming it, and says so with the
+key in the message. `tests/test_registry.py` parses `execute.py` rather than
+grepping it and asserts the module imports no loader and calls nothing that
+turns text into behaviour.
+
+**Plain callables still work.** `runner.task("temp", run=fn, assumes=...)` runs,
+audits and invalidates exactly as before — it simply cannot be checkpointed,
+and `require_checkpointable()` says which task stopped it and why. Passing both
+`run=` and `worker_key=` is refused rather than reconciled: they are two answers
+to "which code is this", and a checkpoint would record the wrong one.
+
+**A key names one implementation for the life of the process.** Registering
+`auth.hash.v1` twice is refused even when the callable is identical, because the
+alternative is a bcrypt worker silently replacing an argon2 one at startup.
+Workers and auditors keep separate namespaces — they carry different authority,
+since an auditor may disprove an assumption and a worker may not — and a key
+found in the wrong one says so rather than reporting a plain absence.
+
+**The load-bearing case is a repair that outlives the process:**
+
+```
+argon2 → CVE → auditor disproves → repair to bcrypt → checkpoint → process dies
+                                                                        ↓
+                                              restore must bind bcrypt, not argon2
+```
+
+which is why repairing a keyed task with a bare `run=` is refused. The task
+would run bcrypt while its checkpoint still said argon2, and the next restore
+would faithfully resurrect the worker the CVE was about. `repair(...,
+worker_key="auth.hash.bcrypt.v1")` moves both halves together, and
+`ArgonToBcryptTest` walks the whole sequence across two runners with nothing
+shared but the two strings — checkpointing at the dangerous boundary, with the
+repair done and bcrypt not yet executed, since that is the state a crash is
+likeliest to catch and the only one that proves `repair()` moved the durable key
+rather than some later run doing it.
+
+A key is text with no whitespace and no control characters — not a naming
+scheme, since dots and versions are conventions you pick, but enough that the
+identifier survives a log line, a shell word and a diff unsplit.
+
+`registry.describe()` returns the keys and only the keys, so a deployment can
+answer "this checkpoint cannot resume here because I lack
+`auth.hash.bcrypt.v1`" without exposing a route back to the code.
+
+### A restored ledger has to be *the* ledger, not *a* ledger
+
+`ledger.snapshot()` writes a versioned container — `contextmesh.runledger` v1 —
+carrying the schema, the version, every entry, and the head:
+
+```json
+{ "schema": "contextmesh.runledger", "version": 1,
+  "head": "b881a2c2…", "entries": [ … ] }
+```
+
+The head is stored even though it is the last entry's digest, so a truncated
+array is a contradiction the loader names rather than a shorter history it would
+accept. `RunLedger.from_snapshot()` takes each entry **exactly as written** and
+then checks it. It does not replay `record()`, and that distinction is the whole
+design: replaying recomputes each digest from whatever the file says, so an
+edited entry comes back with a freshly consistent digest and a chain that
+verifies — the loader meant to catch the tamper would launder it.
+
+What the chain proves, and what it does not:
+
+```
+edit an entry     → its digest no longer recomputes      REFUSED
+delete an entry   → the next one's previous is wrong     REFUSED
+reorder entries   → seq and previous both disagree       REFUSED
+rebuild the lot   → internally perfect                   ACCEPTED
+```
+
+That last row is not a hole; it is what a hash chain is. Anyone who can rewrite
+every entry can recompute every digest, and no amount of self-checking
+distinguishes that chain from the original — a fully reforged ledger passes
+`verify()`. What distinguishes them is a head you trusted *before* the file
+could be rewritten:
+
+```
+        trusted head H
+              │
+   A → B  → C  → D          the history that ran
+   A → B' → C' → D'         every entry and digest rewritten
+              │
+        head H' ≠ H
+```
+
+Pass it as `from_snapshot(data, expect_head=H)` and the forgery is refused,
+because the honest history and its digest already exist, so producing a
+*different* history ending in that same digest is a SHA-256 **second** preimage. Omit it and you get tamper *evidence* — modification, deletion,
+reordering — but not continuity. This is why the restored head being the *exact*
+committed head is the load-bearing invariant, rather than the restored chain
+merely hashing correctly.
+
+Everything the digest covers is validated before an entry is constructed: the
+schema and version exactly, `seq` contiguous from 1, `round` a non-negative
+integer, the event one this build knows, the nullable ids a string or null, the
+payload canonical JSON, and both digests 64 lowercase hex characters. An unknown
+field is refused rather than dropped — the digest covers a fixed set, so
+anything extra is content the chain does not sign. The container is exact for
+the same reason: a v1 file carrying `approved_by` or an `external_anchor` holds
+meaning a v1 reader would silently discard, and a later version giving those
+names semantics would then disagree with every v1 reader about the same bytes.
+
+Duplicate JSON keys are refused too, at every depth — container, entry and the
+signed `data` payload. Python's parser keeps the last value, others keep the
+first, and some reject the document; a digest is only meaningful if every reader
+agrees which JSON value it was taken over, and this file is meant to be
+re-checkable by an implementation that is not this one.
+
+### A restored plan has to schedule the same work
+
+`runner.snapshot()` writes `contextmesh.execution` v1 — the plan's semantic
+state, and nothing that can be derived from it:
+
+```json
+{ "schema": "contextmesh.execution", "version": 1,
+  "plan": "auth", "round": 2, "tasks": [ … ] }
+```
+
+Each task carries its name, title, rationale, state, attempt, ground, `needs`,
+`produces`, both durable keys, its decision and assumption ids, its output and
+its artefacts. Three things are deliberately absent:
+
+```
+run / audit    rebuilt from the keys, through the Runner's registry
+ready/blocked  recomputed — facts about a round, not about a task
+the registry   deployment configuration, never file state
+```
+
+`TaskState` has no `BLOCKED` member for the same reason: being blocked is
+decided every round from state, ground and dependencies. A file that stored a
+schedule could assert one its own contents contradict.
+
+**Task order is not sorted.** `_ready()` walks declaration order, so for two
+tasks that become ready in the same round it decides which runs first. Sorting
+the array would reorder a restored plan's execution without changing a field.
+`plan` is stored for a related reason — the source node's id and every decision
+id are derived from it — and it is checked on the way back in. The graph must
+already hold the source that name derives to, and every decision the snapshot
+restores must cite it:
+
+```
+snapshot.plan  ──slug──►  source:execution-plan-<name>
+                                    ▲
+                                    │ CITES
+                          every restored decision
+```
+
+Change nothing but that one string and the old decisions come back under a newly
+created source; the next rerun then writes `decision:other|hashing|v2`
+superseding `decision:auth|hashing|v1`, and one lineage crosses two plans, each
+internally consistent. Both halves are native invariants rather than invented
+ones: `Runner.__init__` derives the source from `plan`, and `DecisionLog.decide`
+always draws that `CITES` edge.
+
+**References are closed at load, not left to fail later.** The assumption must
+exist in the graph, the decision must be a `DECISION`, the artefacts must be
+`ENTITY` nodes, and every `needs` must name a task in the same file. Two facts written twice have to
+agree: `assumes` is what the task reports and `assumption_id` is what the
+scheduler and the auditor read, so a file holding them in disagreement would
+restore a plan that shows one ground and runs on another. Ids are content
+slugged (sha1 of the statement), so a real binding cannot drift there by
+accident — and `assumption_id` is not nullable, because `Runner.task` binds one
+at declaration and an unbound task could only ever block.
+
+**DONE is a claim about provenance**, so it carries obligations the other states
+do not:
+
+```
+DONE    → must name a decision, attempt ≥ 1, ground not rejected,
+          decision not invalidated
+STALE   → may point at an invalidated decision — that is exactly what
+          selective invalidation leaves behind
+PENDING → no decision, no attempts
+FAILED  → no decision, no attempts
+```
+
+That asymmetry is measured against the live lifecycle rather than assumed. Only
+DONE is constrained: `_commit` creates the decision and only then marks the task
+done, so done-without-one is unreachable — and dangerous, since `_ready` skips
+DONE tasks and a restored plan would cache work as complete that the graph has
+no record of. Over-constraining the others would refuse plans the engine really
+produces.
+
+**A plan that cannot be scheduled is not a plan.** Dependency cycles are refused
+at load rather than left for `run()` to discover, and the check happens before
+the Runner is constructed, so a refused snapshot does not even leave its source
+node behind in the graph.
+
+The load-bearing case is the awkward one — repaired but not yet rerun:
+
+```
+argon2 green → CVE → recheck → hashing, routes STALE; schema, tokens DONE
+                                    ↓
+                          repair hashing → bcrypt
+                                    ↓
+                              CHECKPOINT          bcrypt has never run
+                                    ↓
+                    restore → same ready set, same attempts
+                                    ↓
+                    run() → only the stale closure moves
+```
+
+A restored plan and one carried forward in memory are compared task by task
+after `run()` — same states, same attempt counts, same outputs.
+
+### One session, four companions, one commit
+
+Session v1 held a graph and the resolver that reads it. **v2 adds the execution
+plan and its run ledger**, so a restart brings back not just what is known but
+what was being done about it:
+
+```
+session/
+  session.json          the manifest, and the only thing that commits
+  graph-000003.json     what is known
+  resolver-000003.json  how a question finds it
+  execution-000003.json the plan, mid-repair
+  runledger-000003.json the record of it getting there
+```
+
+All four land in fresh files and are renamed into place; the manifest swap is
+still the single atomic commit, so a crash anywhere in between leaves the
+previous generation serving exactly as before. `execution` and `ledger` are
+`null` rather than absent when a session carries no plan — a reader can tell
+"no execution" from "field missing" — and a plan and its ledger are committed
+together or not at all.
+
+**The interesting failures are between the files.** Each companion already
+refuses its own corruption, and every one of those checks can pass while the
+four describe different runs. So the session boundary adds only what needs the
+pair:
+
+```
+graph ↔ resolver     already: every resolved id is a node of the right type
+plan  ↔ graph        already: references close, plan owns its namespace
+ledger ↔ plan        new: every entry names a task the plan holds, and no
+                     entry sits in a round the plan never reached
+ledger ↔ graph       new: every node_id and assumption_id an entry cites
+                     exists — a verified chain says nothing about that
+```
+
+Kept to what the engine guarantees. The ledger holds no entry for a task that
+has not run, and many for one that has, so neither count is an invariant. Nor is
+there an event-shape matrix: which events carry which ids is not universal, so
+only the ids that are *present* are required to resolve.
+
+**The manifest commits to a history, not a filename.** 7B showed a whole chain
+can be rewritten and still verify, so `"ledger": "runledger-000003.json"` on its
+own commits to nothing — swap the file for another internally perfect ledger and
+the session loads a different history under the same generation. The manifest
+records `ledger_head` and restores with `expect_head=`:
+
+```
+session.json
+     ├── graph-N          ┐
+     ├── resolver-N       │ one generation
+     ├── execution-N      │
+     └── ledger-N ────────┘  and it must end at ledger_head
+```
+
+To be exact about what that buys: **this is not authentication.** A writer who
+can rewrite the ledger can rewrite the manifest beside it, and a plausible
+resealed history whose ids all resolve is accepted — there is a test asserting
+that, so nobody reads the guard as stronger than it is. What the head stops is a
+change to *one* companion quietly redefining a committed generation.
+
+**A directory cannot carry a registry.** A key means something only because a
+running process was configured to say so, so a session holding an execution is
+restorable only by a deployment that brings one — `Session.load(path,
+registry=...)`, and a clear refusal naming the missing key otherwise.
+
+A **v1 directory still loads**, as a session with no execution, and the next
+save upgrades it. A version from the *future* is still refused: this build
+cannot know what it would be dropping.
+
 ### The standalone control layer
 
 `examples/assumption_control_layer.py` is the original single-file sketch of
@@ -630,7 +940,7 @@ contextmesh_mcp/             read-only MCP server (optional extra, 3.10+)
 dashboard/                   the rebuilt dashboard
 docs/                        the capture spec and the architecture notes
 examples/                    the original standalone control-layer sketch
-tests/                       422 tests over the invariants above
+tests/                       470 tests over the invariants above
 ```
 
 ## Staying publishable

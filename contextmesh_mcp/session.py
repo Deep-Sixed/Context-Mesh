@@ -10,22 +10,17 @@ A session on disk is a *directory*, not a file::
       session.json           the manifest, and the commit point
       graph-000003.json      contextmesh.graph    v1 (contextmesh/graph.py)
       resolver-000003.json   contextmesh.resolver v1 (contextmesh/resolve.py)
+      execution-000003.json  contextmesh.execution v1 (contextmesh/execute.py)
+      runledger-000003.json  contextmesh.runledger v1 (contextmesh/execute.py)
 
-Three formats rather than one, because they are versioned by three different
-concerns. Graph snapshot v1 is closed: query-resolution state is not graph
-state, and folding the resolver into it would have meant reopening a settled
-format every time the resolver learned a new field. The session file is the
-join, and it is the only place that can check the invariants neither of the
-other two can see on its own — that the entities the resolver resolves *to*
-are entities the graph actually has, under the labels the graph gives them.
+The session file is the join, and it is the only place that can check the
+invariants the companions cannot see on their own. Session v1 held graph and
+resolver; v2 adds the execution plan and its run ledger.
 
-**Generations, because a session gets overwritten.** Writing three files in
-sequence is safe the first time and unsafe every time after: crash between the
-graph and the resolver and the directory holds a new graph beside an old
-resolver, a pairing that never existed and may still pass every check made on
-it. So a save never overwrites a live file. It writes a whole new generation
-under new names, and only then replaces ``session.json`` — one ``os.replace``,
-which the filesystem makes atomic. The manifest is the commit:
+**Generations, because a session gets overwritten.** A save never overwrites a
+live companion. It writes a whole new generation under new names, and only then
+replaces ``session.json`` — one ``os.replace``, which the filesystem makes
+atomic. The manifest is the commit:
 
     crash before the swap  →  the previous generation is still named, intact
     crash during the swap  →  one manifest or the other, never half of one
@@ -39,6 +34,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import stat
 import tempfile
@@ -50,6 +46,12 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from contextmesh.assumptions import AssumptionLedger
 from contextmesh.demo import run as demo_run
+from contextmesh.execute import (
+    ExecutionError,
+    RunLedger,
+    Runner,
+    TaskRegistry,
+)
 from contextmesh.graph import ContextGraph
 from contextmesh.model import NodeType
 from contextmesh.resolve import Resolver
@@ -60,7 +62,15 @@ DEFAULT_ROUNDS = 8
 #: The session directory's own format. Bump for any change that makes a
 #: directory this build writes unreadable to an older one, or vice versa.
 SESSION_SCHEMA = "contextmesh.session"
-SESSION_VERSION = 1
+SESSION_VERSION = 2
+
+#: Versions this build can *read*. It writes ``SESSION_VERSION`` and only that.
+#: v1 held a graph and a resolver; v2 adds the execution plan and its run
+#: ledger. A v1 directory is a real thing this project shipped, so it is read
+#: rather than orphaned — as a session with no execution — and the next save
+#: upgrades it. A version from the *future* is still refused: this build cannot
+#: know what it would be dropping.
+READABLE_VERSIONS = (1, 2)
 
 SESSION_FILE = "session.json"
 LOCK_FILE = "session.lock"
@@ -71,6 +81,30 @@ STAGING_PREFIX = ".staging-"
 STAGING_SUFFIX = ".tmp"
 GRAPH_STEM = "graph"
 RESOLVER_STEM = "resolver"
+EXECUTION_STEM = "execution"
+RUNLEDGER_STEM = "runledger"
+
+#: The companions a manifest can name, and the stem each generation uses. Order
+#: matters only for reading errors; the manifest is the commit point either way.
+COMPANIONS = (
+    ("graph", GRAPH_STEM),
+    ("resolver", RESOLVER_STEM),
+    ("execution", EXECUTION_STEM),
+    ("ledger", RUNLEDGER_STEM),
+)
+
+#: The two a session cannot be without.
+REQUIRED_COMPANIONS = ("graph", "resolver")
+
+#: A versioned durable format has an exact vocabulary. v1 is kept separately so
+#: the compatibility promise does not quietly teach an old format new fields.
+_SESSION_V1_KEYS = frozenset(
+    {"schema", "version", "generation", "rounds", "walker", "graph", "resolver"}
+)
+_SESSION_V2_KEYS = frozenset(
+    _SESSION_V1_KEYS | {"execution", "ledger", "ledger_head"}
+)
+_LEDGER_HEAD_RE = re.compile(r"^[0-9a-f]{64}$")
 
 #: How often a served session is written back. ``every-ask`` is the default
 #: because a question is a write here and a lost write is silent; the cost is
@@ -134,6 +168,71 @@ class SessionError(ValueError):
 
 def _no_session_constants(value: str) -> float:
     raise SessionError(f"session.json contains the non-JSON constant {value!r}")
+
+
+def _strict_session_object(pairs: Any) -> Dict[str, Any]:
+    """Build one JSON object, refusing a name that appears twice at any depth."""
+    result: Dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise SessionError(f"session.json contains duplicate JSON key {key!r}")
+        result[key] = value
+    return result
+
+
+def _exact_session_keys(data: Dict[str, Any], version: int) -> None:
+    expected = _SESSION_V1_KEYS if version == 1 else _SESSION_V2_KEYS
+    actual = set(data)
+    missing = sorted(expected - actual)
+    unknown = sorted(actual - expected)
+    if missing:
+        raise SessionError(
+            f"{SESSION_FILE} is missing " + ", ".join(repr(name) for name in missing)
+        )
+    if unknown:
+        raise SessionError(
+            f"session version {version} does not define "
+            + ", ".join(repr(name) for name in unknown)
+        )
+
+
+def _declared_ledger_head(data: Dict[str, Any], version: int) -> Optional[str]:
+    """Validate the v2 execution/ledger/head unit and return its trusted head."""
+    if version == 1:
+        return None
+
+    execution = data["execution"]
+    ledger = data["ledger"]
+    head = data["ledger_head"]
+    has_execution = execution is not None
+    has_ledger = ledger is not None
+    has_head = head is not None
+
+    if has_execution != has_ledger:
+        present = "execution" if has_execution else "ledger"
+        missing = "ledger" if has_execution else "execution"
+        raise SessionError(
+            f"{SESSION_FILE} names the {present} but no {missing}; a plan "
+            "and the record of it running are committed together or not at all"
+        )
+
+    if has_execution and not has_head:
+        raise SessionError(
+            "session.ledger_head must not be null when execution and ledger are present"
+        )
+    if not has_execution and has_head:
+        raise SessionError(
+            "session execution, ledger and ledger_head are one unit; the three "
+            "fields travel together"
+        )
+    if has_head and (
+        not isinstance(head, str) or _LEDGER_HEAD_RE.fullmatch(head) is None
+    ):
+        raise SessionError(
+            "session.ledger_head must be exactly 64 lowercase hexadecimal "
+            f"characters, got {head!r}"
+        )
+    return head
 
 
 def write_in_place(directory: Path, name: str, payload: str) -> Path:
@@ -470,24 +569,61 @@ class WalkerConfig:
         )
 
 
-def check_agreement(graph: ContextGraph, resolver: Resolver) -> None:
-    """The invariants that span both files, and so live in neither.
+def _reconcile_execution(
+    runner: Runner, execution: str, ledger: str, graph: ContextGraph
+) -> None:
+    """The plan and its ledger have to be about each other.
 
-    ``Resolver.from_dict`` checks that its aliases, blocks and log point at
-    entities *it* knows. It cannot check them against the graph, because it has
-    never seen the graph. Three things have to hold, and each fails differently:
+    Each is checked on its own before this — the ledger's chain verifies, the
+    plan's references close against the graph — and both can pass while
+    describing different runs. These are the facts that only make sense across
+    the pair::
 
-    - The entity **exists**. Otherwise ``Walker.seed`` treats a canonical id
-      that is not a node as an unresolved mention, so the failure surfaces as
-      "the mesh does not know about that" — a different and wrong answer.
-    - The entity **is an entity**. Resolving a mention to a claim would seed a
-      walk from the middle of the evidence rather than at a thing.
-    - The **labels match**. This is the quiet one: same id, right type, wrong
-      name. ``Resolver.canonical`` is not a display string — it is scored
-      against every mention that reaches ``near_miss``, so a resolver holding
-      ``entity:pgvector -> "HNSW"`` over a graph holding ``"pgvector"`` keeps
-      resolving, and resolves differently, with both files individually valid.
+        every ledger entry names a task the plan holds
+        no entry is recorded in a round the plan never reached
+
+    Reference existence, and no more. Which *events* carry which ids is not a
+    universal the engine guarantees — a DISPROVED entry names an assumption, an
+    EXECUTED one names a decision, and neither shape is enforced anywhere — so
+    only the ids that are present are required to point at something.
+
+    Kept to what the engine actually guarantees in the other direction too. The
+    ledger does not hold an entry for every task (a plan can be saved before
+    anything runs) and a task can appear many times (attempts, audits, repairs),
+    so neither count is an invariant and neither is asserted.
     """
+    names = {task.name for task in runner.tasks}
+    for entry in runner.ledger.entries:
+        if entry.node_id is not None and entry.node_id not in graph.nodes:
+            raise SessionError(
+                f"{ledger} entry {entry.seq} cites node {entry.node_id!r}, "
+                "which is not in this session's graph. The history refers to "
+                "provenance this graph does not hold"
+            )
+        if (
+            entry.assumption_id is not None
+            and entry.assumption_id not in graph.assumptions
+        ):
+            raise SessionError(
+                f"{ledger} entry {entry.seq} cites assumption "
+                f"{entry.assumption_id!r}, which is not in this session's graph"
+            )
+        if entry.task not in names:
+            raise SessionError(
+                f"{ledger} records {entry.task!r} at entry {entry.seq}, which is "
+                f"not a task in {execution}. The plan and its history are from "
+                "different runs"
+            )
+        if entry.round > runner.round:
+            raise SessionError(
+                f"{ledger} records entry {entry.seq} in round {entry.round}, but "
+                f"{execution} has only reached round {runner.round}. The history "
+                "runs ahead of the plan it belongs to"
+            )
+
+
+def check_agreement(graph: ContextGraph, resolver: Resolver) -> None:
+    """The invariants that span both files, and so live in neither."""
     for entity_id, label in sorted(resolver.canonical.items()):
         node = graph.nodes.get(entity_id)
         if node is None:
@@ -515,24 +651,13 @@ class Session:
     walker: Walker
     ledger: AssumptionLedger
     rounds: int = DEFAULT_ROUNDS
-    #: Where this session came from, for ``describe()``. Set by the builders.
     source: str = "bundled demo corpus"
     path: Optional[Path] = field(default=None, repr=False)
-    #: The generation this session was loaded at, or last committed. 0 means
-    #: it has never been on disk.
     generation: int = 0
+    runner: Optional[Runner] = None
 
     @classmethod
     def build(cls, rounds: int = DEFAULT_ROUNDS) -> "Session":
-        """Build the bundled demo graph.
-
-        The ledger comes from the demo run rather than being constructed fresh.
-        Not for lineage: ``lineage()`` walks ``supersedes`` on the graph's own
-        assumption records, so a new ``AssumptionLedger`` over the same graph
-        reconstructs it identically. What a fresh one loses is ``history`` — the
-        recorded sequence of assume / supersede / reject events, which is not
-        derivable from the graph and is worth keeping alongside it.
-        """
         result = demo_run(rounds=rounds)
         return cls(
             graph=result.graph,
@@ -542,28 +667,27 @@ class Session:
             rounds=rounds,
         )
 
-    # ── persistence ──────────────────────────────────────────────────────
     def manifest(self, generation: int) -> Dict[str, Any]:
-        return {
+        """The commit point. Names every companion this generation holds."""
+        keyed = {
             "schema": SESSION_SCHEMA,
             "version": SESSION_VERSION,
             "generation": generation,
-            "graph": generation_name(GRAPH_STEM, generation),
-            "resolver": generation_name(RESOLVER_STEM, generation),
             "rounds": self.rounds,
             "walker": WalkerConfig.of(self.walker).to_dict(),
         }
+        for field_name, stem in COMPANIONS:
+            if field_name in REQUIRED_COMPANIONS or self.runner is not None:
+                keyed[field_name] = generation_name(stem, generation)
+            else:
+                keyed[field_name] = None
+        keyed["ledger_head"] = (
+            self.runner.ledger.head if self.runner is not None else None
+        )
+        return keyed
 
     @staticmethod
     def _live_generation(directory: Path) -> int:
-        """The generation a directory is currently committed to, or 0.
-
-        Read from the manifest rather than from memory, so saving the same
-        session into two directories keeps each one's counter its own, and so a
-        directory written by another process is never rolled backwards. A
-        manifest too broken to read counts as 0 — the save that follows commits
-        a generation 1 that supersedes it wholesale.
-        """
         path = directory / SESSION_FILE
         if not path.is_file():
             return 0
@@ -577,36 +701,13 @@ class Session:
         return max(generation, 0)
 
     def save(self, directory: Any) -> Path:
-        """Commit a new generation of this session. Returns the directory.
-
-        Nothing already referenced is written to. The graph and the resolver go
-        down under names no live manifest names, each one fsynced; only then is
-        ``session.json`` replaced, in a single ``os.replace``. Until that call
-        the directory still reads as the previous generation, and after it the
-        new one is whole — so there is no instant at which a reader can see a
-        graph from one save beside a resolver from another.
-
-        Superseded files are removed afterwards. That cleanup is the only step
-        allowed to fail without losing the save.
-
-        The whole transaction runs under the directory's writer lock, from
-        reading the current generation to sweeping the superseded one. Readers
-        never take it: the manifest swap already gives them a consistent view,
-        and a read that had to wait for a checkpoint would be a worse trade.
-        """
         target = Path(directory)
         target.mkdir(parents=True, exist_ok=True)
         with writer_lock(target):
             return self._commit(target)
 
     def _commit(self, target: Path) -> Path:
-        """The transaction itself. Only called holding the writer lock."""
         live = self._live_generation(target)
-        # Serialising writers stops the directory being corrupted; it does not
-        # stop the second writer from silently discarding the first one's work.
-        # A session that has a home is checked against it: if the directory
-        # moved on since this session last committed there, someone else has
-        # written, and overwriting them wholesale is not a thing to do quietly.
         if self.path is not None and target == self.path and live != self.generation:
             raise SessionError(
                 f"{target} is at generation {live} but this session last "
@@ -615,12 +716,11 @@ class Session:
             )
         generation = live + 1
         payload = self.manifest(generation)
-
-        # Every one of these lands in a fresh O_EXCL file and is renamed into
-        # place, so none of them can be written *through* something already
-        # sitting under the name. See ``write_in_place``.
         write_in_place(target, payload["graph"], self.graph.to_json())
         write_in_place(target, payload["resolver"], self.resolver.to_json())
+        if self.runner is not None:
+            write_in_place(target, payload["execution"], self.runner.to_json())
+            write_in_place(target, payload["ledger"], self.runner.ledger.to_json())
         write_in_place(
             target,
             SESSION_FILE,
@@ -630,30 +730,22 @@ class Session:
             + "\n",
         )
         _fsync_dir(target)
-
         self._sweep(
             target,
-            keep={SESSION_FILE, LOCK_FILE, payload["graph"], payload["resolver"]},
+            keep={SESSION_FILE, LOCK_FILE}
+            | {payload[name] for name, _ in COMPANIONS if payload[name] is not None},
         )
         self.generation = generation
         return target
 
     @staticmethod
     def _sweep(directory: Path, keep: Any) -> None:
-        """Delete superseded generations and abandoned staging files.
-
-        Runs after the commit, still under the writer lock, so anything it
-        removes is unreferenced and no other writer is mid-transaction.
-        Deliberately narrow: only files this build's own naming produces are
-        candidates, so a directory holding something else keeps it — the lock
-        file included, since a queued writer is holding that very inode.
-        """
         for entry in directory.iterdir():
             name = entry.name
             if name in keep or not entry.is_file():
                 continue
-            superseded = name.endswith(".json") and (
-                name.startswith(f"{GRAPH_STEM}-") or name.startswith(f"{RESOLVER_STEM}-")
+            superseded = name.endswith(".json") and any(
+                name.startswith(f"{stem}-") for _, stem in COMPANIONS
             )
             abandoned = name.startswith(STAGING_PREFIX) and name.endswith(STAGING_SUFFIX)
             if superseded or abandoned:
@@ -663,17 +755,6 @@ class Session:
                     pass
 
     def checkpoint(self) -> Path:
-        """Write what has happened since this session was loaded back to disk.
-
-        Asking a question is a write in Context Mesh — a walk moves telemetry
-        and the resolver learns aliases it did not have — so a served session
-        that is never checkpointed is a durable *starting* snapshot rather than
-        a durable session, and the difference only shows up as a quiet loss on
-        restart.
-
-        Only a loaded session has a home. A built one has nowhere to go, and
-        saying so is better than inventing a directory.
-        """
         if self.path is None:
             raise SessionError(
                 "this session was built rather than loaded, so it has no "
@@ -683,45 +764,18 @@ class Session:
         return self.save(self.path)
 
     @classmethod
-    def load(cls, directory: Any) -> "Session":
-        """Restore a session from a directory, or refuse it.
-
-        Two things are rebuilt rather than restored, and both are deliberate:
-
-        - The **ledger** is fresh. ``lineage()`` and ``blast_radius()`` read the
-          graph's own assumption records, so both come back identical; what is
-          gone is ``history``, the per-process event log.
-        - The **walk history** is empty. Per-node walk counts are in the graph
-          snapshot, so ``mesh_ask`` and every count in ``mesh_health`` restore
-          exactly — but health's ``dead_ends`` signal is computed from the walk
-          list, so it is absent until this process has walked. That gap is
-          pinned by a test rather than left to be discovered.
-
-        **Readers do not take the writer lock**, and they do not need to. The
-        manifest swap is atomic and committed companions are immutable, so a
-        pair that reads successfully is always a coherent generation — possibly
-        one older than the directory's newest, which is staleness rather than
-        corruption. What the swap alone does *not* cover is the sweep: a reader
-        holding a manifest for generation 5 can find ``graph-000005.json``
-        already deleted, and fail on a session that is perfectly healthy.
-
-        So a read that loses that race is re-read rather than reported. The
-        retry fires only when the directory's generation actually moved during
-        the attempt, which keeps a genuinely missing file failing immediately,
-        with its own message, instead of after a wait.
-        """
+    def load(
+        cls, directory: Any, *, registry: Optional[TaskRegistry] = None
+    ) -> "Session":
         target = Path(directory)
         if not target.is_dir():
             raise SessionError(f"{target} is not a session directory")
-
         for attempt in range(LOAD_ATTEMPTS):
             before = cls._live_generation(target)
             try:
-                return cls._load_once(target)
+                return cls._load_once(target, registry)
             except _Swept as swept:
                 if cls._live_generation(target) == before:
-                    # Nothing committed while we read. The file is simply not
-                    # there, and waiting will not conjure it.
                     raise SessionError(
                         f"{SESSION_FILE} names {swept.name!r} as the "
                         f"{swept.field_name}, but no such file is in the "
@@ -730,15 +784,15 @@ class Session:
                 if attempt + 1 == LOAD_ATTEMPTS:
                     raise SessionError(
                         f"{target} was committed to {LOAD_ATTEMPTS} times while "
-                        "this read was in progress; giving up rather than "
-                        "spinning"
+                        "this read was in progress; giving up rather than spinning"
                     ) from None
                 time.sleep(LOAD_BACKOFF * (attempt + 1))
         raise AssertionError("unreachable")  # pragma: no cover
 
     @classmethod
-    def _load_once(cls, target: Path) -> "Session":
-        """One attempt. Raises ``_Swept`` if a writer removed what we named."""
+    def _load_once(
+        cls, target: Path, registry: Optional[TaskRegistry] = None
+    ) -> "Session":
         session_path = target / SESSION_FILE
         if not session_path.is_file():
             raise SessionError(
@@ -747,10 +801,14 @@ class Session:
             )
         try:
             raw = session_path.read_text(encoding="utf-8")
-        except FileNotFoundError:  # pragma: no cover - vanishingly narrow
+        except FileNotFoundError:
             raise _Swept(SESSION_FILE, "manifest") from None
         try:
-            data = json.loads(raw, parse_constant=_no_session_constants)
+            data = json.loads(
+                raw,
+                parse_constant=_no_session_constants,
+                object_pairs_hook=_strict_session_object,
+            )
         except json.JSONDecodeError as exc:
             raise SessionError(f"{session_path} is not valid JSON: {exc}") from None
 
@@ -758,15 +816,7 @@ class Session:
             raise SessionError(
                 f"{SESSION_FILE} must contain an object, got {type(data).__name__}"
             )
-        for key in (
-            "schema",
-            "version",
-            "generation",
-            "graph",
-            "resolver",
-            "rounds",
-            "walker",
-        ):
+        for key in ("schema", "version"):
             if key not in data:
                 raise SessionError(f"{SESSION_FILE} is missing {key!r}")
         if data["schema"] != SESSION_SCHEMA:
@@ -776,24 +826,36 @@ class Session:
         version = data["version"]
         if isinstance(version, bool) or not isinstance(version, int):
             raise SessionError(f"session version must be an integer, got {version!r}")
-        if version != SESSION_VERSION:
+        if version not in READABLE_VERSIONS:
             raise SessionError(
                 f"session version {version!r} cannot be read by this build, "
-                f"which writes and reads version {SESSION_VERSION}"
+                f"which writes {SESSION_VERSION} and reads "
+                f"{', '.join(str(v) for v in READABLE_VERSIONS)}"
             )
+        _exact_session_keys(data, version)
+        declared_head = _declared_ledger_head(data, version)
 
         rounds = _session_int(data["rounds"], "rounds", minimum=0)
         generation = _session_int(data["generation"], "generation", minimum=1)
         config = WalkerConfig.from_dict(data["walker"])
 
-        paths = {}
-        for field_name, stem in (("graph", GRAPH_STEM), ("resolver", RESOLVER_STEM)):
+        expected_fields = [name for name, _ in COMPANIONS]
+        if version == 1:
+            expected_fields = list(REQUIRED_COMPANIONS)
+
+        paths: Dict[str, Optional[Path]] = {name: None for name, _ in COMPANIONS}
+        for field_name, stem in COMPANIONS:
+            if field_name not in expected_fields:
+                continue
+            if data[field_name] is None:
+                if field_name in REQUIRED_COMPANIONS:
+                    raise SessionError(
+                        f"{SESSION_FILE} names no {field_name}; a session "
+                        "without one is not a session"
+                    )
+                continue
             name = _bare_name(data[field_name], field_name)
             expected = generation_name(stem, generation)
-            # Not pedantry about naming. The next save computes its filenames
-            # from generation + 1, so a manifest whose names run ahead of its
-            # counter would have that save overwrite a file this one still
-            # points at — losing the very atomicity generations provide.
             if name != expected:
                 raise SessionError(
                     f"{SESSION_FILE} is at generation {generation} but names "
@@ -804,16 +866,12 @@ class Session:
             if not path.is_file():
                 raise _Swept(name, field_name)
             paths[field_name] = path
-        graph_path, resolver_path = paths["graph"], paths["resolver"]
 
-        # SnapshotError and ResolverSnapshotError are both ValueError, and both
-        # already say precisely what is wrong. Re-raising as SessionError keeps
-        # one exception type at the session boundary without losing the reason.
+        graph_path, resolver_path = paths["graph"], paths["resolver"]
+        assert graph_path is not None and resolver_path is not None
         try:
             graph = ContextGraph.load_json(graph_path)
         except FileNotFoundError:
-            # Swept between the check above and the open. Same race, one
-            # instruction later.
             raise _Swept(graph_path.name, "graph") from None
         except ValueError as exc:
             raise SessionError(f"{graph_path.name}: {exc}") from exc
@@ -826,6 +884,18 @@ class Session:
 
         check_agreement(graph, resolver)
 
+        runner = None
+        if paths["execution"] is not None:
+            assert paths["ledger"] is not None
+            assert declared_head is not None
+            runner = cls._load_execution(
+                paths["execution"],
+                paths["ledger"],
+                graph=graph,
+                registry=registry,
+                expect_head=declared_head,
+            )
+
         return cls(
             graph=graph,
             resolver=resolver,
@@ -835,20 +905,46 @@ class Session:
             source=f"session directory {target}",
             path=target,
             generation=generation,
+            runner=runner,
         )
+
+    @staticmethod
+    def _load_execution(
+        execution_path: Path,
+        ledger_path: Path,
+        *,
+        graph: ContextGraph,
+        registry: Optional[TaskRegistry],
+        expect_head: Optional[str] = None,
+    ) -> Runner:
+        if registry is None:
+            raise SessionError(
+                f"{execution_path.name} holds an execution plan, but no "
+                "TaskRegistry was given. A checkpoint names its workers and "
+                "this process has to say what those names mean; pass "
+                "registry= to Session.load"
+            )
+        try:
+            ledger = RunLedger.load_json(ledger_path, expect_head=expect_head)
+        except FileNotFoundError:
+            raise _Swept(ledger_path.name, "ledger") from None
+        except (ExecutionError, ValueError) as exc:
+            raise SessionError(f"{ledger_path.name}: {exc}") from exc
+        try:
+            runner = Runner.load_json(
+                execution_path, graph=graph, registry=registry, ledger=ledger
+            )
+        except FileNotFoundError:
+            raise _Swept(execution_path.name, "execution") from None
+        except (ExecutionError, ValueError) as exc:
+            raise SessionError(f"{execution_path.name}: {exc}") from exc
+        _reconcile_execution(runner, execution_path.name, ledger_path.name, graph)
+        return runner
 
     def assumption_ids(self) -> list:
         return sorted(self.graph.assumptions)
 
     def describe(self) -> dict:
-        """What this server is serving.
-
-        Live and total are reported separately rather than as one ``nodes``
-        number. ``type_counts()`` is live-only and ``len(graph.edges)`` is not,
-        so a single pair of counts silently compared two different things — and
-        in a graph whose whole point is that invalidated work is kept rather
-        than deleted, the gap between them is information, not noise.
-        """
         live_counts = self.graph.type_counts()
         persistent = self.path is not None
         return {
@@ -874,24 +970,7 @@ class Session:
 
 
 class Checkpointer:
-    """Decides when a served session is written back to its directory.
-
-    Lives here rather than in ``server.py`` so the policy is testable on every
-    supported version with no SDK installed — the same reason ``tools`` does.
-
-    Three policies, and the default is the expensive one on purpose:
-
-    - ``every-ask`` — commit after each question. One full serialisation per
-      question, which is real; a lost question is silent, which is worse.
-    - ``on-exit`` — commit once when the server shuts down cleanly. Cheaper,
-      and worth nothing if the process is killed rather than asked to stop.
-    - ``never`` — serve a session without writing to it. The honest choice for
-      a directory you were handed and do not own.
-
-    A session with no directory (``--demo``) cannot be checkpointed, so the
-    policy is inert rather than an error: refusing to serve a demo graph
-    because it has nowhere to save to would help nobody.
-    """
+    """Decides when a served session is written back to its directory."""
 
     def __init__(self, session: Session, policy: str = DEFAULT_CHECKPOINT) -> None:
         if policy not in CHECKPOINT_POLICIES:
@@ -901,13 +980,8 @@ class Checkpointer:
             )
         self.session = session
         self.policy = policy
-        #: Mutations recorded since the last commit. Read by ``close``, so an
-        #: ``on-exit`` server that was never asked anything writes nothing.
         self.pending = 0
         self.commits = 0
-        #: Commits skipped because another process held the writer lock. The
-        #: mutations stay pending, so nothing is lost — but a server that keeps
-        #: losing the race is a configuration problem worth being able to see.
         self.contended = 0
 
     @property
@@ -915,19 +989,12 @@ class Checkpointer:
         return self.policy != "never" and self.session.path is not None
 
     def record_mutation(self) -> Optional[Path]:
-        """Note that a read changed something, and commit if the policy says so."""
         self.pending += 1
         if self.durable and self.policy == "every-ask":
             return self.commit()
         return None
 
     def commit(self) -> Optional[Path]:
-        """Write pending mutations back, unless someone else is writing.
-
-        Contention is expected and benign — the mutations stay pending and the
-        next commit picks them up — so it is counted rather than raised. Any
-        other failure is a real problem with the directory and propagates.
-        """
         if not self.durable or not self.pending:
             return None
         try:
@@ -940,7 +1007,6 @@ class Checkpointer:
         return written
 
     def close(self) -> Optional[Path]:
-        """Last chance to commit. Safe to call more than once."""
         if self.policy == "never":
             return None
         return self.commit()
@@ -952,7 +1018,6 @@ _SESSION: Optional[Session] = None
 def session(
     rounds: int = DEFAULT_ROUNDS, *, directory: Optional[Any] = None
 ) -> Session:
-    """The process-wide session, built or loaded on first use."""
     global _SESSION
     if _SESSION is None:
         _SESSION = (
@@ -964,35 +1029,18 @@ def session(
 
 
 def adopt(opened: Session) -> Session:
-    """Install an already-opened session as the process-wide one.
-
-    ``main`` opens the session before serving so that a directory this build
-    cannot restore fails at the shell. Without this the tool handlers would
-    call ``session()`` and get a *second*, freshly built demo graph — the
-    server would report the loaded session on stderr and then answer questions
-    from a different one.
-    """
     global _SESSION
     _SESSION = opened
     return _SESSION
 
 
 def reset() -> None:
-    """Drop the cached session. Tests use this; a server does not."""
     global _SESSION
     _SESSION = None
 
 
 # ── command line ─────────────────────────────────────────────────────────
 def add_source_arguments(parser: Any) -> Any:
-    """The source flags, shared by both entry points.
-
-    Which graph you are serving is not a detail to be defaulted. ``--demo``
-    used to be what you got by saying nothing; now it has to be said, because
-    the alternative is no longer "nothing" but a real session on disk, and
-    silently serving a throwaway graph when someone meant to serve theirs is
-    the one failure this whole format exists to prevent.
-    """
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument(
         "--demo",
@@ -1028,13 +1076,6 @@ def add_source_arguments(parser: Any) -> Any:
 
 
 def open_session(args: Any) -> Session:
-    """Turn parsed source flags into a session, or explain why not.
-
-    ``--rounds`` with ``--session`` is an error rather than an ignored flag. A
-    restored session carries the round count it was built with; accepting a
-    different number here would print one figure in ``describe()`` and mean
-    another.
-    """
     if args.session is not None:
         if args.rounds is not None:
             raise SessionError(
@@ -1043,7 +1084,6 @@ def open_session(args: Any) -> Session:
             )
         return Session.load(args.session)
     if getattr(args, "checkpoint", DEFAULT_CHECKPOINT) != DEFAULT_CHECKPOINT:
-        # Accepting it silently would suggest a demo graph could be kept.
         raise SessionError(
             "--checkpoint decides when a served session is written back and has "
             "no meaning for --demo, which has no directory to write to"
@@ -1052,16 +1092,6 @@ def open_session(args: Any) -> Session:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    """Save or inspect a session, without loading the MCP SDK.
-
-        python -m contextmesh_mcp --demo --rounds 8 --save ./session
-        python -m contextmesh_mcp --session ./session
-
-    Separate from ``contextmesh-mcp`` on purpose: writing and checking a
-    session directory is not serving one, it needs no transport, and it works
-    on every Python version the core supports rather than only the ones the
-    SDK does.
-    """
     import argparse
 
     parser = add_source_arguments(
@@ -1090,7 +1120,5 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(json.dumps(opened.describe(), indent=2, sort_keys=True, default=str))
         return 0
     except SessionError as exc:
-        # Exit 2, not a traceback: a refused session is an answer, and a shell
-        # can act on it.
         print(f"contextmesh session: {exc}", file=__import__("sys").stderr)
         return 2

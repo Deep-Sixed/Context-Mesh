@@ -663,6 +663,191 @@ jobs:
           EOF
           grep -q "READER SURVIVED A CONCURRENT SWEEP" /tmp/reader.txt
 
+      - name: A session carries the plan it was mid-repair on
+        run: |
+          python - <<'EOF' | tee /tmp/v2.txt
+          import json, subprocess, sys, tempfile
+          from pathlib import Path
+          from contextmesh.execute import Runner, TaskRegistry
+          from contextmesh_mcp.session import Session
+
+          class Advisory:
+              def __init__(self): self.published = False
+              def __call__(self, ctx):
+                  if self.published and ctx.output.get("impl") == "argon2":
+                      return ctx.disproved("CVE-2026-9999 published for argon2id")
+                  return True
+
+          def deployment(advisory=None):
+              r = TaskRegistry()
+              r.register_worker("auth.schema.v1", lambda c: {"ok": True})
+              r.register_worker("auth.hash.argon2.v1", lambda c: {"impl": "argon2"})
+              r.register_worker("auth.hash.bcrypt.v1", lambda c: {"impl": "bcrypt"})
+              r.register_worker("auth.tokens.v1", lambda c: {"ok": True})
+              r.register_auditor("auth.hash.audit.v1", advisory or Advisory())
+              return r
+
+          base = Session.build(rounds=2)
+          adv = Advisory()
+          run = Runner("auth", graph=base.graph, registry=deployment(adv))
+          run.task("schema", worker_key="auth.schema.v1", assumes="sqlite is fine", produces=("Schema",))
+          run.task("hashing", worker_key="auth.hash.argon2.v1", auditor_key="auth.hash.audit.v1",
+                   assumes="Argon2 has no open advisory", needs=("schema",), produces=("Password Hasher",))
+          run.task("tokens", worker_key="auth.tokens.v1", assumes="JWT is fine",
+                   needs=("schema",), produces=("Tokens",))
+          run.run()
+          adv.published = True
+          run.recheck()
+          run.repair("hashing", assumes="bcrypt has no open advisory",
+                     worker_key="auth.hash.bcrypt.v1")
+          base.runner = run
+
+          tmp = Path(tempfile.mkdtemp()) / "session"
+          base.save(tmp)
+          manifest = json.loads((tmp / "session.json").read_text())
+          print(" manifest version:", manifest["version"])
+          assert manifest["version"] == 2
+          for field in ("graph", "resolver", "execution", "ledger"):
+              assert manifest[field] and (tmp / manifest[field]).is_file(), field
+              print("   %-10s %s" % (field, manifest[field]))
+          print(" ready at the checkpoint:", run._ready())
+
+          # A separate process restores the whole session and finishes the work.
+          script = (
+              "import json,sys\n"
+              "exec(open(sys.argv[2]).read())\n"
+              "from contextmesh_mcp.session import Session\n"
+              "adv = Advisory(); adv.published = True\n"
+              "s = Session.load(sys.argv[1], registry=deployment(adv))\n"
+              "assert s.runner is not None\n"
+              "assert s.runner._ready() == ['hashing'], s.runner._ready()\n"
+              "assert s.runner.ledger.verify()\n"
+              "head = s.runner.ledger.head\n"
+              "s.runner.run()\n"
+              "print(json.dumps({'restored_head': head, "
+              "'tasks': {t.name: [t.state.value, t.attempt, t.output] for t in s.runner.tasks}}))\n"
+          )
+          helper = tmp.parent / "defs.py"
+          helper.write_text(
+              "class Advisory:\n"
+              "    def __init__(self): self.published = False\n"
+              "    def __call__(self, ctx):\n"
+              "        if self.published and ctx.output.get('impl') == 'argon2':\n"
+              "            return ctx.disproved('CVE')\n"
+              "        return True\n"
+              "def deployment(advisory=None):\n"
+              "    from contextmesh.execute import TaskRegistry\n"
+              "    r = TaskRegistry()\n"
+              "    r.register_worker('auth.schema.v1', lambda c: {'ok': True})\n"
+              "    r.register_worker('auth.hash.argon2.v1', lambda c: {'impl': 'argon2'})\n"
+              "    r.register_worker('auth.hash.bcrypt.v1', lambda c: {'impl': 'bcrypt'})\n"
+              "    r.register_worker('auth.tokens.v1', lambda c: {'ok': True})\n"
+              "    r.register_auditor('auth.hash.audit.v1', advisory or Advisory())\n"
+              "    return r\n"
+          )
+          out = subprocess.run([sys.executable, "-c", script, str(tmp), str(helper)],
+                               capture_output=True, text=True, timeout=120)
+          if out.returncode != 0:
+              raise SystemExit("::error::" + out.stderr.strip().splitlines()[-1])
+          result = json.loads(out.stdout)
+          assert result["restored_head"] == run.ledger.head, "the ledger head moved"
+          print(" restored ledger head:", result["restored_head"][:32], "...")
+          for name, (state, attempt, output) in sorted(result["tasks"].items()):
+              print("   %-8s %-6s attempt %s  %s" % (name, state, attempt, output))
+          assert result["tasks"]["hashing"][2] == {"impl": "bcrypt"}
+          assert result["tasks"]["hashing"][1] == 2
+          for untouched in ("schema", "tokens"):
+              assert result["tasks"][untouched][1] == 1, untouched
+          print("A SESSION RESTORES THE WORK IN PROGRESS")
+          EOF
+          grep -q "A SESSION RESTORES THE WORK IN PROGRESS" /tmp/v2.txt
+
+      - name: Four companions that were never one session are refused
+        run: |
+          python - <<'EOF' | tee /tmp/v2refuse.txt
+          import json, tempfile
+          from pathlib import Path
+          from contextmesh.execute import Event, RunLedger, Runner, TaskRegistry
+          from contextmesh_mcp.session import Session, SessionError
+
+          def deployment():
+              r = TaskRegistry()
+              r.register_worker("w.v1", lambda c: {"ok": True})
+              return r
+
+          base = Session.build(rounds=2)
+          run = Runner("plan", graph=base.graph, registry=deployment())
+          run.task("only", worker_key="w.v1", assumes="x", produces=("Thing",))
+          run.run()
+          base.runner = run
+
+          tmp = Path(tempfile.mkdtemp()) / "session"
+          base.save(tmp)
+          manifest = json.loads((tmp / "session.json").read_text())
+
+          def refused(label, registry=deployment()):
+              try:
+                  Session.load(tmp, registry=registry)
+              except SessionError as exc:
+                  print(" %-30s refused: %s" % (label, str(exc)[:48]))
+                  return True
+              print(" %-30s ACCEPTED" % label)
+              return False
+
+          # A ledger that verifies perfectly, about a different run.
+          stranger = RunLedger()
+          stranger.record(1, Event.EXECUTED, "a_task_from_elsewhere", "ran")
+          assert stranger.verify(), "the stranger ledger should verify on its own"
+          (tmp / manifest["ledger"]).write_text(json.dumps(stranger.snapshot()))
+          if not refused("a ledger from another run"):
+              raise SystemExit("::error::a foreign ledger was accepted")
+          (tmp / manifest["ledger"]).write_text(json.dumps(run.ledger.snapshot()))
+
+          # The manifest commits to a history, not a filename: swapping only
+          # the ledger for another internally perfect one is refused.
+          resealed = RunLedger()
+          resealed.record(1, Event.EXECUTED, "only", "a different history")
+          assert resealed.verify(), "the replacement should verify on its own"
+          assert resealed.head != manifest["ledger_head"]
+          (tmp / manifest["ledger"]).write_text(json.dumps(resealed.snapshot()))
+          if not refused("a resealed ledger, same name"):
+              raise SystemExit("::error::a swapped ledger was accepted")
+
+          # And with the head updated too, the references still have to close.
+          for label, kwargs in (
+              ("a ledger citing no such node", {"node_id": "decision:gone"}),
+              ("a ledger citing no such ground", {"assumption_id": "assumption:gone"}),
+          ):
+              dangling = RunLedger()
+              dangling.record(1, Event.EXECUTED, "only", "ran", **kwargs)
+              (tmp / manifest["ledger"]).write_text(json.dumps(dangling.snapshot()))
+              moved = dict(manifest); moved["ledger_head"] = dangling.head
+              (tmp / "session.json").write_text(json.dumps(moved, indent=2))
+              if not refused(label):
+                  raise SystemExit("::error::%s was accepted" % label)
+          (tmp / manifest["ledger"]).write_text(json.dumps(run.ledger.snapshot()))
+          (tmp / "session.json").write_text(json.dumps(manifest, indent=2))
+
+          # A plan with no history, and a history with no plan.
+          for dropped, kept in (("ledger", "execution"), ("execution", "ledger")):
+              broken = dict(manifest); broken[dropped] = None
+              (tmp / "session.json").write_text(json.dumps(broken, indent=2))
+              if not refused("%s with no %s" % (kept, dropped)):
+                  raise SystemExit("::error::a half-committed pair was accepted")
+          (tmp / "session.json").write_text(json.dumps(manifest, indent=2))
+
+          # And the one a directory can never supply.
+          try:
+              Session.load(tmp)
+              raise SystemExit("::error::a keyed session loaded with no registry")
+          except SessionError as exc:
+              print(" %-30s refused: %s" % ("no registry at all", str(exc)[:48]))
+          if not refused("a deployment missing the key", registry=TaskRegistry()):
+              raise SystemExit("::error::a deployment without the key was accepted")
+          print("A MISMATCHED SESSION FAILS CLOSED")
+          EOF
+          grep -q "A MISMATCHED SESSION FAILS CLOSED" /tmp/v2refuse.txt
+
       - name: A graph and a resolver that were never a session together
         run: |
           rm -rf /tmp/mixed && cp -r /tmp/session /tmp/mixed
@@ -677,6 +862,606 @@ jobs:
             echo "::error::a resolver was loaded against a graph it does not match"; exit 1
           fi
           grep -q "not a node in this session's graph" /tmp/mixed.txt
+
+  registry:
+    name: registry · durable bindings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: A durable key never becomes an import
+        run: |
+          python - <<'EOF' | tee /tmp/registry.txt
+          import ast, pathlib
+          from contextmesh.execute import TaskRegistry, ExecutionCheckpointError
+
+          # Parsed rather than grepped: a prose "no pickle" in a docstring is
+          # not a defect, and a substring scan cannot tell the two apart.
+          tree = ast.parse(
+              pathlib.Path("contextmesh/execute.py").read_text(encoding="utf-8")
+          )
+          imported, called = set(), set()
+          for node in ast.walk(tree):
+              if isinstance(node, ast.Import):
+                  imported.update(a.name.split(".")[0] for a in node.names)
+              elif isinstance(node, ast.ImportFrom) and node.module:
+                  imported.add(node.module.split(".")[0])
+              elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                  called.add(node.func.id)
+          loaders = {"importlib", "pickle", "marshal", "shelve", "runpy", "imp"}
+          makers = {"eval", "exec", "compile", "__import__"}
+          assert not (loaders & imported), sorted(loaders & imported)
+          assert not (makers & called), sorted(makers & called)
+
+          # And a key shaped exactly like a module path resolves to nothing.
+          registry = TaskRegistry()
+          registry.register_worker("auth.hash.argon2.v1", lambda ctx: {})
+          for shaped in ("contextmesh.execute.demo", "os.system", "builtins.eval"):
+              try:
+                  registry.worker(shaped)
+                  raise SystemExit(f"::error::{shaped} resolved to something")
+              except ExecutionCheckpointError:
+                  pass
+          print("  no loader imported, no text turned into behaviour")
+          print("A KEY IS ONLY EVER A LOOKUP")
+          EOF
+          grep -q "A KEY IS ONLY EVER A LOOKUP" /tmp/registry.txt
+
+      - name: A repair moves the durable key before anything reruns
+        run: |
+          python - <<'EOF' | tee /tmp/argon.txt
+          from contextmesh.execute import Runner, TaskRegistry
+
+          def hasher(tag):
+              return lambda ctx: {"implementation": tag}
+
+          def deployment():
+              r = TaskRegistry()
+              r.register_worker("auth.hash.argon2.v1", hasher("argon2"))
+              r.register_worker("auth.hash.bcrypt.v1", hasher("bcrypt"))
+              r.register_auditor("auth.hash.audit.v1", lambda ctx: True)
+              return r
+
+          first = Runner("auth", registry=deployment())
+          first.task(
+              "hash_password",
+              worker_key="auth.hash.argon2.v1",
+              auditor_key="auth.hash.audit.v1",
+              assumes="Argon2 has no open advisory",
+          )
+          first.run()
+          assert first.output("hash_password")["implementation"] == "argon2"
+
+          # A CVE lands; the assumption is regrounded on bcrypt.
+          first.repair(
+              "hash_password",
+              assumes="bcrypt has no open advisory",
+              worker_key="auth.hash.bcrypt.v1",
+          )
+
+          # Deliberately no first.run(). This is the dangerous boundary: the
+          # repair is done, bcrypt has never executed, and the process dies here.
+          # Everything a checkpoint would carry across is these two strings.
+          durable = first.bindings()["hash_password"]
+          print(" durable binding:", durable)
+          assert durable["worker_key"] == "auth.hash.bcrypt.v1", (
+              "repair() did not move the durable key; only a later run would have"
+          )
+
+          second = Runner("auth", registry=deployment())
+          second.task(
+              "hash_password",
+              worker_key=durable["worker_key"],
+              auditor_key=durable["auditor_key"],
+              assumes="bcrypt has no open advisory",
+          )
+          second.run()
+          got = second.output("hash_password")["implementation"]
+          print(" restored process ran (first execution of bcrypt):", got)
+          assert got == "bcrypt", "the restore resurrected the worker the CVE was about"
+          print("REPAIRED BINDING SURVIVED THE PROCESS")
+          EOF
+          grep -q "REPAIRED BINDING SURVIVED THE PROCESS" /tmp/argon.txt
+
+      - name: One durable key cannot mean two implementations
+        run: |
+          python - <<'EOF' | tee /tmp/one.txt
+          import inspect
+          from contextmesh.execute import Runner, TaskRegistry, ExecutionCheckpointError
+
+          # The mistake has to be unexpressible, not merely discouraged.
+          for method in (Runner.task, Runner.repair):
+              params = inspect.signature(method).parameters
+              assert "registry" not in params, (
+                  "%s still takes a per-call registry=" % method.__name__
+              )
+          print(" no per-call registry= on task() or repair()")
+
+          argon = TaskRegistry()
+          argon.register_worker("auth.hash.v1", lambda ctx: {"implementation": "argon2"})
+          rival = TaskRegistry()
+          rival.register_worker("auth.hash.v1", lambda ctx: {"implementation": "bcrypt"})
+
+          first = Runner("auth", registry=argon)
+          first.task("hash", worker_key="auth.hash.v1", assumes="x")
+          first.run()
+          ran = first.output("hash")["implementation"]
+          key = first.bindings()["hash"]["worker_key"]
+          print(" process A ran:", ran, "| checkpoint says:", key)
+
+          second = Runner("auth", registry=argon)
+          second.task("hash", worker_key=key, assumes="x")
+          second.run()
+          got = second.output("hash")["implementation"]
+          print(" process B restored:", got)
+          assert got == ran, "one key named two implementations across the boundary"
+
+          # rebind() is the one way the meaning changes, and it adopts the table.
+          second.rebind(rival)
+          assert second.registry is rival
+          second.repair("hash", worker_key="auth.hash.v1")
+          second.run()
+          print(" after rebind(rival), repair binds:", second.output("hash")["implementation"])
+          assert second.output("hash")["implementation"] == "bcrypt"
+          # The same hole, reached one task at a time.
+          third = Runner("auth", registry=argon)
+          task = third.task("hash", worker_key="auth.hash.v1", assumes="x")
+          try:
+              task.rebind(rival)
+              raise SystemExit("::error::a task was rebound against a foreign registry")
+          except ExecutionCheckpointError as exc:
+              print(" one task, foreign table:", str(exc)[:72])
+          print("ONE RUNNER MEANS ONE REGISTRY")
+          EOF
+          grep -q "ONE RUNNER MEANS ONE REGISTRY" /tmp/one.txt
+
+      - name: A deployment missing the key refuses, and can say which
+        run: |
+          python - <<'EOF' | tee /tmp/missing.txt
+          from contextmesh.execute import Runner, TaskRegistry, ExecutionCheckpointError
+
+          stale = TaskRegistry()
+          stale.register_worker("auth.hash.argon2.v1", lambda ctx: {})
+          stale.register_auditor("auth.hash.audit.v1", lambda ctx: True)
+
+          runner = Runner("auth", registry=stale)
+          try:
+              runner.task("hash", worker_key="auth.hash.bcrypt.v1", assumes="x")
+              raise SystemExit("::error::an unregistered key was accepted")
+          except ExecutionCheckpointError as exc:
+              assert "auth.hash.bcrypt.v1" in str(exc), str(exc)
+              print(" refused:", str(exc)[:96])
+
+          described = stale.describe()
+          print(" this deployment can bind:", described)
+          assert "auth.hash.bcrypt.v1" not in described["workers"]
+          # describe() is names only -- no route back to the code.
+          assert "function" not in repr(described) and "lambda" not in repr(described)
+
+          # A plain callable still runs; it simply cannot be checkpointed.
+          plain = Runner("plain")
+          plain.task("temporary_task", lambda ctx: {"ok": True}, assumes="input is valid")
+          plain.run()
+          assert plain.output("temporary_task")["ok"] is True
+          assert not plain.checkpointable
+          try:
+              plain.require_checkpointable()
+              raise SystemExit("::error::a plain callable plan claimed to be durable")
+          except ExecutionCheckpointError as exc:
+              print(" plain callable:", str(exc).splitlines()[-1][:96])
+          print("MISSING KEYS FAIL CLOSED")
+          EOF
+          grep -q "MISSING KEYS FAIL CLOSED" /tmp/missing.txt
+
+  ledger:
+    name: ledger · restore and continuity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: A restored ledger continues the exact committed history
+        run: |
+          python - <<'EOF' | tee /tmp/cont.txt
+          import json, subprocess, sys, tempfile
+          from pathlib import Path
+          from contextmesh.execute import RunLedger, Event
+
+          led = RunLedger()
+          led.record(1, Event.EXECUTED, "hash_password", "argon2id", data={"hasher": "Argon2id"})
+          led.record(1, Event.DISPROVED, "hash_password", "CVE-2026-9999")
+          led.record(2, Event.REPAIRED, "hash_password", "reground on bcrypt")
+          led.record(2, Event.EXECUTED, "hash_password", "bcrypt", data={"hasher": "Bcrypt"})
+          committed = led.head
+          print(" process A committed head:", committed[:32], "...")
+
+          tmp = Path(tempfile.mkdtemp())
+          led.save_json(tmp / "ledger.json")
+          before = json.loads((tmp / "ledger.json").read_text())["entries"]
+
+          # A genuinely separate process restores it and appends one event.
+          script = (
+              "import json,sys\n"
+              "from contextmesh.execute import RunLedger, Event\n"
+              "led = RunLedger.load_json(sys.argv[1], expect_head=sys.argv[2])\n"
+              "assert led.head == sys.argv[2]\n"
+              "assert led.verify()\n"
+              "h = led.head\n"
+              "e = led.record(3, Event.AUDITED, 'hash_password', 'bcrypt holds')\n"
+              "assert e.compute_digest(h) == e.digest, 'new entry did not chain from the old head'\n"
+              "led.save_json(sys.argv[1])\n"
+              "print(json.dumps({'restored': h, 'new_head': led.head}))\n"
+          )
+          out = subprocess.run([sys.executable, "-c", script, str(tmp / "ledger.json"), committed],
+                               capture_output=True, text=True, timeout=60)
+          if out.returncode != 0:
+              raise SystemExit("::error::" + out.stderr.strip().splitlines()[-1])
+          result = json.loads(out.stdout)
+          print(" process B restored head:  ", result["restored"][:32], "...")
+          assert result["restored"] == committed
+
+          after = json.loads((tmp / "ledger.json").read_text())["entries"]
+          assert after[: len(before)] == before, "the restored prefix was rewritten"
+          print(" prefix after the append:  ", len(before), "entries, byte-identical")
+          print(" head moved on to:         ", result["new_head"][:32], "...")
+          print("RESTORED THE EXACT COMMITTED HEAD")
+          EOF
+          grep -q "RESTORED THE EXACT COMMITTED HEAD" /tmp/cont.txt
+
+      - name: Edit, delete and reorder are refused; a reforged chain needs the anchor
+        run: |
+          python - <<'EOF' | tee /tmp/tamper.txt
+          from contextmesh.execute import (
+              RunLedger, LedgerEntry, Event, LedgerIntegrityError,
+          )
+
+          def build():
+              led = RunLedger()
+              led.record(1, Event.EXECUTED, "hash_password", "argon2id", data={"hasher": "Argon2id"})
+              led.record(1, Event.DISPROVED, "hash_password", "CVE-2026-9999")
+              led.record(1, Event.INVALIDATED, "auth_routes", "ground removed")
+              led.record(2, Event.EXECUTED, "hash_password", "bcrypt", data={"hasher": "Bcrypt"})
+              return led
+
+          def reseal(snap):
+              """What an attacker with write access does: recompute everything."""
+              prev = RunLedger.GENESIS
+              for i, row in enumerate(snap["entries"], start=1):
+                  row["seq"] = i
+                  e = LedgerEntry(seq=i, round=row["round"], event=Event(row["event"]),
+                                  task=row["task"], detail=row["detail"],
+                                  node_id=row["node_id"], assumption_id=row["assumption_id"],
+                                  data=row["data"])
+                  row["digest"] = e.compute_digest(prev)
+                  prev = row["digest"]
+              snap["head"] = prev
+              return snap
+
+          trusted = build().head
+
+          def refused(label, snap, anchor=None):
+              try:
+                  RunLedger.from_snapshot(snap, expect_head=anchor)
+              except LedgerIntegrityError as exc:
+                  print(" %-34s REFUSED - %s" % (label, str(exc)[:64]))
+                  return True
+              print(" %-34s ACCEPTED" % label)
+              return False
+
+          a = build().snapshot()
+          a["entries"][0]["data"]["hasher"] = "Bcrypt"
+          assert refused("A. edit a historical entry", a)
+
+          b = build().snapshot()
+          del b["entries"][2]
+          for i, row in enumerate(b["entries"], start=1):
+              row["seq"] = i
+          assert refused("B. delete + renumber", b)
+
+          c = build().snapshot()
+          c["entries"][1], c["entries"][2] = c["entries"][2], c["entries"][1]
+          for i, row in enumerate(c["entries"], start=1):
+              row["seq"] = i
+          assert refused("C. reorder", c)
+
+          # D. The one internal consistency cannot see.
+          d = build().snapshot()
+          d["entries"][0]["data"]["hasher"] = "Bcrypt"
+          d = reseal(d)
+          forged = RunLedger.from_snapshot(d)
+          assert forged.verify(), "the forged chain should verify - that is the point"
+          print(" D. reforge every digest            ACCEPTED by verify(), head %s..." % d["head"][:16])
+          assert refused("D. reforge, against trusted head", d, anchor=trusted)
+          print(" trusted head was               %s..." % trusted[:16])
+          print("TAMPER EVIDENT, CONTINUITY ANCHORED")
+          EOF
+          grep -q "TAMPER EVIDENT, CONTINUITY ANCHORED" /tmp/tamper.txt
+
+      - name: A corrupt or foreign ledger file is refused, not half-loaded
+        run: |
+          python - <<'EOF' | tee /tmp/refuse.txt
+          import json, tempfile
+          from pathlib import Path
+          from contextmesh.execute import RunLedger, Event, LedgerIntegrityError
+
+          led = RunLedger()
+          led.record(1, Event.EXECUTED, "t", "d")
+          good = led.snapshot()
+
+          cases = {}
+          cases["another schema"] = dict(good, schema="contextmesh.graph")
+          cases["a future version"] = dict(good, version=99)
+          cases["a boolean version"] = dict(good, version=True)
+          cases["a truncated head"] = dict(good, head="abc")
+          for label, snap in list(cases.items()):
+              try:
+                  RunLedger.from_snapshot(snap)
+                  raise SystemExit("::error::%s was accepted" % label)
+              except LedgerIntegrityError as exc:
+                  print(" %-20s refused: %s" % (label, str(exc)[:58]))
+
+          # An unsigned field is refused rather than silently dropped, at both
+          # levels: the entry record and the container around it.
+          extra = json.loads(json.dumps(good))
+          extra["entries"][0]["approved_by"] = "someone"
+          try:
+              RunLedger.from_snapshot(extra)
+              raise SystemExit("::error::an unsigned entry field was accepted")
+          except LedgerIntegrityError as exc:
+              print(" %-20s refused: %s" % ("an unsigned field", str(exc)[:58]))
+
+          outer = dict(good, external_anchor="https://example.invalid/notarised")
+          try:
+              RunLedger.from_snapshot(outer)
+              raise SystemExit("::error::an undefined container field was accepted")
+          except LedgerIntegrityError as exc:
+              print(" %-20s refused: %s" % ("an undefined v1 field", str(exc)[:58]))
+
+          # Duplicate JSON keys: one name, two values, no agreed meaning.
+          assert json.loads('{"a": 1, "a": 2}') == {"a": 2}, "python keeps the last"
+          tmp0 = Path(tempfile.mkdtemp()) / "dup.json"
+          led2 = RunLedger()
+          led2.record(1, Event.EXECUTED, "t", "d", data={"hasher": "Argon2id"})
+          dup = led2.to_json().replace(
+              '"hasher": "Argon2id"', '"hasher": "Argon2id", "hasher": "Bcrypt"', 1
+          )
+          assert '"hasher": "Bcrypt"' in dup, "the duplicate was not injected"
+          tmp0.write_text(dup)
+          try:
+              RunLedger.load_json(tmp0)
+              raise SystemExit("::error::a duplicate key in signed data was accepted")
+          except LedgerIntegrityError as exc:
+              print(" %-20s refused: %s" % ("a duplicate in data", str(exc)[:58]))
+
+          # NaN never reaches a file, at either end.
+          tmp = Path(tempfile.mkdtemp()) / "l.json"
+          bad = json.loads(json.dumps(good))
+          tmp.write_text(json.dumps(bad).replace('"data": {}', '"data": {"x": NaN}', 1))
+          try:
+              RunLedger.load_json(tmp)
+              raise SystemExit("::error::NaN was parsed")
+          except LedgerIntegrityError as exc:
+              print(" %-20s refused: %s" % ("NaN in the file", str(exc)[:58]))
+          print("A BAD LEDGER FAILS CLOSED")
+          EOF
+          grep -q "A BAD LEDGER FAILS CLOSED" /tmp/refuse.txt
+
+  execution:
+    name: execution · restore and reschedule
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: A repaired plan restores with the same schedule and reruns selectively
+        run: |
+          python - <<'EOF' | tee /tmp/exec.txt
+          import json, subprocess, sys, tempfile
+          from pathlib import Path
+          from contextmesh.execute import Runner, TaskRegistry
+
+          class Advisory:
+              def __init__(self): self.published = False
+              def __call__(self, ctx):
+                  if self.published and ctx.output.get("impl") == "argon2":
+                      return ctx.disproved("CVE-2026-9999 published for argon2id")
+                  return True
+
+          def deployment(advisory=None):
+              r = TaskRegistry()
+              r.register_worker("auth.schema.v1", lambda c: {"ok": True})
+              r.register_worker("auth.hash.argon2.v1", lambda c: {"impl": "argon2"})
+              r.register_worker("auth.hash.bcrypt.v1", lambda c: {"impl": "bcrypt"})
+              r.register_worker("auth.routes.v1", lambda c: {"ok": True})
+              r.register_worker("auth.tokens.v1", lambda c: {"ok": True})
+              r.register_auditor("auth.hash.audit.v1", advisory or Advisory())
+              return r
+
+          advisory = Advisory()
+          a = Runner("auth", registry=deployment(advisory))
+          a.task("schema", worker_key="auth.schema.v1", assumes="sqlite is fine", produces=("Schema",))
+          a.task("hashing", worker_key="auth.hash.argon2.v1", auditor_key="auth.hash.audit.v1",
+                 assumes="Argon2 has no open advisory", needs=("schema",), produces=("Password Hasher",))
+          a.task("routes", worker_key="auth.routes.v1", assumes="REST is fine",
+                 needs=("hashing",), produces=("Routes",))
+          a.task("tokens", worker_key="auth.tokens.v1", assumes="JWT is fine",
+                 needs=("schema",), produces=("Tokens",))
+          a.run()
+          print(" run 1:", {t.name: t.state.value for t in a.tasks})
+
+          advisory.published = True
+          a.recheck()
+          a.repair("hashing", assumes="bcrypt has no open advisory",
+                   worker_key="auth.hash.bcrypt.v1")
+          print(" after CVE + repair:", {t.name: t.state.value for t in a.tasks})
+          print(" attempts:", {t.name: t.attempt for t in a.tasks})
+
+          ready = a._ready()
+          print(" ready at the checkpoint:", ready)
+          assert ready == ["hashing"], ready
+
+          tmp = Path(tempfile.mkdtemp())
+          a.save_json(tmp / "execution.json")
+          a.graph.save_json(tmp / "graph.json")
+          a.ledger.save_json(tmp / "ledger.json")
+          order = [t["name"] for t in json.loads((tmp / "execution.json").read_text())["tasks"]]
+          print(" task order in the file:", order)
+          assert order == ["schema", "hashing", "routes", "tokens"], order
+          assert order != sorted(order), "the file must not be sorted"
+
+          # A separate process: the file, the graph, the ledger, its own registry.
+          script = (
+              "import json,sys\n"
+              "from contextmesh.execute import Runner, TaskRegistry\n"
+              "from contextmesh.graph import ContextGraph\n"
+              "from contextmesh.execute import RunLedger\n"
+              "exec(open(sys.argv[2]).read())\n"
+              "g = ContextGraph.load_json(sys.argv[1] + '/graph.json')\n"
+              "led = RunLedger.load_json(sys.argv[1] + '/ledger.json')\n"
+              "adv = Advisory(); adv.published = True\n"
+              "r = Runner.load_json(sys.argv[1] + '/execution.json', graph=g,\n"
+              "                     registry=deployment(adv), ledger=led)\n"
+              "assert r._ready() == ['hashing'], r._ready()\n"
+              "assert r['hashing'].worker_key == 'auth.hash.bcrypt.v1'\n"
+              "r.run()\n"
+              "print(json.dumps({t.name: [t.state.value, t.attempt, t.output] for t in r.tasks}))\n"
+          )
+          helper = tmp / "defs.py"
+          helper.write_text(
+              "class Advisory:\n"
+              "    def __init__(self): self.published = False\n"
+              "    def __call__(self, ctx):\n"
+              "        if self.published and ctx.output.get('impl') == 'argon2':\n"
+              "            return ctx.disproved('CVE')\n"
+              "        return True\n"
+              "def deployment(advisory=None):\n"
+              "    from contextmesh.execute import TaskRegistry\n"
+              "    r = TaskRegistry()\n"
+              "    r.register_worker('auth.schema.v1', lambda c: {'ok': True})\n"
+              "    r.register_worker('auth.hash.argon2.v1', lambda c: {'impl': 'argon2'})\n"
+              "    r.register_worker('auth.hash.bcrypt.v1', lambda c: {'impl': 'bcrypt'})\n"
+              "    r.register_worker('auth.routes.v1', lambda c: {'ok': True})\n"
+              "    r.register_worker('auth.tokens.v1', lambda c: {'ok': True})\n"
+              "    r.register_auditor('auth.hash.audit.v1', advisory or Advisory())\n"
+              "    return r\n"
+          )
+          out = subprocess.run([sys.executable, "-c", script, str(tmp), str(helper)],
+                               capture_output=True, text=True, timeout=90)
+          if out.returncode != 0:
+              raise SystemExit("::error::" + out.stderr.strip().splitlines()[-1])
+          final = json.loads(out.stdout)
+          for name, (state, attempt, output) in sorted(final.items()):
+              print("   %-8s %-6s attempt %s  %s" % (name, state, attempt, output))
+
+          assert final["hashing"][2] == {"impl": "bcrypt"}, "the restore resurrected argon2"
+          assert final["hashing"][1] == 2, "the repaired task did not rerun"
+          for untouched in ("schema", "tokens"):
+              assert final[untouched][1] == 1, untouched + " reran but was never stale"
+          print("RESTORED PLAN RERAN ONLY THE STALE CLOSURE")
+          EOF
+          grep -q "RESTORED PLAN RERAN ONLY THE STALE CLOSURE" /tmp/exec.txt
+
+      - name: A plan that does not match its graph is refused, not half-loaded
+        run: |
+          python - <<'EOF' | tee /tmp/execrefuse.txt
+          from contextmesh.execute import (
+              Runner, TaskRegistry, ExecutionSnapshotError, ExecutionCheckpointError,
+          )
+          from contextmesh.graph import ContextGraph
+
+          registry = TaskRegistry()
+          registry.register_worker("w.v1", lambda ctx: {"ok": True})
+          runner = Runner("plan", registry=registry)
+          runner.task("only", worker_key="w.v1", assumes="x", produces=("Thing",))
+          runner.run()
+          good = runner.snapshot()
+
+          def refused(label, snap, graph=None, reg=None):
+              try:
+                  Runner.from_snapshot(snap, graph=graph or runner.graph,
+                                       registry=reg or registry)
+              except (ExecutionSnapshotError, ExecutionCheckpointError) as exc:
+                  print(" %-26s refused: %s" % (label, str(exc)[:54]))
+                  return True
+              print(" %-26s ACCEPTED" % label)
+              return False
+
+          import copy
+          cases = []
+          bad = copy.deepcopy(good); bad["tasks"][0]["assumption_id"] = "assumption:invented"
+          cases.append(("a dangling assumption", bad, None, None))
+          bad = copy.deepcopy(good); bad["tasks"][0]["node_id"] = "decision:invented"
+          cases.append(("a dangling decision", bad, None, None))
+          bad = copy.deepcopy(good); bad["tasks"][0]["artefacts"] = ["entity:invented"]
+          cases.append(("a dangling artefact", bad, None, None))
+          bad = copy.deepcopy(good); bad["tasks"][0]["needs"] = ["nobody"]
+          cases.append(("a dependency on nothing", bad, None, None))
+          bad = copy.deepcopy(good); bad["tasks"][0]["state"] = "blocked"
+          cases.append(("blocked as a stored state", bad, None, None))
+          bad = copy.deepcopy(good); bad["tasks"].append(copy.deepcopy(good["tasks"][0]))
+          cases.append(("a task named twice", bad, None, None))
+          bad = copy.deepcopy(good); bad["approved_by"] = "alice"
+          cases.append(("an undefined v1 field", bad, None, None))
+          bad = copy.deepcopy(good); bad["tasks"][0]["assumption_id"] = None
+          cases.append(("a task with no ground", bad, None, None))
+          bad = copy.deepcopy(good); bad["tasks"][0]["assumes"] = "something else entirely"
+          cases.append(("ground text vs binding", bad, None, None))
+          bad = copy.deepcopy(good); bad["tasks"][0]["node_id"] = None
+          cases.append(("done with no decision", bad, None, None))
+          bad = copy.deepcopy(good); bad["tasks"][0]["attempt"] = 0
+          cases.append(("done after no attempts", bad, None, None))
+          bad = copy.deepcopy(good); bad["plan"] = "a-different-plan"
+          cases.append(("a plan the graph never ran", bad, None, None))
+          cases.append(("a different graph entirely", copy.deepcopy(good), ContextGraph(), None))
+          cases.append(("a deployment without the key", copy.deepcopy(good), None, TaskRegistry()))
+
+          for label, snap, graph, reg in cases:
+              if not refused(label, snap, graph, reg):
+                  raise SystemExit("::error::%s was accepted" % label)
+
+          # `plan` is durable because ids are derived from it, so changing only
+          # that string must not graft the old decisions onto a new namespace.
+          from contextmesh.model import slug as _slug
+          bogus = _slug("execution plan: a-different-plan", "source")
+          assert bogus not in runner.graph.nodes
+          renamed = copy.deepcopy(good); renamed["plan"] = "a-different-plan"
+          try:
+              Runner.from_snapshot(renamed, graph=runner.graph, registry=registry)
+              raise SystemExit("::error::a renamed plan was accepted")
+          except ExecutionSnapshotError:
+              pass
+          assert bogus not in runner.graph.nodes, "the renamed plan still created a source"
+          print(" %-26s and no source node landed" % "a renamed plan:")
+
+          # A cycle is refused at load, not left for run() to discover -- and
+          # the refusal happens before the Runner exists, so nothing lands.
+          from contextmesh.model import slug
+          two = Runner("cyc", registry=registry)
+          two.task("a", worker_key="w.v1", assumes="alpha")
+          two.task("b", worker_key="w.v1", assumes="beta")
+          cyc = two.snapshot()
+          cyc["tasks"][0]["needs"] = ["b"]
+          cyc["tasks"][1]["needs"] = ["a"]
+          cyc["plan"] = "cyc-restored"
+          source = slug("execution plan: cyc-restored", "source")
+          assert source not in two.graph.nodes
+          try:
+              Runner.from_snapshot(cyc, graph=two.graph, registry=registry)
+              raise SystemExit("::error::a dependency cycle was accepted")
+          except ExecutionSnapshotError as exc:
+              print(" %-26s refused: %s" % ("a dependency cycle", str(exc)[:54]))
+          assert source not in two.graph.nodes, "the refused plan still left a source node"
+          print(" %-26s nothing landed in the graph" % "and before construction:")
+          print("A BAD PLAN FAILS CLOSED")
+          EOF
+          grep -q "A BAD PLAN FAILS CLOSED" /tmp/execrefuse.txt
 
   smoke:
     name: cli · demo · export
