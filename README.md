@@ -212,6 +212,71 @@ so `lineage()` still answers "what did we used to believe, and why did we stop".
 Until that repair happens the task is *blocked*, not run: nothing executes on
 ground the graph knows to be false.
 
+### Durable identity — a checkpoint holds a name, not a callable
+
+A task's `run` is a Python function, and a function dies with the process that
+made it. So a task can also carry a *key*: a string a later process looks up in
+its own `TaskRegistry` to get a callable back.
+
+```python
+registry = TaskRegistry()
+registry.register_worker("auth.hash.argon2.v1", argon2_hasher)
+registry.register_auditor("auth.hash.audit.v1", advisory_auditor)
+
+runner.task(
+    "hash_password",
+    worker_key="auth.hash.argon2.v1",
+    auditor_key="auth.hash.audit.v1",
+    assumes="Argon2 has no open advisory",
+)
+```
+
+**A key never becomes an import.** The route from string to callable is a table
+this process filled in deliberately — no module path, no qualified name, no
+pickle, no fallback to a similar key. A deployment that never registered
+`auth.hash.bcrypt.v1` cannot resume a checkpoint naming it, and says so with the
+key in the message. `tests/test_registry.py` parses `execute.py` rather than
+grepping it and asserts the module imports no loader and calls nothing that
+turns text into behaviour.
+
+**Plain callables still work.** `runner.task("temp", run=fn, assumes=...)` runs,
+audits and invalidates exactly as before — it simply cannot be checkpointed,
+and `require_checkpointable()` says which task stopped it and why. Passing both
+`run=` and `worker_key=` is refused rather than reconciled: they are two answers
+to "which code is this", and a checkpoint would record the wrong one.
+
+**A key names one implementation for the life of the process.** Registering
+`auth.hash.v1` twice is refused even when the callable is identical, because the
+alternative is a bcrypt worker silently replacing an argon2 one at startup.
+Workers and auditors keep separate namespaces — they carry different authority,
+since an auditor may disprove an assumption and a worker may not — and a key
+found in the wrong one says so rather than reporting a plain absence.
+
+**The load-bearing case is a repair that outlives the process:**
+
+```
+argon2 → CVE → auditor disproves → repair to bcrypt → checkpoint → process dies
+                                                                        ↓
+                                              restore must bind bcrypt, not argon2
+```
+
+which is why repairing a keyed task with a bare `run=` is refused. The task
+would run bcrypt while its checkpoint still said argon2, and the next restore
+would faithfully resurrect the worker the CVE was about. `repair(...,
+worker_key="auth.hash.bcrypt.v1")` moves both halves together, and
+`ArgonToBcryptTest` walks the whole sequence across two runners with nothing
+shared but the two strings.
+
+`registry.describe()` returns the keys and only the keys, so a deployment can
+answer "this checkpoint cannot resume here because I lack
+`auth.hash.bcrypt.v1`" without exposing a route back to the code.
+
+This is the first slice of execution checkpointing. The serialiser itself — the
+run ledger's restore, the execution snapshot format, and a session that joins
+graph, resolver and execution — is deliberately not built yet: the binding
+boundary is proved first so the format is not designed around an unproven model
+of how code is named.
+
 ### The standalone control layer
 
 `examples/assumption_control_layer.py` is the original single-file sketch of
@@ -630,7 +695,7 @@ contextmesh_mcp/             read-only MCP server (optional extra, 3.10+)
 dashboard/                   the rebuilt dashboard
 docs/                        the capture spec and the architecture notes
 examples/                    the original standalone control-layer sketch
-tests/                       422 tests over the invariants above
+tests/                       470 tests over the invariants above
 ```
 
 ## Staying publishable

@@ -53,6 +53,15 @@ class ExecutionError(Exception):
     """Raised when a plan cannot be scheduled, or an auditor misbehaves."""
 
 
+class ExecutionCheckpointError(ExecutionError):
+    """Raised when durable execution identity is missing, wrong, or ambiguous.
+
+    Separate from ``ExecutionError`` so a caller can tell "this plan will not
+    schedule" from "this plan will not survive a restart", but a subclass of it
+    so existing ``except ExecutionError`` handlers keep working.
+    """
+
+
 class TaskState(str, Enum):
     """What the runner believes about a task.
 
@@ -143,6 +152,155 @@ Worker = Callable[[RunContext], Dict[str, Any]]
 Auditor = Callable[[AuditContext], Any]
 
 
+def _valid_key(key: Any, kind: str) -> str:
+    """A registry key has to survive a round trip through a file.
+
+    Not a naming scheme — dots, versions and namespaces are conventions the
+    caller picks. Only the properties a *durable identifier* needs: it is text,
+    it is not empty, and it is not carrying whitespace or control characters
+    that a log line, a diff or a JSON reader would quietly change.
+    """
+    if not isinstance(key, str):
+        raise ExecutionCheckpointError(
+            f"{kind} key must be a string, got {type(key).__name__}"
+        )
+    if not key:
+        raise ExecutionCheckpointError(f"{kind} key must not be empty")
+    if key != key.strip():
+        raise ExecutionCheckpointError(
+            f"{kind} key {key!r} has leading or trailing whitespace; a durable "
+            "identifier has to be exactly what it looks like"
+        )
+    if not key.isprintable():
+        raise ExecutionCheckpointError(
+            f"{kind} key {key!r} contains a control character or newline"
+        )
+    return key
+
+
+class TaskRegistry:
+    """The one place a durable key becomes executable code.
+
+    A checkpoint cannot hold a Python callable, and it must not hold anything
+    that could *become* one — no module path to import, no qualified name to
+    look up, no pickle. What it holds is a key, and a key means something only
+    because a running process was configured to say so. That configuration is
+    this object: deployment state, never file state.
+
+    So the restore path is a lookup and nothing else::
+
+        checkpoint ──"auth.hash.bcrypt.v1"──► registry ──► callable
+
+    If this deployment never registered that key, the restore fails and says
+    which key is missing. It does not fall back to a similar one, guess from a
+    module path, or leave a half-bound runner behind.
+
+    Workers and auditors are kept in separate namespaces on purpose. They have
+    different signatures and different authority — an auditor may disprove an
+    assumption, which is the one thing a worker must never do — so a key that
+    fits one is not silently accepted for the other.
+    """
+
+    def __init__(self) -> None:
+        self._workers: Dict[str, Worker] = {}
+        self._auditors: Dict[str, Auditor] = {}
+
+    # ── registration ─────────────────────────────────────────────────────
+    def _register(
+        self,
+        table: Dict[str, Any],
+        other: Dict[str, Any],
+        kind: str,
+        key: str,
+        fn: Any,
+    ) -> None:
+        _valid_key(key, kind)
+        if not callable(fn):
+            raise ExecutionCheckpointError(
+                f"{kind} {key!r} must be callable, got {type(fn).__name__}"
+            )
+        if key in table:
+            # Refused even when ``fn is table[key]``. A key is an identity, and
+            # re-registering one is either a copy-paste or a genuine swap; both
+            # want to be seen. Silently replacing a bcrypt worker with an argon2
+            # one because they share a key is the failure this whole layer is
+            # built to prevent, and it should not be reachable at startup either.
+            raise ExecutionCheckpointError(
+                f"{kind} key {key!r} is already registered; a durable key names "
+                "one implementation for the life of the process"
+            )
+        if key in other:
+            raise ExecutionCheckpointError(
+                f"{key!r} is already registered as "
+                f"{'an auditor' if kind == 'worker' else 'a worker'}; workers and "
+                "auditors do not share a namespace"
+            )
+        table[key] = fn
+
+    def register_worker(self, key: str, fn: Worker) -> None:
+        self._register(self._workers, self._auditors, "worker", key, fn)
+
+    def register_auditor(self, key: str, fn: Auditor) -> None:
+        self._register(self._auditors, self._workers, "auditor", key, fn)
+
+    # ── resolution ───────────────────────────────────────────────────────
+    def _resolve(
+        self,
+        table: Dict[str, Any],
+        other: Dict[str, Any],
+        kind: str,
+        key: str,
+    ) -> Any:
+        _valid_key(key, kind)
+        if key in table:
+            return table[key]
+        if key in other:
+            # The most confusing failure to debug, so it is named rather than
+            # reported as a plain absence.
+            raise ExecutionCheckpointError(
+                f"{key!r} is registered as "
+                f"{'an auditor' if kind == 'worker' else 'a worker'}, not as "
+                f"{'a worker' if kind == 'worker' else 'an auditor'}"
+            )
+        raise ExecutionCheckpointError(
+            f"{kind} {key!r} is not registered in this process; a checkpoint "
+            "that names it cannot be restored here"
+        )
+
+    def worker(self, key: str) -> Worker:
+        return self._resolve(self._workers, self._auditors, "worker", key)
+
+    def auditor(self, key: str) -> Auditor:
+        return self._resolve(self._auditors, self._workers, "auditor", key)
+
+    def has_worker(self, key: str) -> bool:
+        return isinstance(key, str) and key in self._workers
+
+    def has_auditor(self, key: str) -> bool:
+        return isinstance(key, str) and key in self._auditors
+
+    # ── reporting ────────────────────────────────────────────────────────
+    def describe(self) -> Dict[str, List[str]]:
+        """What this deployment can bind, without exposing what it binds to.
+
+        Keys only — never the callables, their module paths or their
+        qualified names, since any of those would be a route back to importing
+        code the checkpoint named. Sorted so two deployments can be diffed:
+        "this one cannot resume that checkpoint because it lacks
+        ``auth.hash.bcrypt.v1``" is the question this exists to answer.
+        """
+        return {
+            "workers": sorted(self._workers),
+            "auditors": sorted(self._auditors),
+        }
+
+    def __repr__(self) -> str:
+        return (
+            f"<TaskRegistry workers={len(self._workers)} "
+            f"auditors={len(self._auditors)}>"
+        )
+
+
 @dataclass
 class Task:
     """A unit of work and the assumption it is only valid under."""
@@ -155,6 +313,17 @@ class Task:
     needs: Tuple[str, ...] = ()
     produces: Tuple[str, ...] = ()
     audit: Optional[Auditor] = None
+
+    # ── durable identity ─────────────────────────────────────────────────
+    #: What this task's code is *called*, as opposed to what it currently *is*.
+    #: ``run`` is a callable and dies with the process; ``worker_key`` is a
+    #: string a later process can look up in its own ``TaskRegistry``. A task
+    #: may have either — a plain callable runs perfectly well in memory and
+    #: simply cannot be checkpointed — but never both, because two sources of
+    #: truth for "which code is this" can disagree, and the checkpoint would
+    #: record the wrong one.
+    worker_key: Optional[str] = None
+    auditor_key: Optional[str] = None
 
     # ── runner-owned state ───────────────────────────────────────────────
     state: TaskState = TaskState.PENDING
@@ -177,7 +346,62 @@ class Task:
             "node_id": self.node_id,
             "assumption_id": self.assumption_id,
             "artefacts": list(self.artefacts),
+            # Strings, never the callables. This is the only place execution
+            # identity crosses into data, and what crosses is a name.
+            "worker_key": self.worker_key,
+            "auditor_key": self.auditor_key,
         }
+
+    # ── durable identity ─────────────────────────────────────────────────
+    @property
+    def checkpointable(self) -> bool:
+        """Whether a later process could rebuild this task's code from a name."""
+        return self.unbindable_reason() is None
+
+    def unbindable_reason(self) -> Optional[str]:
+        """Why this task could not be restored, or ``None`` if it could.
+
+        A reason rather than a bare ``False``, because "this plan cannot be
+        checkpointed" is useless without "and here is the task that stopped it".
+        """
+        if self.worker_key is None:
+            return (
+                f"task {self.name!r} runs a plain callable with no worker_key, so "
+                "no later process could find its code again"
+            )
+        if self.audit is not None and self.auditor_key is None:
+            return (
+                f"task {self.name!r} has an auditor with no auditor_key; the "
+                "audit would be silently dropped on restore"
+            )
+        return None
+
+    def require_checkpointable(self) -> None:
+        reason = self.unbindable_reason()
+        if reason is not None:
+            raise ExecutionCheckpointError(reason)
+
+    def binding(self) -> Dict[str, Optional[str]]:
+        """The durable half of this task: two names, no code."""
+        return {"worker_key": self.worker_key, "auditor_key": self.auditor_key}
+
+    def rebind(self, registry: "TaskRegistry") -> "Task":
+        """Reconnect this task's callables from its keys, or refuse.
+
+        The restore side of the boundary. It resolves; it does not discover —
+        there is no import, no module path, no fallback to a similar key. A
+        task whose worker key this deployment never registered does not come
+        back half-bound and ready to run the wrong thing.
+        """
+        self.require_checkpointable()
+        assert self.worker_key is not None  # require_checkpointable proved it
+        run = registry.worker(self.worker_key)
+        audit = registry.auditor(self.auditor_key) if self.auditor_key else None
+        # Resolved both before mutating either: a task that fails on its
+        # auditor key must not be left holding a new worker.
+        self.run = run
+        self.audit = audit
+        return self
 
 
 # ── the ledger ───────────────────────────────────────────────────────────
@@ -419,6 +643,7 @@ class Runner:
         graph: Optional[ContextGraph] = None,
         assumptions: Optional[AssumptionLedger] = None,
         decisions: Optional[DecisionLog] = None,
+        registry: Optional[TaskRegistry] = None,
     ) -> None:
         # ``is None``, not ``or``: an empty graph is falsy-looking but real, and
         # ``graph or ContextGraph()`` would silently substitute a fresh one.
@@ -428,6 +653,10 @@ class Runner:
             assumptions if assumptions is not None else AssumptionLedger(self.graph)
         )
         self.decisions = decisions if decisions is not None else DecisionLog(self.graph)
+        #: Deployment configuration, not plan state. Kept so a plan does not
+        #: have to repeat ``registry=`` on every task; a task may still name a
+        #: different one. Never serialised — see ``TaskRegistry``.
+        self.registry = registry
         self.ledger = RunLedger()
         self.rounds: List[RunReport] = []
         self.round = 0
@@ -444,7 +673,7 @@ class Runner:
     def task(
         self,
         name: str,
-        run: Worker,
+        run: Optional[Worker] = None,
         *,
         assumes: str,
         title: Optional[str] = None,
@@ -452,9 +681,52 @@ class Runner:
         needs: Iterable[str] = (),
         produces: Iterable[str] = (),
         audit: Optional[Auditor] = None,
+        worker_key: Optional[str] = None,
+        auditor_key: Optional[str] = None,
+        registry: Optional[TaskRegistry] = None,
     ) -> Task:
+        """Declare a task, either as a plain callable or as a durable key.
+
+        Two ways in, and they do not mix:
+
+            task("temp", run=fn, assumes=...)                 in-memory only
+            task("hash", worker_key="auth.hash.argon2.v1",    checkpointable
+                 assumes=..., registry=registry)
+
+        A plain callable is still perfectly good work — it runs, it audits, it
+        invalidates. It simply cannot be checkpointed, because nothing in a file
+        could name it again. Passing both ``run`` and ``worker_key`` is refused
+        rather than reconciled: the two can disagree, and a checkpoint would
+        then record a name for code it is not actually running.
+        """
         if name in self._tasks:
             raise ExecutionError(f"duplicate task {name!r}")
+        table = registry if registry is not None else self.registry
+
+        if run is not None and worker_key is not None:
+            raise ExecutionCheckpointError(
+                f"task {name!r}: give run= or worker_key=, not both — they are "
+                "two answers to 'which code is this' and can disagree"
+            )
+        if audit is not None and auditor_key is not None:
+            raise ExecutionCheckpointError(
+                f"task {name!r}: give audit= or auditor_key=, not both"
+            )
+        if run is None and worker_key is None:
+            raise ExecutionError(f"task {name!r} needs run= or worker_key=")
+        if (worker_key is not None or auditor_key is not None) and table is None:
+            raise ExecutionCheckpointError(
+                f"task {name!r} names a durable key but no TaskRegistry was "
+                "given, to this task or to the Runner"
+            )
+        if worker_key is not None:
+            assert table is not None  # the check above proved it
+            run = table.worker(worker_key)
+        if auditor_key is not None:
+            assert table is not None
+            audit = table.auditor(auditor_key)
+
+        assert run is not None  # one of the two branches above supplied it
         task = Task(
             name=name,
             title=title or name.replace("_", " ").strip().capitalize(),
@@ -464,6 +736,8 @@ class Runner:
             needs=tuple(needs),
             produces=tuple(produces),
             audit=audit,
+            worker_key=worker_key,
+            auditor_key=auditor_key,
         )
         task.assumption_id = self._assume(assumes).id
         self._tasks[name] = task
@@ -598,14 +872,59 @@ class Runner:
         audit: Optional[Auditor] = None,
         produces: Optional[Iterable[str]] = None,
         rationale: Optional[str] = None,
+        worker_key: Optional[str] = None,
+        auditor_key: Optional[str] = None,
+        registry: Optional[TaskRegistry] = None,
     ) -> Assumption:
         """Put new ground under a task so it can run again.
 
         A rejected assumption is never edited back to life — it stays rejected,
         and the replacement records that it supersedes it. That is what keeps
         "why did this change" answerable by walking the assumption's lineage.
+
+        A repair that swaps the code has to swap the *name* of the code too.
+        Repairing a durable task with a bare ``run=`` is refused, because the
+        result would be a task running bcrypt while its checkpoint still said
+        argon2 — and the next restore would faithfully bring back the worker
+        the CVE was about. That is the exact failure this layer exists to stop,
+        so it is refused at the repair rather than caught at the restore.
         """
         task = self._tasks[name]
+        table = registry if registry is not None else self.registry
+
+        if run is not None and worker_key is not None:
+            raise ExecutionCheckpointError(
+                f"repair of {name!r}: give run= or worker_key=, not both"
+            )
+        if audit is not None and auditor_key is not None:
+            raise ExecutionCheckpointError(
+                f"repair of {name!r}: give audit= or auditor_key=, not both"
+            )
+        if run is not None and task.worker_key is not None:
+            raise ExecutionCheckpointError(
+                f"task {name!r} is bound to worker {task.worker_key!r}; repairing "
+                "it with a bare run= would leave the checkpoint naming the old "
+                "worker while the new one runs. Pass worker_key= instead"
+            )
+        if audit is not None and task.auditor_key is not None:
+            raise ExecutionCheckpointError(
+                f"task {name!r} is bound to auditor {task.auditor_key!r}; repairing "
+                "it with a bare audit= would leave the checkpoint naming the old "
+                "auditor. Pass auditor_key= instead"
+            )
+        if (worker_key is not None or auditor_key is not None) and table is None:
+            raise ExecutionCheckpointError(
+                f"repair of {name!r} names a durable key but no TaskRegistry was "
+                "given, to this repair or to the Runner"
+            )
+        if worker_key is not None:
+            assert table is not None
+            # Resolve before mutating: a key this deployment cannot bind must
+            # leave the task exactly as it was.
+            run = table.worker(worker_key)
+        if auditor_key is not None:
+            assert table is not None
+            audit = table.auditor(auditor_key)
         old = self.graph.assumptions.get(task.assumption_id or "")
         new = old
         if assumes:
@@ -621,8 +940,12 @@ class Runner:
             task.assumption_id = new.id
         if run is not None:
             task.run = run
+        if worker_key is not None:
+            task.worker_key = worker_key
         if audit is not None:
             task.audit = audit
+        if auditor_key is not None:
+            task.auditor_key = auditor_key
         if produces is not None:
             task.produces = tuple(produces)
         if rationale is not None:
@@ -639,6 +962,63 @@ class Runner:
         if new is None:
             raise ExecutionError(f"task {name!r} has no assumption to repair")
         return new
+
+    # ── durable identity ─────────────────────────────────────────────────
+    @property
+    def checkpointable(self) -> bool:
+        """Whether every task in this plan could be rebuilt in a later process."""
+        return not self.unbindable()
+
+    def unbindable(self) -> Tuple[str, ...]:
+        """The reasons this plan could not be checkpointed, one per task.
+
+        All of them, not the first. A plan with six plain callables should say
+        so once rather than over six edit-and-retry cycles.
+        """
+        reasons = []
+        for name in self._order:
+            reason = self._tasks[name].unbindable_reason()
+            if reason is not None:
+                reasons.append(reason)
+        return tuple(reasons)
+
+    def require_checkpointable(self) -> None:
+        """The gate a checkpoint writer calls before it writes anything."""
+        reasons = self.unbindable()
+        if reasons:
+            raise ExecutionCheckpointError(
+                "this plan cannot be checkpointed:\n  " + "\n  ".join(reasons)
+            )
+
+    def bindings(self) -> Dict[str, Dict[str, Optional[str]]]:
+        """Every task's durable identity, by name. Names only, never callables."""
+        return {name: self._tasks[name].binding() for name in self._order}
+
+    def rebind(self, registry: Optional[TaskRegistry] = None) -> "Runner":
+        """Reconnect every task's callables from its keys, or refuse.
+
+        All-or-nothing: each task is resolved against the registry before any
+        of them is mutated, so a plan that names one key this deployment lacks
+        does not come back with five tasks bound and one dangling.
+        """
+        table = registry if registry is not None else self.registry
+        if table is None:
+            raise ExecutionCheckpointError(
+                "rebind needs a TaskRegistry, given here or to the Runner"
+            )
+        self.require_checkpointable()
+        resolved = {}
+        for name in self._order:
+            task = self._tasks[name]
+            assert task.worker_key is not None  # require_checkpointable proved it
+            resolved[name] = (
+                table.worker(task.worker_key),
+                table.auditor(task.auditor_key) if task.auditor_key else None,
+            )
+        for name, (run, audit) in resolved.items():
+            self._tasks[name].run = run
+            self._tasks[name].audit = audit
+        return self
 
     # ── internals ────────────────────────────────────────────────────────
     def _assume(self, statement: str) -> Assumption:

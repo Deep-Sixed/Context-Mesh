@@ -678,6 +678,145 @@ jobs:
           fi
           grep -q "not a node in this session's graph" /tmp/mixed.txt
 
+  registry:
+    name: registry · durable bindings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: A durable key never becomes an import
+        run: |
+          python - <<'EOF' | tee /tmp/registry.txt
+          import ast, pathlib
+          from contextmesh.execute import TaskRegistry, ExecutionCheckpointError
+
+          # Parsed rather than grepped: a prose "no pickle" in a docstring is
+          # not a defect, and a substring scan cannot tell the two apart.
+          tree = ast.parse(
+              pathlib.Path("contextmesh/execute.py").read_text(encoding="utf-8")
+          )
+          imported, called = set(), set()
+          for node in ast.walk(tree):
+              if isinstance(node, ast.Import):
+                  imported.update(a.name.split(".")[0] for a in node.names)
+              elif isinstance(node, ast.ImportFrom) and node.module:
+                  imported.add(node.module.split(".")[0])
+              elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                  called.add(node.func.id)
+          loaders = {"importlib", "pickle", "marshal", "shelve", "runpy", "imp"}
+          makers = {"eval", "exec", "compile", "__import__"}
+          assert not (loaders & imported), sorted(loaders & imported)
+          assert not (makers & called), sorted(makers & called)
+
+          # And a key shaped exactly like a module path resolves to nothing.
+          registry = TaskRegistry()
+          registry.register_worker("auth.hash.argon2.v1", lambda ctx: {})
+          for shaped in ("contextmesh.execute.demo", "os.system", "builtins.eval"):
+              try:
+                  registry.worker(shaped)
+                  raise SystemExit(f"::error::{shaped} resolved to something")
+              except ExecutionCheckpointError:
+                  pass
+          print("  no loader imported, no text turned into behaviour")
+          print("A KEY IS ONLY EVER A LOOKUP")
+          EOF
+          grep -q "A KEY IS ONLY EVER A LOOKUP" /tmp/registry.txt
+
+      - name: A repaired binding is what a later process restores
+        run: |
+          python - <<'EOF' | tee /tmp/argon.txt
+          from contextmesh.execute import Runner, TaskRegistry
+
+          def hasher(tag):
+              return lambda ctx: {"implementation": tag}
+
+          def deployment():
+              r = TaskRegistry()
+              r.register_worker("auth.hash.argon2.v1", hasher("argon2"))
+              r.register_worker("auth.hash.bcrypt.v1", hasher("bcrypt"))
+              r.register_auditor("auth.hash.audit.v1", lambda ctx: True)
+              return r
+
+          first = Runner("auth", registry=deployment())
+          first.task(
+              "hash_password",
+              worker_key="auth.hash.argon2.v1",
+              auditor_key="auth.hash.audit.v1",
+              assumes="Argon2 has no open advisory",
+          )
+          first.run()
+          assert first.output("hash_password")["implementation"] == "argon2"
+
+          # A CVE lands; the assumption is regrounded on bcrypt.
+          first.repair(
+              "hash_password",
+              assumes="bcrypt has no open advisory",
+              worker_key="auth.hash.bcrypt.v1",
+          )
+          first.run()
+          assert first.output("hash_password")["implementation"] == "bcrypt"
+
+          # Everything a checkpoint would carry across the process boundary.
+          durable = first.bindings()["hash_password"]
+          print(" durable binding:", durable)
+          assert durable["worker_key"] == "auth.hash.bcrypt.v1"
+
+          second = Runner("auth", registry=deployment())
+          second.task(
+              "hash_password",
+              worker_key=durable["worker_key"],
+              auditor_key=durable["auditor_key"],
+              assumes="bcrypt has no open advisory",
+          )
+          second.run()
+          got = second.output("hash_password")["implementation"]
+          print(" restored process ran:", got)
+          assert got == "bcrypt", "the restore resurrected the worker the CVE was about"
+          print("REPAIRED BINDING SURVIVED THE PROCESS")
+          EOF
+          grep -q "REPAIRED BINDING SURVIVED THE PROCESS" /tmp/argon.txt
+
+      - name: A deployment missing the key refuses, and can say which
+        run: |
+          python - <<'EOF' | tee /tmp/missing.txt
+          from contextmesh.execute import Runner, TaskRegistry, ExecutionCheckpointError
+
+          stale = TaskRegistry()
+          stale.register_worker("auth.hash.argon2.v1", lambda ctx: {})
+          stale.register_auditor("auth.hash.audit.v1", lambda ctx: True)
+
+          runner = Runner("auth", registry=stale)
+          try:
+              runner.task("hash", worker_key="auth.hash.bcrypt.v1", assumes="x")
+              raise SystemExit("::error::an unregistered key was accepted")
+          except ExecutionCheckpointError as exc:
+              assert "auth.hash.bcrypt.v1" in str(exc), str(exc)
+              print(" refused:", str(exc)[:96])
+
+          described = stale.describe()
+          print(" this deployment can bind:", described)
+          assert "auth.hash.bcrypt.v1" not in described["workers"]
+          # describe() is names only -- no route back to the code.
+          assert "function" not in repr(described) and "lambda" not in repr(described)
+
+          # A plain callable still runs; it simply cannot be checkpointed.
+          plain = Runner("plain")
+          plain.task("temporary_task", lambda ctx: {"ok": True}, assumes="input is valid")
+          plain.run()
+          assert plain.output("temporary_task")["ok"] is True
+          assert not plain.checkpointable
+          try:
+              plain.require_checkpointable()
+              raise SystemExit("::error::a plain callable plan claimed to be durable")
+          except ExecutionCheckpointError as exc:
+              print(" plain callable:", str(exc).splitlines()[-1][:96])
+          print("MISSING KEYS FAIL CLOSED")
+          EOF
+          grep -q "MISSING KEYS FAIL CLOSED" /tmp/missing.txt
+
   smoke:
     name: cli · demo · export
     runs-on: ubuntu-latest
