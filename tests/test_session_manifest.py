@@ -62,6 +62,15 @@ class ThreeWayInvariantTest(unittest.TestCase):
             Session.load(directory)
         self.assertIn("three fields travel together", str(caught.exception))
 
+    def test_malformed_head_with_an_execution_is_refused(self):
+        directory = _save_plan()
+        for bad in ("", "abc", "A" * 64, "g" * 64, "0" * 63, "0" * 65, 12345):
+            with self.subTest(bad=bad):
+                _rewrite(directory, ledger_head=bad)
+                with self.assertRaises(SessionError) as caught:
+                    Session.load(directory, registry=deployment())
+                self.assertIn("ledger_head", str(caught.exception))
+
 
 class DuplicateManifestKeyTest(unittest.TestCase):
     def test_duplicate_ledger_head_is_refused(self):
