@@ -725,7 +725,7 @@ jobs:
           EOF
           grep -q "A KEY IS ONLY EVER A LOOKUP" /tmp/registry.txt
 
-      - name: A repaired binding is what a later process restores
+      - name: A repair moves the durable key before anything reruns
         run: |
           python - <<'EOF' | tee /tmp/argon.txt
           from contextmesh.execute import Runner, TaskRegistry
@@ -756,13 +756,15 @@ jobs:
               assumes="bcrypt has no open advisory",
               worker_key="auth.hash.bcrypt.v1",
           )
-          first.run()
-          assert first.output("hash_password")["implementation"] == "bcrypt"
 
-          # Everything a checkpoint would carry across the process boundary.
+          # Deliberately no first.run(). This is the dangerous boundary: the
+          # repair is done, bcrypt has never executed, and the process dies here.
+          # Everything a checkpoint would carry across is these two strings.
           durable = first.bindings()["hash_password"]
           print(" durable binding:", durable)
-          assert durable["worker_key"] == "auth.hash.bcrypt.v1"
+          assert durable["worker_key"] == "auth.hash.bcrypt.v1", (
+              "repair() did not move the durable key; only a later run would have"
+          )
 
           second = Runner("auth", registry=deployment())
           second.task(
@@ -773,11 +775,63 @@ jobs:
           )
           second.run()
           got = second.output("hash_password")["implementation"]
-          print(" restored process ran:", got)
+          print(" restored process ran (first execution of bcrypt):", got)
           assert got == "bcrypt", "the restore resurrected the worker the CVE was about"
           print("REPAIRED BINDING SURVIVED THE PROCESS")
           EOF
           grep -q "REPAIRED BINDING SURVIVED THE PROCESS" /tmp/argon.txt
+
+      - name: One durable key cannot mean two implementations
+        run: |
+          python - <<'EOF' | tee /tmp/one.txt
+          import inspect
+          from contextmesh.execute import Runner, TaskRegistry, ExecutionCheckpointError
+
+          # The mistake has to be unexpressible, not merely discouraged.
+          for method in (Runner.task, Runner.repair):
+              params = inspect.signature(method).parameters
+              assert "registry" not in params, (
+                  "%s still takes a per-call registry=" % method.__name__
+              )
+          print(" no per-call registry= on task() or repair()")
+
+          argon = TaskRegistry()
+          argon.register_worker("auth.hash.v1", lambda ctx: {"implementation": "argon2"})
+          rival = TaskRegistry()
+          rival.register_worker("auth.hash.v1", lambda ctx: {"implementation": "bcrypt"})
+
+          first = Runner("auth", registry=argon)
+          first.task("hash", worker_key="auth.hash.v1", assumes="x")
+          first.run()
+          ran = first.output("hash")["implementation"]
+          key = first.bindings()["hash"]["worker_key"]
+          print(" process A ran:", ran, "| checkpoint says:", key)
+
+          second = Runner("auth", registry=argon)
+          second.task("hash", worker_key=key, assumes="x")
+          second.run()
+          got = second.output("hash")["implementation"]
+          print(" process B restored:", got)
+          assert got == ran, "one key named two implementations across the boundary"
+
+          # rebind() is the one way the meaning changes, and it adopts the table.
+          second.rebind(rival)
+          assert second.registry is rival
+          second.repair("hash", worker_key="auth.hash.v1")
+          second.run()
+          print(" after rebind(rival), repair binds:", second.output("hash")["implementation"])
+          assert second.output("hash")["implementation"] == "bcrypt"
+          # The same hole, reached one task at a time.
+          third = Runner("auth", registry=argon)
+          task = third.task("hash", worker_key="auth.hash.v1", assumes="x")
+          try:
+              task.rebind(rival)
+              raise SystemExit("::error::a task was rebound against a foreign registry")
+          except ExecutionCheckpointError as exc:
+              print(" one task, foreign table:", str(exc)[:72])
+          print("ONE RUNNER MEANS ONE REGISTRY")
+          EOF
+          grep -q "ONE RUNNER MEANS ONE REGISTRY" /tmp/one.txt
 
       - name: A deployment missing the key refuses, and can say which
         run: |

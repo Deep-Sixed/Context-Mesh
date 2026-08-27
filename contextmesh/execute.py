@@ -171,6 +171,17 @@ def _valid_key(key: Any, kind: str) -> str:
             f"{kind} key {key!r} has leading or trailing whitespace; a durable "
             "identifier has to be exactly what it looks like"
         )
+    if any(ch.isspace() for ch in key):
+        # Tabs, newlines and the exotic spaces are already non-printable, so in
+        # practice this catches the interior ASCII space — the one whitespace
+        # character that survives a JSON round trip looking innocent and then
+        # splits a log column, a shell word or a CSV cell in half. Tightening a
+        # key format once checkpoints exist on disk is the expensive direction,
+        # so it is refused now rather than regretted later.
+        raise ExecutionCheckpointError(
+            f"{kind} key {key!r} contains whitespace; a durable identifier has "
+            "to survive a log line, a shell word and a diff unsplit"
+        )
     if not key.isprintable():
         raise ExecutionCheckpointError(
             f"{kind} key {key!r} contains a control character or newline"
@@ -325,6 +336,14 @@ class Task:
     worker_key: Optional[str] = None
     auditor_key: Optional[str] = None
 
+    #: The Runner whose registry defines what this task's keys mean, if any.
+    #: A task declared through ``Runner.task`` is governed by that Runner, and
+    #: rebinding it against some other registry is refused — otherwise one task
+    #: could run code from a table the Runner never adopted while its binding
+    #: still named a key the Runner resolves differently. Never serialised: a
+    #: checkpoint carries keys, not the tables that explain them.
+    governed_by: Optional["Runner"] = field(default=None, repr=False, compare=False)
+
     # ── runner-owned state ───────────────────────────────────────────────
     state: TaskState = TaskState.PENDING
     attempt: int = 0
@@ -392,7 +411,17 @@ class Task:
         there is no import, no module path, no fallback to a similar key. A
         task whose worker key this deployment never registered does not come
         back half-bound and ready to run the wrong thing.
+
+        A task that belongs to a Runner rebinds through that Runner. Doing it
+        here with some other registry would put the Runner's own invariant back
+        in play — one key meaning two implementations — one task at a time.
         """
+        if self.governed_by is not None and registry is not self.governed_by.registry:
+            raise ExecutionCheckpointError(
+                f"task {self.name!r} belongs to a Runner and its keys mean what "
+                "that Runner's registry says; rebind the Runner instead of "
+                "rebinding one task against a different table"
+            )
         self.require_checkpointable()
         assert self.worker_key is not None  # require_checkpointable proved it
         run = registry.worker(self.worker_key)
@@ -653,10 +682,13 @@ class Runner:
             assumptions if assumptions is not None else AssumptionLedger(self.graph)
         )
         self.decisions = decisions if decisions is not None else DecisionLog(self.graph)
-        #: Deployment configuration, not plan state. Kept so a plan does not
-        #: have to repeat ``registry=`` on every task; a task may still name a
-        #: different one. Never serialised — see ``TaskRegistry``.
-        self.registry = registry
+        # Deployment configuration, not plan state, and exactly one per Runner.
+        # A durable key has to mean one implementation across this whole plan:
+        # if two registries were in play, the same string could name argon2 in
+        # the checkpoint and bcrypt at runtime. Read-only on purpose — the only
+        # ways in are here and ``rebind()``, which re-resolves every task before
+        # it adopts one. Never serialised — see ``TaskRegistry``.
+        self._registry = registry
         self.ledger = RunLedger()
         self.rounds: List[RunReport] = []
         self.round = 0
@@ -668,6 +700,18 @@ class Runner:
             f"execution plan: {plan}",
             attrs={"origin": "runner", "retrieved_at": "at plan time"},
         )
+
+    @property
+    def registry(self) -> Optional[TaskRegistry]:
+        """The one registry that says what this plan's durable keys mean.
+
+        Set at construction or swapped wholesale by :meth:`rebind`. Not
+        assignable, because a bare assignment would leave the tasks bound to
+        the previous registry's callables while every later ``repair()``
+        resolved against the new one — a Runner running one implementation and
+        checkpointing the name of another.
+        """
+        return self._registry
 
     # ── declaring work ───────────────────────────────────────────────────
     def task(
@@ -683,7 +727,6 @@ class Runner:
         audit: Optional[Auditor] = None,
         worker_key: Optional[str] = None,
         auditor_key: Optional[str] = None,
-        registry: Optional[TaskRegistry] = None,
     ) -> Task:
         """Declare a task, either as a plain callable or as a durable key.
 
@@ -691,17 +734,23 @@ class Runner:
 
             task("temp", run=fn, assumes=...)                 in-memory only
             task("hash", worker_key="auth.hash.argon2.v1",    checkpointable
-                 assumes=..., registry=registry)
+                 assumes=...)
 
         A plain callable is still perfectly good work — it runs, it audits, it
         invalidates. It simply cannot be checkpointed, because nothing in a file
         could name it again. Passing both ``run`` and ``worker_key`` is refused
         rather than reconciled: the two can disagree, and a checkpoint would
         then record a name for code it is not actually running.
+
+        The key is always resolved through the Runner's own registry. There is
+        deliberately no per-task ``registry=``: a checkpoint records the key and
+        not the table it came from, so two tables would make the same string
+        mean two different implementations and a restore could pick the wrong
+        one. To run a task against different code, give it a different key.
         """
         if name in self._tasks:
             raise ExecutionError(f"duplicate task {name!r}")
-        table = registry if registry is not None else self.registry
+        table = self._registry
 
         if run is not None and worker_key is not None:
             raise ExecutionCheckpointError(
@@ -716,8 +765,8 @@ class Runner:
             raise ExecutionError(f"task {name!r} needs run= or worker_key=")
         if (worker_key is not None or auditor_key is not None) and table is None:
             raise ExecutionCheckpointError(
-                f"task {name!r} names a durable key but no TaskRegistry was "
-                "given, to this task or to the Runner"
+                f"task {name!r} names a durable key but this Runner has no "
+                "TaskRegistry; pass one to Runner(registry=...)"
             )
         if worker_key is not None:
             assert table is not None  # the check above proved it
@@ -738,6 +787,7 @@ class Runner:
             audit=audit,
             worker_key=worker_key,
             auditor_key=auditor_key,
+            governed_by=self,
         )
         task.assumption_id = self._assume(assumes).id
         self._tasks[name] = task
@@ -874,7 +924,6 @@ class Runner:
         rationale: Optional[str] = None,
         worker_key: Optional[str] = None,
         auditor_key: Optional[str] = None,
-        registry: Optional[TaskRegistry] = None,
     ) -> Assumption:
         """Put new ground under a task so it can run again.
 
@@ -890,7 +939,7 @@ class Runner:
         so it is refused at the repair rather than caught at the restore.
         """
         task = self._tasks[name]
-        table = registry if registry is not None else self.registry
+        table = self._registry
 
         if run is not None and worker_key is not None:
             raise ExecutionCheckpointError(
@@ -914,8 +963,8 @@ class Runner:
             )
         if (worker_key is not None or auditor_key is not None) and table is None:
             raise ExecutionCheckpointError(
-                f"repair of {name!r} names a durable key but no TaskRegistry was "
-                "given, to this repair or to the Runner"
+                f"repair of {name!r} names a durable key but this Runner has no "
+                "TaskRegistry; pass one to Runner(registry=...)"
             )
         if worker_key is not None:
             assert table is not None
@@ -1000,8 +1049,14 @@ class Runner:
         All-or-nothing: each task is resolved against the registry before any
         of them is mutated, so a plan that names one key this deployment lacks
         does not come back with five tasks bound and one dangling.
+
+        The registry is adopted in that same step. A rebind that swapped the
+        callables but left the old registry in place would give the Runner two
+        answers to "what does this key mean" — the tasks running the new code
+        while the next ``repair()`` resolved against the old table — so the
+        adoption and the callables land together or neither does.
         """
-        table = registry if registry is not None else self.registry
+        table = registry if registry is not None else self._registry
         if table is None:
             raise ExecutionCheckpointError(
                 "rebind needs a TaskRegistry, given here or to the Runner"
@@ -1015,9 +1070,11 @@ class Runner:
                 table.worker(task.worker_key),
                 table.auditor(task.auditor_key) if task.auditor_key else None,
             )
+        # Past here nothing can raise, so the swap is a single visible step.
         for name, (run, audit) in resolved.items():
             self._tasks[name].run = run
             self._tasks[name].audit = audit
+        self._registry = table
         return self
 
     # ── internals ────────────────────────────────────────────────────────

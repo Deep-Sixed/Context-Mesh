@@ -223,6 +223,7 @@ registry = TaskRegistry()
 registry.register_worker("auth.hash.argon2.v1", argon2_hasher)
 registry.register_auditor("auth.hash.audit.v1", advisory_auditor)
 
+runner = Runner("auth", registry=registry)
 runner.task(
     "hash_password",
     worker_key="auth.hash.argon2.v1",
@@ -230,6 +231,17 @@ runner.task(
     assumes="Argon2 has no open advisory",
 )
 ```
+
+**One Runner, one registry.** The registry belongs to the Runner, and there is
+deliberately no per-task or per-repair `registry=`. A checkpoint records the key
+and not the table it was resolved through, so two tables in one plan would let
+the same string mean argon2 in the file and bcrypt at runtime — and a restore
+would pick whichever one it was handed. `rebind(new_registry)` is the one way to
+change it: every task is resolved first, and only if all of them succeed are the
+callables and the registry adopted together. A task inside a Runner rebinds
+through that Runner for the same reason — pointing one task at a foreign table
+is the same hole reached one task at a time. To run different code, use a
+different key.
 
 **A key never becomes an import.** The route from string to callable is a table
 this process filled in deliberately — no module path, no qualified name, no
@@ -265,7 +277,14 @@ would run bcrypt while its checkpoint still said argon2, and the next restore
 would faithfully resurrect the worker the CVE was about. `repair(...,
 worker_key="auth.hash.bcrypt.v1")` moves both halves together, and
 `ArgonToBcryptTest` walks the whole sequence across two runners with nothing
-shared but the two strings.
+shared but the two strings — checkpointing at the dangerous boundary, with the
+repair done and bcrypt not yet executed, since that is the state a crash is
+likeliest to catch and the only one that proves `repair()` moved the durable key
+rather than some later run doing it.
+
+A key is text with no whitespace and no control characters — not a naming
+scheme, since dots and versions are conventions you pick, but enough that the
+identifier survives a log line, a shell word and a diff unsplit.
 
 `registry.describe()` returns the keys and only the keys, so a deployment can
 answer "this checkpoint cannot resume here because I lack

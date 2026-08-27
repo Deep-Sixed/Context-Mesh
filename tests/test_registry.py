@@ -100,9 +100,12 @@ class RegistrationTest(unittest.TestCase):
     def test_an_invalid_key_is_refused(self):
         for key, fragment in (
             ("", "must not be empty"),
-            (" padded ", "whitespace"),
-            ("has\nnewline", "control character"),
-            ("has\ttab", "control character"),
+            (" padded ", "leading or trailing whitespace"),
+            ("has\nnewline", "whitespace"),
+            ("has\ttab", "whitespace"),
+            ("has a space", "whitespace"),
+            ("has\xa0nbsp", "whitespace"),
+            ("has\x07bell", "control character"),
             (7, "must be a string"),
             (None, "must be a string"),
         ):
@@ -110,6 +113,20 @@ class RegistrationTest(unittest.TestCase):
                 with self.assertRaises(ExecutionCheckpointError) as caught:
                     self.registry.register_worker(key, worker("x"))
                 self.assertIn(fragment, str(caught.exception))
+
+    def test_an_interior_space_is_the_one_that_would_have_slipped_through(self):
+        """Every other whitespace character is already non-printable.
+
+        A plain ASCII space is not: it survives JSON looking innocent and then
+        splits a log column, a shell word or a CSV cell in half. It is the only
+        reason the whitespace check earns its place next to `isprintable`.
+        """
+        self.assertTrue(" ".isprintable())
+        for other in ("\t", "\n", "\xa0", "\u2003"):
+            self.assertFalse(other.isprintable(), repr(other))
+        with self.assertRaises(ExecutionCheckpointError) as caught:
+            self.registry.register_worker("auth hash bcrypt v1", worker("x"))
+        self.assertIn("whitespace", str(caught.exception))
 
     def test_a_non_callable_is_refused(self):
         with self.assertRaises(ExecutionCheckpointError) as caught:
@@ -303,14 +320,72 @@ class DeclarationTest(unittest.TestCase):
             bare.task("hash", worker_key="auth.hash.argon2.v1", assumes="x")
         self.assertIn("no TaskRegistry", str(caught.exception))
 
-    def test_a_per_task_registry_overrides_the_runner_default(self):
+    def test_a_task_cannot_name_a_registry_of_its_own(self):
+        """One Runner, one registry — the invariant the whole layer rests on.
+
+        A checkpoint records the key and not the table it was resolved through.
+        So if a task could name its own registry, this would be reachable::
+
+            runner registry:  auth.hash.v1 → argon2
+            task registry:    auth.hash.v1 → bcrypt
+
+            process A runs        bcrypt
+            checkpoint says       "auth.hash.v1"
+            process B restores    argon2
+
+        which is precisely the resurrection the durable key exists to prevent.
+        There is no parameter to pass, so the mistake is not expressible.
+        """
         other = TaskRegistry()
-        other.register_worker("other.v1", worker("other"))
+        other.register_worker("auth.hash.argon2.v1", worker("bcrypt-in-disguise"))
+        with self.assertRaises(TypeError) as caught:
+            self.runner.task(
+                "elsewhere",
+                worker_key="auth.hash.argon2.v1",
+                assumes="x",
+                registry=other,
+            )
+        self.assertIn("registry", str(caught.exception))
+
+    def test_a_repair_cannot_name_a_registry_of_its_own(self):
+        other = TaskRegistry()
+        other.register_worker("auth.hash.argon2.v1", worker("bcrypt-in-disguise"))
         self.runner.task(
-            "elsewhere", worker_key="other.v1", assumes="x", registry=other
+            "hash", worker_key="auth.hash.argon2.v1", assumes="x"
         )
+        with self.assertRaises(TypeError) as caught:
+            self.runner.repair(
+                "hash", worker_key="auth.hash.argon2.v1", registry=other
+            )
+        self.assertIn("registry", str(caught.exception))
+
+    def test_one_key_means_one_implementation_across_the_whole_runner(self):
+        """The behavioural half of the rule above, not just the signature.
+
+        Two registries disagreeing about `auth.hash.argon2.v1` must not be able
+        to put a task in this Runner that runs one of them while its binding
+        names the other. Whatever this Runner runs for a key is what a later
+        process resolving that key gets.
+        """
+        rival = TaskRegistry()
+        rival.register_worker("auth.hash.argon2.v1", worker("bcrypt-in-disguise"))
+
+        self.runner.task("hash", worker_key="auth.hash.argon2.v1", assumes="x")
         self.runner.run()
-        self.assertEqual(self.runner.output("elsewhere")["implementation"], "other")
+        ran = self.runner.output("hash")["implementation"]
+        key = self.runner.bindings()["hash"]["worker_key"]
+
+        # A later process, holding only the key, resolving through the registry
+        # this Runner was configured with.
+        restored = Runner("auth", registry=self.registry)
+        restored.task("hash", worker_key=key, assumes="x")
+        restored.run()
+
+        self.assertEqual(ran, "argon2")
+        self.assertEqual(restored.output("hash")["implementation"], ran)
+        # And the rival table, which never reached the Runner, changed nothing.
+        self.assertEqual(rival.worker("auth.hash.argon2.v1")(None)["implementation"],
+                         "bcrypt-in-disguise")
 
     def test_an_unregistered_key_is_refused_at_declaration(self):
         """Not deferred to run time — the plan is wrong now."""
@@ -356,6 +431,16 @@ class DeclarationTest(unittest.TestCase):
                 }
             },
         )
+
+    def test_the_governing_runner_is_not_part_of_the_durable_record(self):
+        """A checkpoint carries keys, never the tables that explain them."""
+        task = self.runner.task(
+            "hash_password", worker_key="auth.hash.argon2.v1", assumes="x"
+        )
+        self.assertIs(task.governed_by, self.runner)
+        self.assertNotIn("governed_by", task.to_dict())
+        self.assertNotIn("governed_by", task.binding())
+        self.assertNotIn("Runner", repr(task))
 
     def test_to_dict_carries_the_keys_and_not_the_callables(self):
         task = self.runner.task(
@@ -468,6 +553,99 @@ class RebindTest(unittest.TestCase):
             task.rebind(partial)
         self.assertIs(task.run, original_run, "the worker was swapped anyway")
         self.assertIs(task.audit, original_audit)
+
+    def test_rebind_adopts_the_registry_it_resolved_against(self):
+        """Otherwise the Runner ends up with two answers to what a key means.
+
+        Before this, `rebind(fresh)` swapped the callables and left the old
+        registry in place, so the tasks ran the new code while the very next
+        `repair()` resolved names through the old table.
+        """
+        fresh = TaskRegistry()
+        fresh.register_worker("auth.hash.argon2.v1", worker("argon2-fresh"))
+        fresh.register_worker("auth.hash.bcrypt.v1", worker("bcrypt-fresh"))
+        fresh.register_auditor("auth.hash.audit.v1", auditor())
+
+        self.runner.rebind(fresh)
+        self.assertIs(self.runner.registry, fresh)
+
+        # The proof that it matters: a repair after the rebind resolves through
+        # the adopted registry, which is also the one running the tasks.
+        self.runner.repair("hash_password", worker_key="auth.hash.bcrypt.v1")
+        self.runner.run()
+        self.assertEqual(
+            self.runner.output("hash_password")["implementation"], "bcrypt-fresh"
+        )
+
+    def test_a_failed_rebind_does_not_adopt_the_registry_either(self):
+        """All-or-nothing covers the registry, not just the callables."""
+        incomplete = TaskRegistry()
+        incomplete.register_worker("auth.hash.argon2.v1", worker("argon2-fresh"))
+        # No auditor: the second half of the resolve will fail.
+
+        with self.assertRaises(ExecutionCheckpointError):
+            self.runner.rebind(incomplete)
+
+        self.assertIs(self.runner.registry, self.registry)
+        self.runner.run()
+        self.assertEqual(
+            self.runner.output("hash_password")["implementation"], "argon2"
+        )
+
+    def test_the_registry_cannot_be_swapped_by_assignment(self):
+        """A bare assignment would swap the meaning without rebinding anything."""
+        fresh = TaskRegistry()
+        fresh.register_worker("auth.hash.argon2.v1", worker("argon2-fresh"))
+        with self.assertRaises(AttributeError):
+            self.runner.registry = fresh
+
+    def test_a_runners_task_cannot_be_rebound_against_a_foreign_registry(self):
+        """The same hole as a per-task registry=, reached one task at a time.
+
+        `Task.rebind` takes a registry directly, so without this a task inside a
+        Runner could be pointed at a table the Runner never adopted: it runs
+        that table's code while its binding still names a key the Runner
+        resolves to something else, and the restore picks the Runner's answer.
+        """
+        rival = TaskRegistry()
+        rival.register_worker("auth.hash.argon2.v1", worker("bcrypt-in-disguise"))
+        rival.register_auditor("auth.hash.audit.v1", auditor())
+
+        task = self.runner["hash_password"]
+        with self.assertRaises(ExecutionCheckpointError) as caught:
+            task.rebind(rival)
+        self.assertIn("rebind the Runner", str(caught.exception))
+
+        # Nothing moved: it still runs, and runs the Runner's implementation.
+        self.runner.run()
+        self.assertEqual(
+            self.runner.output("hash_password")["implementation"], "argon2"
+        )
+
+    def test_a_runners_task_may_be_rebound_against_the_runners_own_registry(self):
+        """The rule is one registry, not no rebinding."""
+        task = self.runner["hash_password"]
+        self.assertIs(task.rebind(self.registry), task)
+
+    def test_the_runners_rebind_makes_the_new_registry_legitimate_for_its_tasks(self):
+        fresh = TaskRegistry()
+        fresh.register_worker("auth.hash.argon2.v1", worker("argon2-fresh"))
+        fresh.register_auditor("auth.hash.audit.v1", auditor())
+
+        self.runner.rebind(fresh)
+        # What was foreign a moment ago is now this Runner's own table.
+        self.runner["hash_password"].rebind(fresh)
+        self.runner.run()
+        self.assertEqual(
+            self.runner.output("hash_password")["implementation"], "argon2-fresh"
+        )
+
+    def test_a_standalone_task_is_governed_by_nothing_and_rebinds_freely(self):
+        task = Task(
+            name="solo", title="Solo", run=worker("old"), assumes="x",
+            worker_key="solo.v1",
+        )
+        self.assertIsNone(task.governed_by)
 
     def test_a_task_rebinds_on_its_own(self):
         fresh = TaskRegistry()
@@ -582,13 +760,67 @@ class ArgonToBcryptTest(unittest.TestCase):
         registry.register_auditor("auth.hash.audit.v1", auditor())
         return registry
 
-    def test_the_repaired_binding_is_what_a_later_process_restores(self):
-        first = self.deployment()
-        runner = self.build(first)
+    def restore(self, durable):
+        """A second process: nothing shared but the strings and its own registry."""
+        restored = Runner("auth", registry=self.deployment())
+        restored.task(
+            "hash_password",
+            worker_key=durable["hash_password"]["worker_key"],
+            auditor_key=durable["hash_password"]["auditor_key"],
+            assumes="bcrypt has no open advisory",
+        )
+        return restored
+
+    def test_the_repair_updates_the_durable_identity_before_anything_reruns(self):
+        """The dangerous boundary: repaired, not yet rerun, then the process dies.
+
+            argon2 runs
+                 ↓
+            CVE → repair to bcrypt
+                 ↓
+            CHECKPOINT          ← here, with bcrypt never having executed
+                 ↓
+            process dies
+                 ↓
+            restore → first execution must be bcrypt
+
+        Post-repair/pre-rerun is the state a crash is most likely to catch, and
+        the only one that separates two implementations: `repair()` updating the
+        durable key itself, versus some later run or commit doing it. If the
+        binding were a side effect of execution, a test that reran bcrypt in the
+        first process would still pass while a real crash resurrected argon2.
+        """
+        runner = self.build(self.deployment())
         runner.run()
         self.assertEqual(runner.output("hash_password")["implementation"], "argon2")
 
-        # A CVE lands and the assumption is regrounded on bcrypt.
+        runner.repair(
+            "hash_password",
+            assumes="bcrypt has no open advisory",
+            worker_key="auth.hash.bcrypt.v1",
+        )
+
+        # Deliberately no runner.run(). bcrypt has never executed in this process.
+        self.assertEqual(runner.state("hash_password"), TaskState.STALE)
+        durable = runner.bindings()
+        self.assertEqual(
+            durable["hash_password"]["worker_key"],
+            "auth.hash.bcrypt.v1",
+            "repair() did not move the durable key; only a later run would have",
+        )
+
+        restored = self.restore(durable)
+        restored.run()
+        self.assertEqual(
+            restored.output("hash_password")["implementation"],
+            "bcrypt",
+            "the restored process resurrected the worker the CVE was about",
+        )
+
+    def test_the_repaired_binding_also_survives_a_rerun_before_the_checkpoint(self):
+        """The gentler ordering: the first process got to finish its rerun."""
+        runner = self.build(self.deployment())
+        runner.run()
         runner.repair(
             "hash_password",
             assumes="bcrypt has no open advisory",
@@ -597,27 +829,10 @@ class ArgonToBcryptTest(unittest.TestCase):
         runner.run()
         self.assertEqual(runner.output("hash_password")["implementation"], "bcrypt")
 
-        # This is everything a checkpoint would carry: two strings.
-        durable = runner.bindings()
-        self.assertEqual(
-            durable["hash_password"]["worker_key"], "auth.hash.bcrypt.v1"
-        )
-
-        # A second process. Nothing shared but the strings and its own registry.
-        second = self.deployment()
-        restored = Runner("auth", registry=second)
-        restored.task(
-            "hash_password",
-            worker_key=durable["hash_password"]["worker_key"],
-            auditor_key=durable["hash_password"]["auditor_key"],
-            assumes="bcrypt has no open advisory",
-        )
+        restored = self.restore(runner.bindings())
         restored.run()
-
         self.assertEqual(
-            restored.output("hash_password")["implementation"],
-            "bcrypt",
-            "the restored process resurrected the worker the CVE was about",
+            restored.output("hash_password")["implementation"], "bcrypt"
         )
 
     def test_the_pre_repair_binding_is_the_one_that_would_resurrect_argon2(self):
