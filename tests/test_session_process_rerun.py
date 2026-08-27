@@ -12,8 +12,6 @@ its own TaskRegistry, because registry contents are deployment configuration and
 must never cross the checkpoint boundary.
 """
 
-from __future__ import annotations
-
 import json
 import subprocess
 import sys
