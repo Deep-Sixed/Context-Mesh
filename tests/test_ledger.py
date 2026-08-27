@@ -444,6 +444,16 @@ class DuplicateJsonKeyTest(unittest.TestCase):
         loose = json.loads('{"hasher": "Argon2id", "hasher": "Bcrypt"}')
         self.assertEqual(loose, {"hasher": "Bcrypt"})
 
+    def test_a_syntactically_broken_file_arrives_as_a_ledger_error(self):
+        """One error boundary: a truncated file is not a different kind of problem.
+
+        A caller catching LedgerIntegrityError should not also have to catch
+        json.JSONDecodeError to cover "the file is cut in half".
+        """
+        with self.assertRaises(LedgerIntegrityError) as caught:
+            RunLedger.load_json(self.write('{"schema":'))
+        self.assertIn("not valid JSON", str(caught.exception))
+
     def test_a_file_with_unique_keys_still_loads(self):
         ledger = history()
         path = self.write(ledger.to_json())

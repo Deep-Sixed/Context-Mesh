@@ -64,6 +64,17 @@ class LedgerIntegrityError(ExecutionError):
     """
 
 
+class ExecutionSnapshotError(ExecutionError):
+    """Raised when a serialised execution state is not one this build can restore.
+
+    Distinct from :class:`ExecutionCheckpointError`, which is about a *key* this
+    deployment cannot bind, and from :class:`LedgerIntegrityError`, which is
+    about a *history* that does not add up. This one is about the plan: a field
+    of the wrong shape, a task named twice, or a reference into a graph that
+    does not hold what the snapshot says it holds.
+    """
+
+
 class ExecutionCheckpointError(ExecutionError):
     """Raised when durable execution identity is missing, wrong, or ambiguous.
 
@@ -415,6 +426,44 @@ class Task:
         """The durable half of this task: two names, no code."""
         return {"worker_key": self.worker_key, "auditor_key": self.auditor_key}
 
+    def snapshot(self) -> Dict[str, Any]:
+        """Everything a later process needs to be *this* task again.
+
+        Not :meth:`to_dict`, which is the report view: that one carries the
+        derived ``audited`` flag and omits ``rationale`` and ``output``, because
+        it answers "what happened" rather than "what state is this in".
+        """
+        return {
+            "name": self.name,
+            "title": self.title,
+            "rationale": self.rationale,
+            "state": self.state.value,
+            "attempt": self.attempt,
+            "assumes": self.assumes,
+            "needs": list(self.needs),
+            "produces": list(self.produces),
+            "worker_key": self.worker_key,
+            "auditor_key": self.auditor_key,
+            "node_id": self.node_id,
+            "assumption_id": self.assumption_id,
+            "output": self._storable_output(),
+            "artefacts": list(self.artefacts),
+        }
+
+    def _storable_output(self) -> Dict[str, Any]:
+        """A worker may return anything; what may be *stored* is narrower.
+
+        Refused at the write rather than the read, because here the run that
+        produced it is still in front of you. A set has no order and a NaN is
+        not JSON, so either would come back rendered differently than it went in.
+        """
+        try:
+            return _canonical(dict(self.output), path="output")
+        except ExecutionError as exc:
+            raise ExecutionSnapshotError(
+                f"task {self.name!r} cannot be checkpointed: {exc}"
+            ) from None
+
     def rebind(self, registry: "TaskRegistry") -> "Task":
         """Reconnect this task's callables from its keys, or refuse.
 
@@ -483,33 +532,67 @@ _ENTRY_KEYS = frozenset(
 _LEDGER_KEYS = frozenset({"schema", "version", "head", "entries"})
 
 
+class _DuplicateKey(ValueError):
+    """Internal. Raised inside the JSON hook, re-raised as the format's own error.
+
+    The hook is shared by both durable formats, so it cannot name either one —
+    ``_parse_durable_json`` translates it into whichever error the caller's
+    format uses.
+    """
+
+
 def _strict_object(pairs: Any) -> Dict[str, Any]:
     """json object hook. Two keys with one name have no agreed meaning.
 
     Python keeps the last, other parsers keep the first, and some refuse the
-    document outright. That is tolerable in a config file and not tolerable
-    here: this ledger is meant to be re-checkable by an implementation that is
-    not this one, and a digest only means something if every reader agrees which
+    document outright. That is tolerable in a config file and not here: these
+    files exist to be read back by an implementation that is not this one, and
+    for the ledger a digest only means something if every reader agrees which
     JSON value it was taken over. Applied through ``object_pairs_hook`` so it
-    reaches the container, each entry, and the signed ``data`` payload alike.
+    reaches the container, each record, and every nested payload alike.
     """
     result: Dict[str, Any] = {}
     for key, value in pairs:
         if key in result:
-            raise LedgerIntegrityError(
+            raise _DuplicateKey(
                 f"duplicate JSON key {key!r}; two values under one name mean "
-                "different things to different parsers, so the digest would be "
-                "taken over an object readers disagree about"
+                "different things to different parsers, so readers would "
+                "disagree about what this file says"
             )
         result[key] = value
     return result
 
 
+def _parse_durable_json(text: str, error: type) -> Any:
+    """Read a durable file, with syntax failures inside the format's own error.
+
+    A caller catching ``LedgerIntegrityError`` or ``ExecutionSnapshotError``
+    should not also have to catch ``json.JSONDecodeError`` to cover "the file is
+    truncated" — that is the same answer as any other unreadable file, arriving
+    under a different name because of how it happens to be parsed.
+    """
+    try:
+        return json.loads(
+            text,
+            parse_constant=_no_ledger_constants,
+            object_pairs_hook=_strict_object,
+        )
+    except (_DuplicateKey, _NonJsonConstant) as exc:
+        # Checked before JSONDecodeError: all of these are ValueErrors.
+        raise error(str(exc)) from None
+    except json.JSONDecodeError as exc:
+        raise error(f"file is not valid JSON: {exc}") from None
+
+
+class _NonJsonConstant(ValueError):
+    """Internal, for the same reason as :class:`_DuplicateKey`."""
+
+
 def _no_ledger_constants(value: str) -> float:
     """json.load hook. ``NaN``/``Infinity`` are not JSON and do not round-trip."""
-    raise LedgerIntegrityError(
-        f"ledger contains the non-JSON constant {value!r}; a digest taken over "
-        "a value other parsers refuse is not a digest anyone can re-check"
+    raise _NonJsonConstant(
+        f"contains the non-JSON constant {value!r}; a value other parsers "
+        "refuse is not a value anyone else can read back"
     )
 
 
@@ -747,11 +830,7 @@ class RunLedger:
         from pathlib import Path
 
         text = Path(path).read_text(encoding="utf-8")
-        data = json.loads(
-            text,
-            parse_constant=_no_ledger_constants,
-            object_pairs_hook=_strict_object,
-        )
+        data = _parse_durable_json(text, LedgerIntegrityError)
         return cls.from_snapshot(data, expect_head=expect_head)
 
     @classmethod
@@ -952,6 +1031,215 @@ def _entry_from_row(row: Any, index: int) -> LedgerEntry:
         # every entry consistent by construction and the chain unfalsifiable.
         digest=digest,
     )
+
+
+def _task_from_row(row: Any, index: int) -> Task:
+    """One serialised task, checked field by field before it becomes an object.
+
+    No callables are set here. A task arrives from a file with two names and
+    leaves this function still holding only names; binding them is a separate
+    step, so a plan that fails to bind never half-exists.
+    """
+    where = f"execution task {index}"
+    if not isinstance(row, dict):
+        raise ExecutionSnapshotError(
+            f"{where} must be an object, got {type(row).__name__}"
+        )
+    missing = sorted(_TASK_KEYS - set(row))
+    if missing:
+        raise ExecutionSnapshotError(
+            f"{where} is missing " + ", ".join(repr(key) for key in missing)
+        )
+    unknown = sorted(set(row) - _TASK_KEYS)
+    if unknown:
+        raise ExecutionSnapshotError(
+            f"{where} carries "
+            + ", ".join(repr(key) for key in unknown)
+            + ", which v1 does not define"
+        )
+
+    for field_name in ("name", "title", "rationale", "assumes"):
+        if not isinstance(row[field_name], str):
+            raise ExecutionSnapshotError(
+                f"{where}: {field_name} must be a string, got {row[field_name]!r}"
+            )
+    if not row["name"]:
+        raise ExecutionSnapshotError(f"{where}: name must not be empty")
+    where = f"execution task {row['name']!r}"
+
+    state = row["state"]
+    if not isinstance(state, str):
+        raise ExecutionSnapshotError(f"{where}: state must be a string, got {state!r}")
+    try:
+        parsed_state = TaskState(state)
+    except ValueError:
+        known = ", ".join(sorted(s.value for s in TaskState))
+        raise ExecutionSnapshotError(
+            f"{where}: {state!r} is not a state this build knows; it reads {known}. "
+            "Blocked is deliberately absent — it is a fact about a round, not a task"
+        ) from None
+
+    attempt = row["attempt"]
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 0:
+        raise ExecutionSnapshotError(
+            f"{where}: attempt must be a non-negative integer, got {attempt!r}"
+        )
+
+    for field_name in ("needs", "produces", "artefacts"):
+        value = row[field_name]
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            raise ExecutionSnapshotError(
+                f"{where}: {field_name} must be an array of strings, got {value!r}"
+            )
+
+    worker_key = row["worker_key"]
+    if worker_key is None:
+        raise ExecutionSnapshotError(
+            f"{where}: has no worker_key. A plain callable runs perfectly well in "
+            "memory and simply cannot be checkpointed, so it cannot be restored"
+        )
+    _valid_key(worker_key, "worker")
+    auditor_key = row["auditor_key"]
+    if auditor_key is not None:
+        _valid_key(auditor_key, "auditor")
+
+    for field_name in ("node_id", "assumption_id"):
+        value = row[field_name]
+        if value is not None and (not isinstance(value, str) or not value):
+            raise ExecutionSnapshotError(
+                f"{where}: {field_name} must be a non-empty string or null, "
+                f"got {value!r}"
+            )
+
+    output = row["output"]
+    if not isinstance(output, dict):
+        raise ExecutionSnapshotError(
+            f"{where}: output must be an object, got {type(output).__name__}"
+        )
+    try:
+        # A worker may return anything; what may be *stored* is narrower. A set
+        # has no order and a NaN is not JSON, so either would restore into
+        # something a later reader renders differently than this one wrote it.
+        canonical = _canonical(output, path="output")
+    except ExecutionError as exc:
+        raise ExecutionSnapshotError(f"{where}: {exc}") from None
+
+    return Task(
+        name=row["name"],
+        title=row["title"],
+        run=_unbound,
+        assumes=row["assumes"],
+        rationale=row["rationale"],
+        needs=tuple(row["needs"]),
+        produces=tuple(row["produces"]),
+        audit=None,
+        worker_key=worker_key,
+        auditor_key=auditor_key,
+        state=parsed_state,
+        attempt=attempt,
+        node_id=row["node_id"],
+        assumption_id=row["assumption_id"],
+        output=canonical,
+        artefacts=tuple(row["artefacts"]),
+    )
+
+
+def _unbound(ctx: "RunContext") -> Dict[str, Any]:
+    """Placeholder between shape-checking a task and binding its worker.
+
+    Never reachable through a restored Runner: ``from_snapshot`` binds every
+    task before it hands one back, and refuses as a whole if any key is missing.
+    It exists so a half-checked task is never a callable that would silently run.
+    """
+    raise ExecutionCheckpointError(
+        "this task was restored but never bound to a worker; "
+        "Runner.from_snapshot binds every task or refuses the whole plan"
+    )
+
+
+def _close_task_references(task: Task, *, tasks: Set[str], graph: ContextGraph) -> None:
+    """Every id a restored task names has to point at something, now.
+
+    A dangling reference that loads quietly becomes a crash three rounds later,
+    in code that has no idea a file was involved.
+    """
+    where = f"execution task {task.name!r}"
+    for need in task.needs:
+        if need not in tasks:
+            raise ExecutionSnapshotError(
+                f"{where}: needs {need!r}, which is not a task in this snapshot"
+            )
+    if task.name in task.needs:
+        raise ExecutionSnapshotError(f"{where}: needs itself")
+
+    if task.assumption_id is not None and task.assumption_id not in graph.assumptions:
+        raise ExecutionSnapshotError(
+            f"{where}: assumption {task.assumption_id!r} is not in this graph"
+        )
+    if task.node_id is not None:
+        node = graph.nodes.get(task.node_id)
+        if node is None:
+            raise ExecutionSnapshotError(
+                f"{where}: decision {task.node_id!r} is not in this graph"
+            )
+        if node.type is not NodeType.DECISION:
+            raise ExecutionSnapshotError(
+                f"{where}: {task.node_id!r} is a {node.type.value}, not a decision"
+            )
+        if task.state is TaskState.DONE and node.invalidated:
+            # Measured against the live lifecycle rather than assumed: a STALE
+            # task legitimately points at an invalidated decision — that is what
+            # selective invalidation leaves behind. A DONE one does not, and a
+            # plan restored in that state would schedule as settled while the
+            # graph says its ground is gone.
+            raise ExecutionSnapshotError(
+                f"{where}: says done, but decision {task.node_id!r} is invalidated. "
+                "A task whose ground fell is stale, not done"
+            )
+    for artefact_id in task.artefacts:
+        node = graph.nodes.get(artefact_id)
+        if node is None:
+            raise ExecutionSnapshotError(
+                f"{where}: artefact {artefact_id!r} is not in this graph"
+            )
+        if node.type is not NodeType.ENTITY:
+            raise ExecutionSnapshotError(
+                f"{where}: artefact {artefact_id!r} is a {node.type.value}, "
+                "not an entity"
+            )
+
+
+#: The durable execution format. Versioned apart from the graph snapshot and the
+#: run ledger, because plan state, provenance and history change for different
+#: reasons and one shared number would force all three to move together.
+EXECUTION_SCHEMA = "contextmesh.execution"
+EXECUTION_VERSION = 1
+
+_EXECUTION_KEYS = frozenset({"schema", "version", "plan", "round", "tasks"})
+
+#: What a serialised task holds — all of it, and only this. Callables are absent
+#: by construction: ``run`` and ``audit`` are rebuilt from their keys through the
+#: Runner's registry. So are the derived facts — ready-ness and blocked-ness are
+#: recomputed every round from state, ground and dependencies, and storing them
+#: would let a file assert a schedule its own contents contradict.
+_TASK_KEYS = frozenset(
+    {
+        "name",
+        "title",
+        "rationale",
+        "state",
+        "attempt",
+        "assumes",
+        "needs",
+        "produces",
+        "worker_key",
+        "auditor_key",
+        "node_id",
+        "assumption_id",
+        "output",
+        "artefacts",
+    }
+)
 
 
 @dataclass
@@ -1372,6 +1660,193 @@ class Runner:
     def bindings(self) -> Dict[str, Dict[str, Optional[str]]]:
         """Every task's durable identity, by name. Names only, never callables."""
         return {name: self._tasks[name].binding() for name in self._order}
+
+    # ── the durable format ───────────────────────────────────────────────
+    def snapshot(self) -> Dict[str, Any]:
+        """This plan's semantic state, as a versioned container.
+
+        ``tasks`` is in declaration order and is **not** sorted. Order is part
+        of the scheduler's semantics, not presentation: :meth:`_ready` walks
+        ``_order``, so for two tasks that become ready in the same round it
+        decides which runs first. Sorting the array would reorder a restored
+        plan's execution without changing a single field.
+
+        ``plan`` is here because it is load-bearing rather than a label — the
+        source node's id and every decision id are derived from it, so a restore
+        under a different plan string would append a parallel provenance trail
+        beside the one it claims to continue.
+
+        The run ledger is deliberately not inside this: it has its own versioned
+        format and its own head, and nesting it would give one history two
+        containers that could disagree.
+        """
+        self.require_checkpointable()
+        return {
+            "schema": EXECUTION_SCHEMA,
+            "version": EXECUTION_VERSION,
+            "plan": self.plan,
+            "round": self.round,
+            "tasks": [self._tasks[name].snapshot() for name in self._order],
+        }
+
+    def to_json(self) -> str:
+        """The snapshot as text, in the exact form :meth:`save_json` writes."""
+        return (
+            json.dumps(
+                self.snapshot(),
+                sort_keys=True,
+                indent=2,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            + "\n"
+        )
+
+    def save_json(self, path: Any) -> Any:
+        from pathlib import Path
+
+        target = Path(path)
+        target.write_text(self.to_json(), encoding="utf-8")
+        return target
+
+    @classmethod
+    def load_json(
+        cls,
+        path: Any,
+        *,
+        graph: ContextGraph,
+        registry: TaskRegistry,
+        ledger: Optional[RunLedger] = None,
+        assumptions: Optional[AssumptionLedger] = None,
+        decisions: Optional[DecisionLog] = None,
+    ) -> "Runner":
+        from pathlib import Path
+
+        text = Path(path).read_text(encoding="utf-8")
+        data = _parse_durable_json(text, ExecutionSnapshotError)
+        return cls.from_snapshot(
+            data,
+            graph=graph,
+            registry=registry,
+            ledger=ledger,
+            assumptions=assumptions,
+            decisions=decisions,
+        )
+
+    @classmethod
+    def from_snapshot(
+        cls,
+        data: Any,
+        *,
+        graph: ContextGraph,
+        registry: TaskRegistry,
+        ledger: Optional[RunLedger] = None,
+        assumptions: Optional[AssumptionLedger] = None,
+        decisions: Optional[DecisionLog] = None,
+    ) -> "Runner":
+        """Rebuild a plan from a snapshot against a live graph, or refuse it.
+
+        Three things are reconstructed rather than read, and each for a reason::
+
+            run / audit    from worker_key / auditor_key, through `registry`
+            ready/blocked  recomputed, because they are facts about this round
+            source node    re-derived from `plan`, and dedupes onto the old one
+
+        A snapshot is untrusted input, so its references are closed here rather
+        than left to fail somewhere downstream: the assumption must exist, the
+        decision must be a decision, the artefacts must be entities, and every
+        ``needs`` must name a task in this same file. A task that says it is
+        DONE while its decision has been invalidated is refused outright — that
+        is a plan which would restore as runnable and then contradict the graph
+        it was restored against.
+        """
+        if not isinstance(data, dict):
+            raise ExecutionSnapshotError(
+                f"execution snapshot must be an object, got {type(data).__name__}"
+            )
+        missing = sorted(_EXECUTION_KEYS - set(data))
+        if missing:
+            raise ExecutionSnapshotError(
+                "execution snapshot is missing "
+                + ", ".join(repr(key) for key in missing)
+            )
+        unknown = sorted(set(data) - _EXECUTION_KEYS)
+        if unknown:
+            raise ExecutionSnapshotError(
+                "execution snapshot carries "
+                + ", ".join(repr(key) for key in unknown)
+                + ", which v1 does not define"
+            )
+        if data["schema"] != EXECUTION_SCHEMA:
+            raise ExecutionSnapshotError(
+                f"not a {EXECUTION_SCHEMA} snapshot: schema is {data['schema']!r}"
+            )
+        version = data["version"]
+        if isinstance(version, bool) or not isinstance(version, int):
+            raise ExecutionSnapshotError(
+                f"execution version must be an integer, got {version!r}"
+            )
+        if version != EXECUTION_VERSION:
+            raise ExecutionSnapshotError(
+                f"execution version {version!r} cannot be read by this build, "
+                f"which writes and reads version {EXECUTION_VERSION}"
+            )
+        plan = data["plan"]
+        if not isinstance(plan, str) or not plan:
+            raise ExecutionSnapshotError(
+                f"execution plan must be a non-empty string, got {plan!r}"
+            )
+        round_ = data["round"]
+        if isinstance(round_, bool) or not isinstance(round_, int) or round_ < 0:
+            raise ExecutionSnapshotError(
+                f"execution round must be a non-negative integer, got {round_!r}"
+            )
+        rows = data["tasks"]
+        if not isinstance(rows, list):
+            raise ExecutionSnapshotError(
+                f"execution tasks must be an array, got {type(rows).__name__}"
+            )
+
+        # Shape first, in declaration order, before anything is looked up.
+        tasks: List[Task] = []
+        seen: Set[str] = set()
+        for index, row in enumerate(rows, start=1):
+            task = _task_from_row(row, index)
+            if task.name in seen:
+                raise ExecutionSnapshotError(
+                    f"execution task {task.name!r} appears twice; a task name is "
+                    "how dependencies and the ledger refer to it, so two of them "
+                    "have no single meaning"
+                )
+            seen.add(task.name)
+            tasks.append(task)
+
+        # Then references, which need the whole set and the live graph.
+        for task in tasks:
+            _close_task_references(task, tasks=seen, graph=graph)
+
+        # Then code, which is the one thing the file never carried.
+        for task in tasks:
+            assert task.worker_key is not None  # every row was checked above
+            task.run = registry.worker(task.worker_key)
+            if task.auditor_key is not None:
+                task.audit = registry.auditor(task.auditor_key)
+
+        runner = cls(
+            plan,
+            graph=graph,
+            assumptions=assumptions,
+            decisions=decisions,
+            registry=registry,
+        )
+        if ledger is not None:
+            runner.ledger = ledger
+        runner.round = round_
+        for task in tasks:
+            task.governed_by = runner
+            runner._tasks[task.name] = task
+            runner._order.append(task.name)
+        return runner
 
     def rebind(self, registry: Optional[TaskRegistry] = None) -> "Runner":
         """Reconnect every task's callables from its keys, or refuse.

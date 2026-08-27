@@ -355,10 +355,71 @@ first, and some reject the document; a digest is only meaningful if every reader
 agrees which JSON value it was taken over, and this file is meant to be
 re-checkable by an implementation that is not this one.
 
-This is the second slice of execution checkpointing. The execution snapshot
-format and a session that joins graph, resolver and execution are deliberately
-not built yet: the ledger's restore is proved first so the larger format is not
-designed around an unproven model of how history is carried.
+### A restored plan has to schedule the same work
+
+`runner.snapshot()` writes `contextmesh.execution` v1 — the plan's semantic
+state, and nothing that can be derived from it:
+
+```json
+{ "schema": "contextmesh.execution", "version": 1,
+  "plan": "auth", "round": 2, "tasks": [ … ] }
+```
+
+Each task carries its name, title, rationale, state, attempt, ground, `needs`,
+`produces`, both durable keys, its decision and assumption ids, its output and
+its artefacts. Three things are deliberately absent:
+
+```
+run / audit    rebuilt from the keys, through the Runner's registry
+ready/blocked  recomputed — facts about a round, not about a task
+the registry   deployment configuration, never file state
+```
+
+`TaskState` has no `BLOCKED` member for the same reason: being blocked is
+decided every round from state, ground and dependencies. A file that stored a
+schedule could assert one its own contents contradict.
+
+**Task order is not sorted.** `_ready()` walks declaration order, so for two
+tasks that become ready in the same round it decides which runs first. Sorting
+the array would reorder a restored plan's execution without changing a field.
+`plan` is stored for a related reason — the source node's id and every decision
+id are derived from it, so restoring under a different string would append a
+parallel provenance trail beside the one it claims to continue.
+
+**References are closed at load, not left to fail later.** The assumption must
+exist in the graph, the decision must be a `DECISION`, the artefacts must be
+`ENTITY` nodes, and every `needs` must name a task in the same file. One state
+rule joins the two records:
+
+```
+task says DONE  +  its decision is invalidated   → REFUSED
+task says STALE +  its decision is invalidated   → fine, that is what
+                                                   invalidation leaves behind
+```
+
+That asymmetry is measured against the live lifecycle rather than assumed: a
+stale task pointing at an invalidated decision is the normal post-CVE state, and
+the restore below depends on it being allowed.
+
+The load-bearing case is the awkward one — repaired but not yet rerun:
+
+```
+argon2 green → CVE → recheck → hashing, routes STALE; schema, tokens DONE
+                                    ↓
+                          repair hashing → bcrypt
+                                    ↓
+                              CHECKPOINT          bcrypt has never run
+                                    ↓
+                    restore → same ready set, same attempts
+                                    ↓
+                    run() → only the stale closure moves
+```
+
+A restored plan and one carried forward in memory are compared task by task
+after `run()` — same states, same attempt counts, same outputs.
+
+This is the third slice of execution checkpointing. A session that joins graph,
+resolver and execution is deliberately not built yet.
 
 ### The standalone control layer
 
