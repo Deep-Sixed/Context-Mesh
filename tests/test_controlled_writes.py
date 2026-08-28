@@ -147,10 +147,14 @@ class ControlledWriteIntegrationTest(unittest.TestCase):
             edge
             for edge in runner.graph.edges.values()
             if edge.type is EdgeType.CONTRADICTS
+            and edge.src == evidence
+            and edge.dst == assumption.id
         ]
-        self.assertEqual(len(contradictions), 1)
-        self.assertEqual(contradictions[0].src, evidence)
-        self.assertEqual(contradictions[0].dst, assumption.id)
+        self.assertEqual(
+            len(contradictions),
+            1,
+            "8B must materialize exactly the evidence→assumption contradiction it audited",
+        )
         self.assertEqual(
             sum(
                 1
@@ -168,6 +172,11 @@ class ControlledWriteIntegrationTest(unittest.TestCase):
         assumption = runner.graph.assumptions[hashing.assumption_id]
         generation = self.session.generation
         head = runner.ledger.head
+        contradictions_before = {
+            edge.id
+            for edge in runner.graph.edges.values()
+            if edge.type is EdgeType.CONTRADICTS
+        }
 
         assert self.session.path is not None
         with writer_lock(self.session.path):
@@ -178,11 +187,13 @@ class ControlledWriteIntegrationTest(unittest.TestCase):
         self.assertEqual(runner.ledger.head, head)
         self.assertIs(hashing.state, TaskState.DONE)
         self.assertIs(assumption.status, AssumptionStatus.ACTIVE)
-        self.assertFalse(
-            any(
-                edge.type is EdgeType.CONTRADICTS
+        self.assertEqual(
+            {
+                edge.id
                 for edge in runner.graph.edges.values()
-            )
+                if edge.type is EdgeType.CONTRADICTS
+            },
+            contradictions_before,
         )
 
     def test_unknown_repair_key_fails_before_the_committed_session_changes(self):
