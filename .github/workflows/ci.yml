@@ -35,6 +35,40 @@ jobs:
         # server-registration tests skip and are covered by the mcp job.
         run: python -m unittest discover -s tests -v
 
+  test-windows:
+    name: windows tests · python ${{ matrix.python }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run the meaningful suite on Windows
+        run: python -m unittest discover -s tests -v
+      - name: The demo CLI degrades deterministically on cp1252
+        shell: bash
+        run: |
+          python - <<'EOF'
+          import io, sys
+          from contextlib import redirect_stdout
+          from contextmesh import cli
+
+          raw = io.BytesIO()
+          stream = io.TextIOWrapper(raw, encoding="cp1252")
+          sys.stdout = stream
+          with redirect_stdout(stream):
+              assert cli.main(["--rounds", "1", "demo"]) == 0
+          stream.flush()
+          out = raw.getvalue().decode("cp1252")
+          assert "BUILD PATH * what earns a node in the graph" in out
+          assert "committed -> walkable" in out
+          print("CP1252 CLI FALLBACK OK", file=sys.__stdout__)
+          EOF
+
   lint:
     name: ruff
     runs-on: ubuntu-latest
@@ -173,6 +207,7 @@ jobs:
           root = pathlib.Path("/tmp/session")
           data = json.loads((root / "session.json").read_text())
           assert data["generation"] == 1, data["generation"]
+          assert (root / "session-000001.json").is_file(), "no immutable manifest"
           assert data["graph"] == "graph-000001.json", data["graph"]
           assert data["resolver"] == "resolver-000001.json", data["resolver"]
           for key in ("graph", "resolver"):
@@ -381,7 +416,9 @@ jobs:
           assert committed["generation"] == held["generation"] + 1
           leftovers = sorted(p.name for p in root.iterdir())
           assert leftovers == sorted(
-              ["session.json", "session.lock", committed["graph"], committed["resolver"]]
+              ["session.json", f"session-{committed['generation']:06d}.json",
+               "session.lock", "session.lock.meta",
+               committed["graph"], committed["resolver"]]
           ), leftovers
           print("generation", held["generation"], "->", committed["generation"], leftovers)
           print("COMMIT IS ATOMIC AND SWEPT")
@@ -414,7 +451,9 @@ jobs:
           after = json.loads((root / "session.json").read_text())
           leftovers = sorted(p.name for p in root.iterdir())
           assert leftovers == sorted(
-              ["session.json", "session.lock", after["graph"], after["resolver"]]
+              ["session.json", f"session-{after['generation']:06d}.json",
+               "session.lock", "session.lock.meta",
+               after["graph"], after["resolver"]]
           ), leftovers
           print("recovered to generation", after["generation"], leftovers)
           print("INTERRUPTED SAVE DID NOT MIX GENERATIONS")

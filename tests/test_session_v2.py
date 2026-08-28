@@ -5,7 +5,8 @@ plan and its run ledger, so a restart brings back not just what is known but
 what was being done about it::
 
     session/
-      session.json          the manifest, and the only thing that commits
+      session-000003.json   the immutable manifest that commits generation 3
+      session.json          compatibility pointer to the latest manifest
       graph-000003.json     what is known
       resolver-000003.json  how a question finds it
       execution-000003.json the plan, mid-repair
@@ -36,6 +37,8 @@ from contextmesh_mcp.session import (
     SESSION_VERSION,
     Session,
     SessionError,
+    live_manifest_path,
+    read_live_manifest_text,
 )
 
 
@@ -88,7 +91,7 @@ class ManifestTest(unittest.TestCase):
         self.dir = Path(self.tmp.name) / "session"
 
     def manifest(self):
-        return json.loads((self.dir / SESSION_FILE).read_text(encoding="utf-8"))
+        return json.loads(read_live_manifest_text(self.dir))
 
     def test_a_session_with_a_plan_names_all_four_companions(self):
         session_with_a_plan().save(self.dir)
@@ -238,7 +241,9 @@ class SeamTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.dir = Path(self.tmp.name) / "session"
         session_with_a_plan().save(self.dir)
-        self.manifest = json.loads((self.dir / SESSION_FILE).read_text())
+        self.manifest_path = live_manifest_path(self.dir)
+        assert self.manifest_path is not None
+        self.manifest = json.loads(self.manifest_path.read_text())
 
     def rewrite(self, field, payload):
         """Replace a companion, and keep the manifest honest about it."""
@@ -247,7 +252,7 @@ class SeamTest(unittest.TestCase):
         )
         if field == "ledger":
             self.manifest["ledger_head"] = payload["head"]
-            (self.dir / SESSION_FILE).write_text(
+            self.manifest_path.write_text(
                 json.dumps(self.manifest, indent=2) + "\n", encoding="utf-8"
             )
 
@@ -275,14 +280,14 @@ class SeamTest(unittest.TestCase):
 
     def test_an_execution_without_a_ledger_is_refused(self):
         self.manifest["ledger"] = None
-        (self.dir / SESSION_FILE).write_text(
+        self.manifest_path.write_text(
             json.dumps(self.manifest, indent=2) + "\n", encoding="utf-8"
         )
         self.refuses("committed together or not at all")
 
     def test_a_ledger_without_an_execution_is_refused(self):
         self.manifest["execution"] = None
-        (self.dir / SESSION_FILE).write_text(
+        self.manifest_path.write_text(
             json.dumps(self.manifest, indent=2) + "\n", encoding="utf-8"
         )
         self.refuses("committed together or not at all")
@@ -313,7 +318,9 @@ class LedgerHeadTest(unittest.TestCase):
         self.dir = Path(self.tmp.name) / "session"
         self.session = session_with_a_plan()
         self.session.save(self.dir)
-        self.manifest = json.loads((self.dir / SESSION_FILE).read_text())
+        self.manifest_path = live_manifest_path(self.dir)
+        assert self.manifest_path is not None
+        self.manifest = json.loads(self.manifest_path.read_text())
 
     def test_the_manifest_records_the_head_it_committed(self):
         self.assertEqual(
@@ -329,7 +336,7 @@ class LedgerHeadTest(unittest.TestCase):
 
     def test_a_v2_manifest_without_a_head_is_refused(self):
         del self.manifest["ledger_head"]
-        (self.dir / SESSION_FILE).write_text(json.dumps(self.manifest, indent=2))
+        self.manifest_path.write_text(json.dumps(self.manifest, indent=2))
         with self.assertRaises(SessionError) as caught:
             Session.load(self.dir, registry=deployment())
         self.assertIn("ledger_head", str(caught.exception))
@@ -351,7 +358,7 @@ class LedgerHeadTest(unittest.TestCase):
 
     def test_a_head_that_does_not_match_the_committed_ledger_is_refused(self):
         self.manifest["ledger_head"] = "0" * 64
-        (self.dir / SESSION_FILE).write_text(json.dumps(self.manifest, indent=2))
+        self.manifest_path.write_text(json.dumps(self.manifest, indent=2))
         with self.assertRaises(SessionError) as caught:
             Session.load(self.dir, registry=deployment())
         self.assertIn("does not continue the history", str(caught.exception))
@@ -365,7 +372,7 @@ class LedgerHeadTest(unittest.TestCase):
         (self.dir / self.manifest["ledger"]).write_text(
             json.dumps(plausible.snapshot()), encoding="utf-8"
         )
-        (self.dir / SESSION_FILE).write_text(json.dumps(self.manifest, indent=2))
+        self.manifest_path.write_text(json.dumps(self.manifest, indent=2))
         restored = Session.load(self.dir, registry=deployment())
         self.assertEqual(restored.runner.ledger.head, plausible.head)
 
@@ -376,14 +383,16 @@ class LedgerReferenceTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.dir = Path(self.tmp.name) / "session"
         session_with_a_plan().save(self.dir)
-        self.manifest = json.loads((self.dir / SESSION_FILE).read_text())
+        self.manifest_path = live_manifest_path(self.dir)
+        assert self.manifest_path is not None
+        self.manifest = json.loads(self.manifest_path.read_text())
 
     def install(self, ledger):
         (self.dir / self.manifest["ledger"]).write_text(
             json.dumps(ledger.snapshot()), encoding="utf-8"
         )
         self.manifest["ledger_head"] = ledger.head
-        (self.dir / SESSION_FILE).write_text(json.dumps(self.manifest, indent=2))
+        self.manifest_path.write_text(json.dumps(self.manifest, indent=2))
 
     def refuses(self, ledger, fragment):
         self.install(ledger)
@@ -443,6 +452,9 @@ class VersionOneTest(unittest.TestCase):
         (self.dir / SESSION_FILE).write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
         )
+        live = live_manifest_path(self.dir)
+        if live is not None:
+            live.unlink()
 
     def test_both_versions_are_readable(self):
         self.assertEqual(READABLE_VERSIONS, (1, 2))

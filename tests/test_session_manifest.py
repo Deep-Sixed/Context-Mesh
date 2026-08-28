@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 from contextmesh.execute import Runner, TaskRegistry
-from contextmesh_mcp.session import Session, SessionError
+from contextmesh_mcp.session import Session, SessionError, live_manifest_path
 
 
 class Advisory:
@@ -81,7 +81,8 @@ def _save_graph_only() -> Path:
 
 
 def _rewrite(directory: Path, **updates) -> None:
-    path = directory / "session.json"
+    path = live_manifest_path(directory)
+    assert path is not None
     data = json.loads(path.read_text(encoding="utf-8"))
     data.update(updates)
     path.write_text(json.dumps(data, sort_keys=True, indent=2) + "\n", encoding="utf-8")
@@ -100,7 +101,9 @@ class ExactManifestTest(unittest.TestCase):
 class ThreeWayInvariantTest(unittest.TestCase):
     def test_null_head_with_an_execution_is_refused(self):
         directory = _save_plan()
-        data = json.loads((directory / "session.json").read_text(encoding="utf-8"))
+        path = live_manifest_path(directory)
+        assert path is not None
+        data = json.loads(path.read_text(encoding="utf-8"))
         self.assertIsNotNone(data["execution"])
         self.assertIsNotNone(data["ledger_head"])
         _rewrite(directory, ledger_head=None)
@@ -112,7 +115,9 @@ class ThreeWayInvariantTest(unittest.TestCase):
 
     def test_head_without_execution_is_refused(self):
         directory = _save_graph_only()
-        data = json.loads((directory / "session.json").read_text(encoding="utf-8"))
+        path = live_manifest_path(directory)
+        assert path is not None
+        data = json.loads(path.read_text(encoding="utf-8"))
         self.assertIsNone(data["execution"])
         _rewrite(directory, ledger_head="a" * 64)
         with self.assertRaises(SessionError) as caught:
@@ -132,7 +137,8 @@ class ThreeWayInvariantTest(unittest.TestCase):
 class DuplicateManifestKeyTest(unittest.TestCase):
     def test_duplicate_ledger_head_is_refused(self):
         directory = _save_plan()
-        path = directory / "session.json"
+        path = live_manifest_path(directory)
+        assert path is not None
         text = path.read_text(encoding="utf-8")
         self.assertIn('"ledger_head":', text)
         text = text.replace(
