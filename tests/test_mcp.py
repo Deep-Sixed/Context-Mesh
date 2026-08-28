@@ -1,27 +1,19 @@
-"""The MCP read boundary: telemetry may move, structure and belief may not.
+"""MCP read/write authority boundaries.
 
-`graph_before == graph_after` is the wrong test. A walk bumps `node.walks` and
-`edge.traversals`, and PRUNE later drops what nothing walked — so asking a
-question is a write in this system, deliberately. The invariant that matters is
-narrower and stronger: no read tool may change graph structure, ontology state,
-assumptions, supersession, or invalidation.
-
-These tests import `contextmesh_mcp.tools` and never the MCP SDK, so the safety
-boundary is checked on every Python version the core supports, with no
-dependencies installed. The SDK-dependent server module is covered separately
-and skips when the extra is absent.
+Read tools may move walk telemetry but must not mutate structure or belief.
+PR #8 adds controlled structural writes in a separate registry; those writes
+have their own safety cases and never widen the read registry.
 """
 
 import hashlib
+import inspect
 import json
 import unittest
 
 from contextmesh.model import AssumptionStatus, EdgeType, NodeType
-from contextmesh_mcp import resources, tools
+from contextmesh_mcp import resources, tools, writes
 from contextmesh_mcp.session import Session
 
-#: The only two fields a read is permitted to move. Everything else in the
-#: record is frozen — including provenance, build numbers and the embedding.
 TELEMETRY = {"node": {"walks"}, "edge": {"traversals"}}
 
 
@@ -30,26 +22,15 @@ def _without(payload, drop):
 
 
 def structure(graph):
-    """Everything a read must not touch.
+    """Everything a read must not touch, by subtraction from the full record."""
 
-    Built by *subtraction* from the full record rather than by listing fields:
-    enumerating what to freeze means a field added later is unprotected until
-    somebody remembers to add it here, and the first version of this helper
-    made exactly that mistake — an embedding could be zeroed and provenance
-    rewritten with the test still passing.
-
-    ``Node.to_dict`` currently reports ``embedded`` as a bool rather than the
-    vector, so the embedding is digested in separately. When lossless
-    persistence lands and the vector is in the record, this stays correct and
-    the extra digest becomes redundant rather than wrong.
-    """
-    def node_state(n):
-        payload = _without(n.to_dict(), TELEMETRY["node"])
+    def node_state(node):
+        payload = _without(node.to_dict(), TELEMETRY["node"])
         payload["embedding_digest"] = (
             hashlib.sha256(
-                json.dumps(list(n.embedding), sort_keys=True).encode("utf-8")
+                json.dumps(list(node.embedding), sort_keys=True).encode("utf-8")
             ).hexdigest()
-            if n.embedding is not None
+            if node.embedding is not None
             else None
         )
         return json.dumps(payload, sort_keys=True)
@@ -69,7 +50,6 @@ def structure(graph):
 
 
 def telemetry(graph):
-    """What a read is allowed to move."""
     return {
         "node_walks": {n.id: n.walks for n in graph.nodes.values()},
         "edge_traversals": {e.id: e.traversals for e in graph.edges.values()},
@@ -77,8 +57,6 @@ def telemetry(graph):
 
 
 class ReadBoundaryTest(unittest.TestCase):
-    """Every v0.1 tool, against the frozen half of the graph."""
-
     @classmethod
     def setUpClass(cls):
         cls.session = Session.build(rounds=4)
@@ -95,7 +73,9 @@ class ReadBoundaryTest(unittest.TestCase):
         self.assertStructureUnchanged()
 
     def test_mesh_ask_on_an_unanswerable_question(self):
-        result = tools.mesh_ask(self.session, "What is the refund policy for annual plans?")
+        result = tools.mesh_ask(
+            self.session, "What is the refund policy for annual plans?"
+        )
         self.assertFalse(result["resolved"])
         self.assertTrue(result["dead_end"])
         self.assertStructureUnchanged()
@@ -107,8 +87,7 @@ class ReadBoundaryTest(unittest.TestCase):
         self.assertStructureUnchanged()
 
     def test_mesh_health(self):
-        result = tools.mesh_health(self.session)
-        self.assertIn("signals", result)
+        self.assertIn("signals", tools.mesh_health(self.session))
         self.assertStructureUnchanged()
 
     def test_mesh_lineage(self):
@@ -121,7 +100,7 @@ class ReadBoundaryTest(unittest.TestCase):
             tools.mesh_blast_radius(self.session, assumption_id)
         self.assertStructureUnchanged()
 
-    def test_every_tool_in_the_registry_in_one_pass(self):
+    def test_every_read_tool_in_one_pass(self):
         node_id = next(iter(self.session.graph.nodes))
         assumption_id = sorted(self.session.graph.assumptions)[0]
         args = {
@@ -131,7 +110,7 @@ class ReadBoundaryTest(unittest.TestCase):
             "mesh_lineage": {"assumption_id": assumption_id},
             "mesh_blast_radius": {"assumption_id": assumption_id},
         }
-        self.assertEqual(sorted(args), tools.names(), "a tool was added without a safety case")
+        self.assertEqual(sorted(args), tools.names())
         for name in tools.names():
             tools.call(self.session, name, args[name])
         self.assertStructureUnchanged()
@@ -147,8 +126,6 @@ class ReadBoundaryTest(unittest.TestCase):
 
 
 class FrozenStateTest(unittest.TestCase):
-    """The snapshot has to notice these, or the read-boundary test proves nothing."""
-
     def setUp(self):
         self.graph = Session.build(rounds=2).graph
         self.before = structure(self.graph)
@@ -176,15 +153,12 @@ class FrozenStateTest(unittest.TestCase):
         self.assertNotEqual(structure(self.graph), self.before)
 
     def test_telemetry_alone_is_not_caught(self):
-        # The one thing it must stay blind to, or mesh_ask can never pass.
         next(iter(self.graph.nodes.values())).walks += 1
         next(iter(self.graph.edges.values())).traversals += 1
         self.assertEqual(structure(self.graph), self.before)
 
 
 class BlastRadiusIsADryRunTest(unittest.TestCase):
-    """The load-bearing safety case: computing fallout must not cause it."""
-
     def setUp(self):
         self.session = Session.build(rounds=2)
         self.graph = self.session.graph
@@ -207,7 +181,8 @@ class BlastRadiusIsADryRunTest(unittest.TestCase):
         )
         self.assertEqual(after, before)
         self.assertEqual(
-            len(self.graph.by_type(NodeType.EVIDENCE, live_only=False)), evidence_before
+            len(self.graph.by_type(NodeType.EVIDENCE, live_only=False)),
+            evidence_before,
         )
 
     def test_nothing_becomes_invalidated(self):
@@ -223,14 +198,15 @@ class BlastRadiusIsADryRunTest(unittest.TestCase):
         )
 
     def test_no_node_or_edge_count_changes(self):
-        n, e = len(self.graph.nodes), len(self.graph.edges)
+        counts = len(self.graph.nodes), len(self.graph.edges)
         for assumption_id in self.graph.assumptions:
             tools.mesh_blast_radius(self.session, assumption_id)
-        self.assertEqual((len(self.graph.nodes), len(self.graph.edges)), (n, e))
+        self.assertEqual((len(self.graph.nodes), len(self.graph.edges)), counts)
 
     def test_it_reports_both_halves(self):
         assumption_id = next(
-            a.id for a in self.graph.assumptions.values()
+            a.id
+            for a in self.graph.assumptions.values()
             if a.status is AssumptionStatus.ACTIVE
         )
         result = tools.mesh_blast_radius(self.session, assumption_id)
@@ -238,24 +214,25 @@ class BlastRadiusIsADryRunTest(unittest.TestCase):
         self.assertIn("would_invalidate", result)
         self.assertIn("would_preserve", result)
         self.assertEqual(result["blast_radius"], len(result["would_invalidate"]))
-        self.assertEqual(result["would_preserve_count"], len(result["would_preserve"]))
+        self.assertEqual(
+            result["would_preserve_count"], len(result["would_preserve"])
+        )
         for row in result["would_invalidate"]:
-            self.assertTrue(row["because"], f"{row['id']} came back with no reason")
+            self.assertTrue(row["because"])
 
     def test_a_rejected_assumption_says_why_its_radius_is_zero(self):
         rejected = [
-            a for a in self.graph.assumptions.values()
+            a
+            for a in self.graph.assumptions.values()
             if a.status is AssumptionStatus.REJECTED
         ]
-        self.assertTrue(rejected, "the demo should leave one rejected assumption")
+        self.assertTrue(rejected)
         result = tools.mesh_blast_radius(self.session, rejected[0].id)
         self.assertIsNotNone(result["note"])
         self.assertIn("already", result["note"])
 
 
 class TelemetryTest(unittest.TestCase):
-    """The half a read *is* allowed to move, asserted rather than assumed."""
-
     def setUp(self):
         self.session = Session.build(rounds=2)
 
@@ -263,7 +240,7 @@ class TelemetryTest(unittest.TestCase):
         before = telemetry(self.session.graph)
         tools.mesh_ask(self.session, "Why did the Index Builder run out of memory?")
         after = telemetry(self.session.graph)
-        self.assertNotEqual(after, before, "a walk should be recorded")
+        self.assertNotEqual(after, before)
         for node_id, walks in before["node_walks"].items():
             self.assertGreaterEqual(after["node_walks"][node_id], walks)
 
@@ -279,35 +256,54 @@ class TelemetryTest(unittest.TestCase):
 
 
 class SurfaceTest(unittest.TestCase):
-    """What v0.1 exposes, and what it must not."""
-
     FORBIDDEN = (
-        "invalidate", "reject", "repair", "execute", "add_node", "add_edge",
-        "supersede", "assume", "recheck", "prune", "write", "delete",
+        "invalidate",
+        "reject",
+        "repair",
+        "execute",
+        "add_node",
+        "add_edge",
+        "supersede",
+        "assume",
+        "recheck",
+        "prune",
+        "write",
+        "delete",
     )
 
     def setUp(self):
         self.session = Session.build(rounds=2)
 
-    def test_exactly_five_tools(self):
+    def test_exactly_five_read_tools(self):
         self.assertEqual(
             tools.names(),
-            ["mesh_ask", "mesh_blast_radius", "mesh_get_node", "mesh_health", "mesh_lineage"],
+            [
+                "mesh_ask",
+                "mesh_blast_radius",
+                "mesh_get_node",
+                "mesh_health",
+                "mesh_lineage",
+            ],
         )
 
-    def test_no_mutating_tool_is_registered(self):
+    def test_no_mutating_tool_is_in_the_read_registry(self):
         for name in tools.names():
             for forbidden in self.FORBIDDEN:
-                self.assertNotIn(
-                    forbidden, name, f"{name} looks like a write tool; v0.1 is read-only"
-                )
+                self.assertNotIn(forbidden, name)
+
+    def test_controlled_write_registry_is_exact(self):
+        self.assertEqual(
+            writes.names(),
+            ["mesh_recheck", "mesh_repair", "mesh_resume", "mesh_submit_evidence"],
+        )
 
     def test_every_tool_declares_a_description(self):
-        for name, entry in tools.TOOLS.items():
-            self.assertTrue(entry["description"].strip(), name)
-            self.assertTrue(callable(entry["fn"]), name)
+        for registry in (tools.TOOLS, writes.WRITE_TOOLS):
+            for name, entry in registry.items():
+                self.assertTrue(entry["description"].strip(), name)
+                self.assertTrue(callable(entry["fn"]), name)
 
-    def test_unknown_tool_and_unknown_ids_raise_cleanly(self):
+    def test_unknown_read_tool_and_unknown_ids_raise_cleanly(self):
         with self.assertRaises(tools.MeshToolError):
             tools.call(self.session, "mesh_reject", {})
         with self.assertRaises(tools.MeshToolError):
@@ -320,12 +316,6 @@ class SurfaceTest(unittest.TestCase):
             resources.read(self.session, "contextmesh://nope")
 
     def test_a_demo_session_says_it_will_not_survive_a_restart(self):
-        """It used to say why: ``ContextGraph`` could not reload.
-
-        It can now, so the note points at ``--session`` instead. The assertion
-        stays because the claim is the same one — a client is told, in the
-        payload, whether what it is reading outlives the server.
-        """
         described = self.session.describe()
         self.assertFalse(described["persistent"])
         self.assertIn("--session", described["note"])
@@ -335,13 +325,11 @@ class SurfaceTest(unittest.TestCase):
         described = self.session.describe()
         for key in ("nodes_live", "nodes_total", "edges_live", "edges_total"):
             self.assertIn(key, described)
-        # The demo rejects an assumption, so live must actually be the smaller
-        # number — otherwise this reads as a distinction without a difference.
         self.assertLess(described["nodes_live"], described["nodes_total"])
         self.assertLessEqual(described["edges_live"], described["edges_total"])
-        self.assertNotIn("nodes", described, "the ambiguous key should be gone")
+        self.assertNotIn("nodes", described)
 
-    def test_every_payload_is_json_serialisable(self):
+    def test_every_read_payload_is_json_serialisable(self):
         node_id = next(iter(self.session.graph.nodes))
         assumption_id = sorted(self.session.graph.assumptions)[0]
         args = {
@@ -361,48 +349,111 @@ class SurfaceTest(unittest.TestCase):
 
 
 class ServerTest(unittest.TestCase):
-    """Only this class needs the SDK, so only this class skips without it."""
-
     def setUp(self):
         try:
             import mcp  # noqa: F401
         except ImportError:
             self.skipTest("mcp SDK not installed (pip install 'contextmesh[mcp]')")
 
-    def test_the_server_registers_exactly_the_five_read_tools(self):
+    @staticmethod
+    def _registry_entry(name):
+        if name in tools.TOOLS:
+            return tools.TOOLS[name]
+        return writes.WRITE_TOOLS[name]
+
+    def _published(self):
         import asyncio
 
         from contextmesh_mcp import server
 
-        registered = sorted(t.name for t in asyncio.run(server.mcp.list_tools()))
-        self.assertEqual(registered, tools.names())
+        return {tool.name: tool.input_schema for tool in asyncio.run(server.mcp.list_tools())}
+
+    def test_the_server_registers_read_tools_plus_controlled_writes(self):
+        published = self._published()
+        self.assertEqual(
+            sorted(published),
+            sorted([*tools.names(), *writes.names()]),
+        )
 
     def test_the_registered_schema_matches_each_tool_signature(self):
-        """One source of truth: the typed signature is what the SDK publishes.
-
-        The tool table used to carry hand-written JSON schemas that nothing
-        registered — documentation shaped like a contract, free to drift from
-        the contract. They are gone; this asserts the published schema against
-        the function the tool actually calls.
-        """
         import asyncio
-        import inspect
 
         from contextmesh_mcp import server
 
+        internal = {"session", "checkpointer"}
         for tool in asyncio.run(server.mcp.list_tools()):
-            fn = tools.TOOLS[tool.name]["fn"]
-            expected = [
+            fn = self._registry_entry(tool.name)["fn"]
+            params = inspect.signature(fn).parameters
+            expected = [name for name in params if name not in internal]
+            required = [
                 name
-                for name in inspect.signature(fn).parameters
-                if name != "session"
+                for name, param in params.items()
+                if name not in internal and param.default is inspect.Parameter.empty
             ]
             schema = tool.input_schema
             self.assertEqual(schema["type"], "object", tool.name)
             self.assertEqual(sorted(schema["properties"]), sorted(expected), tool.name)
             self.assertEqual(
-                sorted(schema.get("required", [])), sorted(expected), tool.name
+                sorted(schema.get("required", [])), sorted(required), tool.name
             )
+
+    def test_evidence_schema_carries_no_verdict_or_edge_authority(self):
+        schema = self._published()["mesh_submit_evidence"]
+        self.assertEqual(
+            set(schema["properties"]),
+            {"text", "source_id", "external_id", "metadata"},
+        )
+        self.assertEqual(set(schema.get("required", [])), {"text", "source_id"})
+        forbidden = {
+            "edge",
+            "edge_type",
+            "target",
+            "target_id",
+            "assumption_id",
+            "verdict",
+            "reject",
+            "invalidate",
+            "status",
+        }
+        self.assertTrue(forbidden.isdisjoint(schema["properties"]))
+
+    def test_recheck_and_resume_publish_no_client_authority(self):
+        published = self._published()
+        for name in ("mesh_recheck", "mesh_resume"):
+            self.assertEqual(published[name]["properties"], {}, name)
+            self.assertEqual(published[name].get("required", []), [], name)
+
+    def test_repair_publishes_keys_not_code_or_verdicts(self):
+        schema = self._published()["mesh_repair"]
+        self.assertEqual(
+            set(schema["properties"]),
+            {
+                "task",
+                "worker_key",
+                "assumes",
+                "auditor_key",
+                "produces",
+                "rationale",
+            },
+        )
+        self.assertEqual(
+            set(schema.get("required", [])),
+            {"task", "worker_key", "assumes"},
+        )
+        forbidden = {
+            "run",
+            "audit",
+            "callable",
+            "module",
+            "module_path",
+            "import",
+            "registry",
+            "verdict",
+            "reject",
+            "invalidate",
+            "status",
+        }
+        self.assertTrue(forbidden.isdisjoint(schema["properties"]))
 
     def test_the_server_registers_the_resources(self):
         import asyncio

@@ -6,14 +6,15 @@
 
 Requires Python 3.10+, because the MCP SDK does. Writing and inspecting a
 session needs neither the SDK nor 3.10, which is why that lives in
-``session.py`` and is reachable as ``python -m contextmesh_mcp``. Everything the tools actually
-do lives in ``tools.py`` and ``resources.py``, which do not, so the behaviour
-this server exposes is tested without the SDK on every version the core
-supports. This file is transport and nothing else.
+``session.py`` and is reachable as ``python -m contextmesh_mcp``. Read tools
+live in ``tools.py``; controlled structural writes live in ``writes.py``. Both
+remain plain Python so their contracts are tested without the SDK on every
+version the core supports. This file is transport and nothing else.
 
-Read-only by construction: the five tools registered below are the five in
-``tools.TOOLS``, none of which mutate structure or belief. There is no code path
-here that adds a node, adds an edge, rejects an assumption, repairs or executes.
+PR #8 keeps client authority narrow: evidence enters as observation; recheck
+runs deployment-owned auditors; repair selects deployment-owned TaskRegistry
+keys; resume delegates to the native selective scheduler. There is no direct
+reject, invalidate, status setter, callable, module path or client audit verdict.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 try:
     from mcp.server import MCPServer
@@ -33,7 +34,7 @@ except ImportError as exc:  # pragma: no cover - depends on the optional extra
         f"(import failed: {exc})"
     ) from exc
 
-from . import resources, tools
+from . import resources, tools, writes
 from .session import (
     Checkpointer,
     SessionError,
@@ -54,12 +55,22 @@ with the evidence on it — or as one of four typed dead-end reasons rather than
 guess, so "the graph cannot answer this" is a distinguishable outcome.
 
 mesh_blast_radius is a dry run: it tells you what would fall if an assumption
-turned out to be false, and what would survive. It changes nothing. This server
-is read-only; it cannot reject an assumption, repair, or execute.
+turned out to be false, and what would survive. It changes nothing.
+
+Controlled writes are deliberately split by authority:
+
+- mesh_submit_evidence stores a raw observation. It cannot name an edge,
+  assumption, verdict, rejection or invalidation target.
+- mesh_recheck asks the registered auditors to interpret current state. The
+  client supplies no verdict. A disproof must identify pre-ingested evidence.
+- mesh_repair can select only durable worker/auditor keys already registered in
+  this deployment. No callable, module path or import string crosses MCP.
+- mesh_resume delegates to the native scheduler, which reruns only pending/stale
+  work and leaves unaffected DONE work cached.
 
 This instance may be serving a saved session directory or a demo graph rebuilt
 for this process. contextmesh://session says which, and whether anything you see
-here outlives the server.
+here outlives the server. Controlled writes refuse an ephemeral demo session.
 
 Independent project. No affiliation with, or endorsement by, anyone involved in
 the screen capture the dashboard was reverse-engineered from.
@@ -80,16 +91,12 @@ _CHECKPOINTER: Optional[Checkpointer] = None
 def _run(
     name: str, arguments: Optional[Dict[str, Any]] = None, *, mutates: bool = False
 ) -> str:
-    """Answer a tool call, and commit afterwards if the call changed anything.
+    """Answer a read tool call, checkpointing telemetry when appropriate.
 
-    ``mutates`` is passed at the call site rather than inferred, so adding a
-    sixth tool forces a decision about whether it writes. Only ``mesh_ask``
-    does today: a walk moves ``node.walks`` and ``edge.traversals``, and the
-    resolver learns aliases on a scored match.
-
-    The commit happens after a successful answer and never inside the error
-    paths — a question that failed has nothing worth persisting, and a failing
-    checkpoint must not turn a good answer into a dead channel.
+    ``mesh_ask`` moves walk/resolver telemetry. A failed checkpoint for that
+    observational telemetry is reported to stderr without turning a good answer
+    into a dead channel. Structural writes use ``_run_write`` instead because
+    they have the stronger success-means-durable contract.
     """
     try:
         result = tools.call(session(), name, arguments)
@@ -102,15 +109,31 @@ def _run(
     if mutates and _CHECKPOINTER is not None:
         try:
             _CHECKPOINTER.record_mutation()
-        except Exception as exc:  # a failed write is reported, not fatal
+        except Exception as exc:  # a failed telemetry write is reported, not fatal
             print(f"context-mesh: checkpoint failed: {exc}", file=sys.stderr)
     return _payload(result)
 
 
-# ── tools ────────────────────────────────────────────────────────────────
+def _run_write(name: str, **arguments: Any) -> str:
+    """Run a controlled structural write and adopt only its committed clone."""
+    global _CHECKPOINTER
+    try:
+        entry = writes.WRITE_TOOLS[name]
+        result = entry["fn"](session(), _CHECKPOINTER, **arguments)
+    except Exception as exc:
+        return _payload(
+            {"error": type(exc).__name__, "tool": name, "message": str(exc)}
+        )
+    if result.session is not session():
+        adopt(result.session)
+        assert _CHECKPOINTER is not None
+        _CHECKPOINTER.session = result.session
+    return _payload(result.payload)
+
+
+# ── read tools ───────────────────────────────────────────────────────────
 @mcp.tool(name="mesh_ask", description=tools.TOOLS["mesh_ask"]["description"])
 def mesh_ask(question: str) -> str:
-    # The one tool that writes. See ``_run``.
     return _run("mesh_ask", {"question": question}, mutates=True)
 
 
@@ -135,6 +158,65 @@ def mesh_lineage(assumption_id: str) -> str:
 )
 def mesh_blast_radius(assumption_id: str) -> str:
     return _run("mesh_blast_radius", {"assumption_id": assumption_id})
+
+
+# ── controlled writes ────────────────────────────────────────────────────
+@mcp.tool(
+    name="mesh_submit_evidence",
+    description=writes.WRITE_TOOLS["mesh_submit_evidence"]["description"],
+)
+def mesh_submit_evidence(
+    text: str,
+    source_id: str,
+    external_id: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> str:
+    return _run_write(
+        "mesh_submit_evidence",
+        text=text,
+        source_id=source_id,
+        external_id=external_id,
+        metadata=metadata,
+    )
+
+
+@mcp.tool(
+    name="mesh_recheck",
+    description=writes.WRITE_TOOLS["mesh_recheck"]["description"],
+)
+def mesh_recheck() -> str:
+    return _run_write("mesh_recheck")
+
+
+@mcp.tool(
+    name="mesh_repair",
+    description=writes.WRITE_TOOLS["mesh_repair"]["description"],
+)
+def mesh_repair(
+    task: str,
+    worker_key: str,
+    assumes: str,
+    auditor_key: Optional[str] = None,
+    produces: Optional[List[str]] = None,
+    rationale: Optional[str] = None,
+) -> str:
+    return _run_write(
+        "mesh_repair",
+        task=task,
+        worker_key=worker_key,
+        assumes=assumes,
+        auditor_key=auditor_key,
+        produces=produces,
+        rationale=rationale,
+    )
+
+
+@mcp.tool(
+    name="mesh_resume",
+    description=writes.WRITE_TOOLS["mesh_resume"]["description"],
+)
+def mesh_resume() -> str:
+    return _run_write("mesh_resume")
 
 
 # ── resources ────────────────────────────────────────────────────────────
@@ -172,7 +254,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = add_source_arguments(
         argparse.ArgumentParser(
             prog="contextmesh-mcp",
-            description="Read-only MCP server over a Context Mesh graph.",
+            description=(
+                "MCP server over a Context Mesh graph with controlled evidence intake."
+            ),
             epilog=(
                 "contextmesh-mcp --demo --rounds 8 --save ./session   write one\n"
                 "contextmesh-mcp --session ./session                  serve it"
@@ -182,9 +266,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    # Build or load before serving, so the first tool call is not the slow one
-    # and a session this build cannot restore fails at the shell rather than
-    # halfway through a client's first question.
     try:
         opened = open_session(args)
     except SessionError as exc:
@@ -208,17 +289,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(
         f"context-mesh MCP: {described['nodes_live']}/{described['nodes_total']} nodes live, "
         f"{described['edges_live']}/{described['edges_total']} edges live, "
-        f"read-only, {where}",
+        f"controlled writes, {where}",
         file=sys.stderr,
     )
     try:
         mcp.run(transport="stdio")
     finally:
-        # A clean shutdown is the last chance for on-exit, and the safety net
-        # for every-ask if a mutation landed after the final commit. Reported
-        # the same way a per-question checkpoint failure is: a shutdown that
-        # cannot write is worth saying out loud, and worth saying *once*, not
-        # worth replacing the exit code of whatever stopped the server.
         try:
             written = _CHECKPOINTER.close()
         except Exception as exc:
@@ -227,7 +303,3 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if written is not None:
                 print(f"context-mesh: checkpointed {written}", file=sys.stderr)
     return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

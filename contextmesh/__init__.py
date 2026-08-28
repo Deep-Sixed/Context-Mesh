@@ -16,6 +16,7 @@ The pieces:
 - ``pipeline``    CHUNK → EXTRACT → RESOLVE → LINK → EMBED → PRUNE
 - ``traverse``    walks that return the evidence path, and classify the failures
 - ``assumptions`` versioned assumptions and selective invalidation
+- ``evidence``    controlled observation intake; data enters without a verdict
 - ``execute``     re-runs exactly the work an invalidation knocked down
 - ``decisions``   append-only decision history
 - ``health``      the conditions that quietly make a graph useless
@@ -25,6 +26,13 @@ The pieces:
 from .assumptions import AssumptionLedger, InvalidationReport
 from .corpus import documents
 from .decisions import DecisionLog, DecisionRecord
+from .evidence import (
+    EvidenceConflictError,
+    EvidenceIntake,
+    EvidenceIntakeError,
+    EvidenceReceipt,
+    submit_evidence,
+)
 from .execute import (
     AuditContext,
     ExecutionError,
@@ -74,6 +82,10 @@ __all__ = [
     "Document",
     "Edge",
     "EdgeType",
+    "EvidenceConflictError",
+    "EvidenceIntake",
+    "EvidenceIntakeError",
+    "EvidenceReceipt",
     "ExecutionError",
     "InvalidationReport",
     "Node",
@@ -101,4 +113,5 @@ __all__ = [
     "documents",
     "report",
     "snapshot",
+    "submit_evidence",
 ]
