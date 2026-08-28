@@ -1,8 +1,8 @@
 """Controlled MCP writes over a durable Context Mesh session.
 
-The read tool layer deliberately knows nothing about persistence.  Structural
+The read tool layer deliberately knows nothing about persistence. Structural
 writes need a stronger contract than ``mesh_ask`` telemetry: a successful reply
-means the mutation is in the committed session generation.  To make failure
+means the mutation is in the committed session generation. To make failure
 atomic, writes are applied to a lossless in-memory clone first; only the clone is
 made live after its manifest has committed.
 """
@@ -10,12 +10,13 @@ made live after its manifest has committed.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from contextmesh.assumptions import AssumptionLedger
 from contextmesh.evidence import EvidenceIntakeError, submit_evidence
-from contextmesh.execute import RunLedger, Runner
+from contextmesh.execute import Event, RunLedger, Runner, TaskState
 from contextmesh.graph import ContextGraph
+from contextmesh.recheck import recheck as evidence_recheck
 from contextmesh.resolve import Resolver
 
 from .session import (
@@ -108,6 +109,19 @@ def _require_durable(
     return checkpointer
 
 
+def _runner(session: Session) -> Runner:
+    runner = session.runner
+    if runner is None:
+        raise ControlledWriteError(
+            "this session has no execution plan; recheck, repair and resume require one"
+        )
+    if runner.registry is None:
+        raise ControlledWriteError(
+            "this execution plan has no TaskRegistry; controlled execution writes refuse it"
+        )
+    return runner
+
+
 def commit_mutation(
     session: Session,
     checkpointer: Optional[Checkpointer],
@@ -127,14 +141,14 @@ def commit_mutation(
         cp.contended += 1
         raise ControlledWriteError(str(exc)) from None
     except SessionError as exc:
-        # SessionError includes compare-and-swap refusal.  It is known to happen
+        # SessionError includes compare-and-swap refusal. It is known to happen
         # before this writer replaces the manifest, so the live session remains
         # authoritative and needs no rollback at all.
         raise ControlledWriteError(str(exc)) from None
     except Exception as exc:
-        # ``session.json`` is the commit point.  A best-effort cleanup failure
+        # ``session.json`` is the commit point. A best-effort cleanup failure
         # after its swap must not make us resurrect the previous in-memory
-        # generation.  If the directory moved exactly one generation, adopt the
+        # generation. If the directory moved exactly one generation, adopt the
         # clone; otherwise the mutation never became committed.
         assert staged.path is not None
         live = Session._live_generation(staged.path)
@@ -172,7 +186,7 @@ def mesh_submit_evidence(
     external_id: Optional[str] = None,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> WriteResult:
-    """Store one observation.  It creates no edge and expresses no verdict."""
+    """Store one observation. It creates no edge and expresses no verdict."""
 
     def mutate(staged: Session) -> Tuple[Dict[str, Any], bool]:
         receipt = submit_evidence(
@@ -187,6 +201,131 @@ def mesh_submit_evidence(
     return commit_mutation(session, checkpointer, mutate)
 
 
+def mesh_recheck(
+    session: Session,
+    checkpointer: Optional[Checkpointer],
+) -> WriteResult:
+    """Ask registered auditors to interpret standing work; the client supplies no verdict."""
+
+    def mutate(staged: Session) -> Tuple[Dict[str, Any], bool]:
+        runner = _runner(staged)
+        before = len(runner.ledger.entries)
+        reports = evidence_recheck(runner, require_evidence=True)
+        new_entries = runner.ledger.entries[before:]
+        audited = sum(1 for entry in new_entries if entry.event is Event.AUDITED)
+        return (
+            {
+                "round": runner.round,
+                "audited": audited,
+                "invalidations": [report.to_dict() for report in reports],
+                "ledger_head": runner.ledger.head,
+            },
+            True,
+        )
+
+    return commit_mutation(session, checkpointer, mutate)
+
+
+def _non_empty(value: Any, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ControlledWriteError(f"{name} must be a non-empty string")
+    return value
+
+
+def mesh_repair(
+    session: Session,
+    checkpointer: Optional[Checkpointer],
+    *,
+    task: str,
+    worker_key: str,
+    assumes: str,
+    auditor_key: Optional[str] = None,
+    produces: Optional[List[str]] = None,
+    rationale: Optional[str] = None,
+) -> WriteResult:
+    """Re-ground stale work using only deployment-owned TaskRegistry keys."""
+    task = _non_empty(task, "task")
+    worker_key = _non_empty(worker_key, "worker_key")
+    assumes = _non_empty(assumes, "assumes")
+    if auditor_key is not None:
+        auditor_key = _non_empty(auditor_key, "auditor_key")
+    if rationale is not None and not isinstance(rationale, str):
+        raise ControlledWriteError("rationale must be a string or null")
+    if produces is not None:
+        if not isinstance(produces, list) or not all(
+            isinstance(item, str) and item for item in produces
+        ):
+            raise ControlledWriteError("produces must be an array of non-empty strings")
+
+    def mutate(staged: Session) -> Tuple[Dict[str, Any], bool]:
+        runner = _runner(staged)
+        try:
+            target = runner[task]
+        except KeyError:
+            raise ControlledWriteError(f"task {task!r} is not in this execution plan") from None
+        if target.state not in (TaskState.STALE, TaskState.FAILED):
+            raise ControlledWriteError(
+                f"task {task!r} is {target.state.value}, not stale or failed; "
+                "controlled repair does not replace healthy cached work"
+            )
+        new = runner.repair(
+            task,
+            assumes=assumes,
+            worker_key=worker_key,
+            auditor_key=auditor_key,
+            produces=produces,
+            rationale=rationale,
+        )
+        rebound = runner[task]
+        return (
+            {
+                "task": task,
+                "state": rebound.state.value,
+                "worker_key": rebound.worker_key,
+                "auditor_key": rebound.auditor_key,
+                "assumption_id": new.id,
+                "assumption": new.statement,
+                "ledger_head": runner.ledger.head,
+            },
+            True,
+        )
+
+    return commit_mutation(session, checkpointer, mutate)
+
+
+def mesh_resume(
+    session: Session,
+    checkpointer: Optional[Checkpointer],
+) -> WriteResult:
+    """Run only pending/stale work; DONE tasks stay cached under Runner.run()."""
+
+    def mutate(staged: Session) -> Tuple[Dict[str, Any], bool]:
+        runner = _runner(staged)
+        unsettled = [
+            task.name
+            for task in runner.tasks
+            if task.state in (TaskState.PENDING, TaskState.STALE)
+        ]
+        if not unsettled:
+            return (
+                {
+                    "round": runner.round,
+                    "executed": [],
+                    "cached": [task.name for task in runner.tasks if task.state is TaskState.DONE],
+                    "changed": False,
+                    "ledger_head": runner.ledger.head,
+                },
+                False,
+            )
+        report = runner.run()
+        payload = report.to_dict()
+        payload["ledger_head"] = runner.ledger.head
+        payload["changed"] = True
+        return payload, True
+
+    return commit_mutation(session, checkpointer, mutate)
+
+
 WRITE_TOOLS: Dict[str, Dict[str, Any]] = {
     "mesh_submit_evidence": {
         "fn": mesh_submit_evidence,
@@ -194,6 +333,29 @@ WRITE_TOOLS: Dict[str, Dict[str, Any]] = {
             "Submit a raw observation as an EVIDENCE node. The client supplies "
             "no edge, assumption, verdict, rejection or invalidation target; "
             "successful new evidence is committed before this call returns."
+        ),
+    },
+    "mesh_recheck": {
+        "fn": mesh_recheck,
+        "description": (
+            "Ask the execution plan's registered auditors to recheck standing work. "
+            "The client supplies no audit verdict or assumption target; a disproof "
+            "must identify pre-ingested evidence and is committed before return."
+        ),
+    },
+    "mesh_repair": {
+        "fn": mesh_repair,
+        "description": (
+            "Repair stale or failed work by selecting worker/auditor keys already "
+            "registered in this deployment. No callable, module path or import "
+            "string crosses MCP."
+        ),
+    },
+    "mesh_resume": {
+        "fn": mesh_resume,
+        "description": (
+            "Resume pending or stale execution through the native scheduler. "
+            "Previously DONE work remains cached and is not re-executed."
         ),
     },
 }
@@ -208,6 +370,9 @@ __all__ = [
     "WRITE_TOOLS",
     "WriteResult",
     "commit_mutation",
+    "mesh_recheck",
+    "mesh_repair",
+    "mesh_resume",
     "mesh_submit_evidence",
     "names",
 ]
