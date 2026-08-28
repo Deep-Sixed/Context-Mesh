@@ -11,9 +11,10 @@ live in ``tools.py``; controlled structural writes live in ``writes.py``. Both
 remain plain Python so their contracts are tested without the SDK on every
 version the core supports. This file is transport and nothing else.
 
-PR #8 adds one deliberately narrow write: ``mesh_submit_evidence`` stores a raw
-observation and commits it before acknowledging success. It cannot create an
-edge, reject an assumption, repair work, or execute a worker.
+PR #8 keeps client authority narrow: evidence enters as observation; recheck
+runs deployment-owned auditors; repair selects deployment-owned TaskRegistry
+keys; resume delegates to the native selective scheduler. There is no direct
+reject, invalidate, status setter, callable, module path or client audit verdict.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 try:
     from mcp.server import MCPServer
@@ -56,10 +57,16 @@ guess, so "the graph cannot answer this" is a distinguishable outcome.
 mesh_blast_radius is a dry run: it tells you what would fall if an assumption
 turned out to be false, and what would survive. It changes nothing.
 
-mesh_submit_evidence is the one structural write in PR #8A. It stores a raw
-observation in a persistent session and commits it before success is returned.
-It cannot name a graph edge, an assumption, a verdict, a rejection, or an
-invalidation target. Interpretation remains inside registered auditors.
+Controlled writes are deliberately split by authority:
+
+- mesh_submit_evidence stores a raw observation. It cannot name an edge,
+  assumption, verdict, rejection or invalidation target.
+- mesh_recheck asks the registered auditors to interpret current state. The
+  client supplies no verdict. A disproof must identify pre-ingested evidence.
+- mesh_repair can select only durable worker/auditor keys already registered in
+  this deployment. No callable, module path or import string crosses MCP.
+- mesh_resume delegates to the native scheduler, which reruns only pending/stale
+  work and leaves unaffected DONE work cached.
 
 This instance may be serving a saved session directory or a demo graph rebuilt
 for this process. contextmesh://session says which, and whether anything you see
@@ -173,6 +180,45 @@ def mesh_submit_evidence(
     )
 
 
+@mcp.tool(
+    name="mesh_recheck",
+    description=writes.WRITE_TOOLS["mesh_recheck"]["description"],
+)
+def mesh_recheck() -> str:
+    return _run_write("mesh_recheck")
+
+
+@mcp.tool(
+    name="mesh_repair",
+    description=writes.WRITE_TOOLS["mesh_repair"]["description"],
+)
+def mesh_repair(
+    task: str,
+    worker_key: str,
+    assumes: str,
+    auditor_key: Optional[str] = None,
+    produces: Optional[List[str]] = None,
+    rationale: Optional[str] = None,
+) -> str:
+    return _run_write(
+        "mesh_repair",
+        task=task,
+        worker_key=worker_key,
+        assumes=assumes,
+        auditor_key=auditor_key,
+        produces=produces,
+        rationale=rationale,
+    )
+
+
+@mcp.tool(
+    name="mesh_resume",
+    description=writes.WRITE_TOOLS["mesh_resume"]["description"],
+)
+def mesh_resume() -> str:
+    return _run_write("mesh_resume")
+
+
 # ── resources ────────────────────────────────────────────────────────────
 @mcp.resource("contextmesh://schema", mime_type="text/markdown")
 def resource_schema() -> str:
@@ -243,7 +289,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print(
         f"context-mesh MCP: {described['nodes_live']}/{described['nodes_total']} nodes live, "
         f"{described['edges_live']}/{described['edges_total']} edges live, "
-        f"controlled evidence writes, {where}",
+        f"controlled writes, {where}",
         file=sys.stderr,
     )
     try:
@@ -257,7 +303,3 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if written is not None:
                 print(f"context-mesh: checkpointed {written}", file=sys.stderr)
     return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
