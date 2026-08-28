@@ -1821,6 +1821,34 @@ class ProcessLockTest(unittest.TestCase):
         self.assertEqual(manifest(self.dir)["generation"], 2)
         self.assertEqual(Session.load(self.dir).generation, 2)
 
+    def test_a_crash_before_publication_leaves_the_committed_generation_serving(self):
+        """A real process dies after companions exist but before the commit point."""
+        crash = (
+            "import os, sys\n"
+            "from pathlib import Path\n"
+            "import contextmesh_mcp.session as sessionmod\n"
+            "root = Path(sys.argv[1])\n"
+            "original = sessionmod.write_in_place\n"
+            "def write_then_crash(directory, name, payload):\n"
+            "    path = original(directory, name, payload)\n"
+            "    if name.startswith('resolver-'):\n"
+            "        os._exit(73)\n"
+            "    return path\n"
+            "sessionmod.write_in_place = write_then_crash\n"
+            "sessionmod.Session.load(root).checkpoint()\n"
+        )
+        failed = self.spawn(crash)
+        failed.communicate(timeout=120)
+        self.assertEqual(failed.returncode, 73)
+
+        restored = Session.load(self.dir)
+        self.assertEqual(restored.generation, 1)
+        self.assertEqual(manifest(self.dir)["generation"], 1)
+
+        restored.checkpoint()
+        self.assertEqual(Session.load(self.dir).generation, 2)
+        self.assertEqual(names(self.dir), GenerationTest.expected(self, 2))
+
     def test_a_writer_killed_mid_transaction_does_not_hold_the_lock(self):
         """Kernel-held, so a SIGKILL releases it. No stale-lock guessing."""
         holder = self.spawn(

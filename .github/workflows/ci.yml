@@ -69,6 +69,21 @@ jobs:
           print("CP1252 CLI FALLBACK OK", file=sys.__stdout__)
           EOF
 
+  persistence-contract:
+    name: persistence contract · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Prove the unchanged cross-process persistence contract
+        run: python -m unittest -v tests.test_session.ProcessBoundaryTest.test_one_process_writes_and_another_reads tests.test_session.ProcessLockTest.test_a_reader_holding_the_manifest_does_not_block_publication tests.test_session.ProcessLockTest.test_the_second_writer_is_refused_then_succeeds_on_retry tests.test_session.ProcessLockTest.test_a_crash_before_publication_leaves_the_committed_generation_serving tests.test_session.ProcessLockTest.test_a_writer_killed_mid_transaction_does_not_hold_the_lock
+
   lint:
     name: ruff
     runs-on: ubuntu-latest
@@ -79,6 +94,22 @@ jobs:
           python-version: "3.12"
       - run: pipx install ruff
       - run: ruff check contextmesh contextmesh_mcp tests dashboard/bundle.py
+
+  package:
+    name: wheel + sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install build
+      - name: Build both distributions without deprecated license metadata
+        run: |
+          python -m build 2>&1 | tee /tmp/build.txt
+          ! grep -F "project.license as a TOML table is deprecated" /tmp/build.txt
+          test "$(find dist -maxdepth 1 -name '*.whl' | wc -l)" -eq 1
+          test "$(find dist -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 1
 
   leaks:
     name: no private data
@@ -393,12 +424,13 @@ jobs:
         run: |
           python - <<'EOF' | tee /tmp/atomic.txt
           import json, os, pathlib, shutil
-          from contextmesh_mcp.session import Session
+          from contextmesh_mcp.session import Session, live_manifest_path
 
           shutil.rmtree("/tmp/gen", ignore_errors=True)
           shutil.copytree("/tmp/session", "/tmp/gen")
           root = pathlib.Path("/tmp/gen")
-          live = root / "session.json"
+          live = live_manifest_path(root)
+          assert live is not None
           session = Session.load(root)
 
           # A reader holding the manifest across the commit must still see the
@@ -412,7 +444,9 @@ jobs:
           assert held["generation"] == session.generation - 1, held["generation"]
           assert (root / held["graph"]).name == held["graph"]
 
-          committed = json.loads(live.read_text())
+          committed_live = live_manifest_path(root)
+          assert committed_live is not None
+          committed = json.loads(committed_live.read_text())
           assert committed["generation"] == held["generation"] + 1
           leftovers = sorted(p.name for p in root.iterdir())
           assert leftovers == sorted(
