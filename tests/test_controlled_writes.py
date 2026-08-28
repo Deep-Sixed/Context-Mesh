@@ -28,6 +28,11 @@ def deployment() -> TaskRegistry:
     registry.register_worker("auth.tokens.v1", lambda ctx: {"algorithm": "EdDSA"})
 
     def audit_hash(ctx):
+        # The advisory contradicts Argon2 ground, not every future hasher this
+        # task may be repaired onto. This condition is load-bearing: without it
+        # a successful bcrypt rerun would be rejected by evidence about argon2.
+        if ctx.output.get("impl") != "argon2":
+            return ctx.ok("the active implementation is not affected by the Argon2 advisory")
         for node in ctx.graph.nodes.values():
             if node.type is not NodeType.EVIDENCE:
                 continue
@@ -235,8 +240,10 @@ class ControlledWriteIntegrationTest(unittest.TestCase):
         # Process-boundary equivalent #1: throw away every live object and bind
         # the plan from durable keys in a fresh deployment registry.
         fresh_b = Session.load(self.root, registry=deployment())
+        b_generation = fresh_b.generation
         cp_b = Checkpointer(fresh_b)
         after_recheck = mesh_recheck(fresh_b, cp_b).session
+        self.assertEqual(after_recheck.generation, b_generation + 1)
 
         # Process-boundary equivalent #2: another fresh registry sees the stale
         # closure and changes executable identity before any rerun occurs.
@@ -250,6 +257,7 @@ class ControlledWriteIntegrationTest(unittest.TestCase):
             assumes="bcrypt has no open advisory",
             produces=["Password Hasher"],
         ).session
+        assert repaired.runner is not None
         self.assertEqual(repaired.runner["hashing"].worker_key, "auth.hash.bcrypt.v1")
         self.assertEqual(repaired.runner["hashing"].attempt, 1)
 
@@ -272,7 +280,6 @@ class ControlledWriteIntegrationTest(unittest.TestCase):
         )
         self.assertTrue(runner.ledger.verify())
         self.assertEqual(runner.ledger.head, final_write.payload["ledger_head"])
-        self.assertGreater(after_recheck.generation, fresh_b.generation - 1)
 
 
 if __name__ == "__main__":
