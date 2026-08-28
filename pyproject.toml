@@ -43,3 +43,6 @@ select = ["E", "F", "W", "I"]
 # The corpus is prose. Wrapping a document's sentences mid-clause to satisfy a
 # column limit makes the source material harder to read than the limit is worth.
 "contextmesh/corpus.py" = ["E501"]
+# Provider adapter diagnostics are security/error messages whose exact wording
+# is more useful intact than split only to satisfy a display-column limit.
+"contextmesh/llm.py" = ["E501"]
