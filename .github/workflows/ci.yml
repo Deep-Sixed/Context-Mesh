@@ -212,7 +212,7 @@ jobs:
       - name: The server refuses a bad session before opening the transport
         run: |
           contextmesh-mcp --demo --rounds 2 --save /tmp/bad
-          python -c "import json,pathlib;p=pathlib.Path('/tmp/bad/session.json');d=json.loads(p.read_text());d['version']=99;p.write_text(json.dumps(d))"
+          python -c "import json,pathlib;from contextmesh_mcp.session import live_manifest_path;p=live_manifest_path(pathlib.Path('/tmp/bad'));assert p is not None;d=json.loads(p.read_text());d['version']=99;p.write_text(json.dumps(d))"
           if contextmesh-mcp --session /tmp/bad 2>/tmp/bad.txt; then
             echo "::error::the server accepted a session it cannot restore"; exit 1
           fi
@@ -632,7 +632,7 @@ jobs:
         run: |
           python - <<'EOF' | tee /tmp/symlink.txt
           import json, os, pathlib, shutil
-          from contextmesh_mcp.session import Session, SessionError
+          from contextmesh_mcp.session import Session, SessionError, live_manifest_path
 
           def fresh(case):
               root = pathlib.Path(f"/tmp/hostile-{case}")
@@ -794,6 +794,8 @@ jobs:
           tmp = Path(tempfile.mkdtemp()) / "session"
           base.save(tmp)
           manifest = json.loads((tmp / "session.json").read_text())
+          manifest_path = live_manifest_path(tmp)
+          assert manifest_path is not None
           print(" manifest version:", manifest["version"])
           assert manifest["version"] == 2
           for field in ("graph", "resolver", "execution", "ledger"):
@@ -911,19 +913,19 @@ jobs:
               dangling.record(1, Event.EXECUTED, "only", "ran", **kwargs)
               (tmp / manifest["ledger"]).write_text(json.dumps(dangling.snapshot()))
               moved = dict(manifest); moved["ledger_head"] = dangling.head
-              (tmp / "session.json").write_text(json.dumps(moved, indent=2))
+              manifest_path.write_text(json.dumps(moved, indent=2))
               if not refused(label):
                   raise SystemExit("::error::%s was accepted" % label)
           (tmp / manifest["ledger"]).write_text(json.dumps(run.ledger.snapshot()))
-          (tmp / "session.json").write_text(json.dumps(manifest, indent=2))
+          manifest_path.write_text(json.dumps(manifest, indent=2))
 
           # A plan with no history, and a history with no plan.
           for dropped, kept in (("ledger", "execution"), ("execution", "ledger")):
               broken = dict(manifest); broken[dropped] = None
-              (tmp / "session.json").write_text(json.dumps(broken, indent=2))
+              manifest_path.write_text(json.dumps(broken, indent=2))
               if not refused("%s with no %s" % (kept, dropped)):
                   raise SystemExit("::error::a half-committed pair was accepted")
-          (tmp / "session.json").write_text(json.dumps(manifest, indent=2))
+          manifest_path.write_text(json.dumps(manifest, indent=2))
 
           # And the one a directory can never supply.
           try:
