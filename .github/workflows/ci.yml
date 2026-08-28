@@ -435,19 +435,18 @@ jobs:
           assert live is not None
           session = Session.load(root)
 
-          # A reader holding the manifest across the commit must still see the
-          # previous generation, whole. That is what os.replace buys, and an
-          # in-place rewrite of the same bytes would not.
-          inode = live.stat().st_ino
+          # A reader holding an immutable manifest across the commit must still
+          # see the previous generation whole, even if the sweep unlinks its
+          # old pathname after publishing the next manifest.
           with open(live, encoding="utf-8") as reader:
               session.checkpoint()
               held = json.loads(reader.read())
-          assert live.stat().st_ino != inode, "the manifest was written in place"
           assert held["generation"] == session.generation - 1, held["generation"]
           assert (root / held["graph"]).name == held["graph"]
 
           committed_live = live_manifest_path(root)
           assert committed_live is not None
+          assert committed_live != live, "the manifest was written in place"
           committed = json.loads(committed_live.read_text())
           assert committed["generation"] == held["generation"] + 1
           leftovers = sorted(p.name for p in root.iterdir())
