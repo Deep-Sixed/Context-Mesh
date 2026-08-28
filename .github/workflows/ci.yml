@@ -63,7 +63,7 @@ jobs:
         run: ops/leak-check.sh "${{ github.event.pull_request.base.sha }}"
 
   mcp:
-    name: mcp · read-only server
+    name: mcp · controlled server
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -84,16 +84,31 @@ jobs:
           print("core: 0 dependencies, requires-python >=3.9")
           EOF
 
-      - name: The server registers exactly five read tools
+      - name: The server separates five reads from controlled writes
         run: |
           python - <<'EOF' | tee /tmp/mcp.txt
           import asyncio
-          from contextmesh_mcp import server, tools
-          names = sorted(t.name for t in asyncio.run(server.mcp.list_tools()))
-          print("tools:", names)
-          assert names == tools.names(), names
-          for forbidden in ("invalidate", "reject", "repair", "execute", "add_"):
-              assert not any(forbidden in n for n in names), forbidden
+          from contextmesh_mcp import server, tools, writes
+          published = sorted(t.name for t in asyncio.run(server.mcp.list_tools()))
+          print("read tools:", tools.names())
+          print("write tools:", writes.names())
+          print("published:", published)
+          assert tools.names() == [
+              "mesh_ask",
+              "mesh_blast_radius",
+              "mesh_get_node",
+              "mesh_health",
+              "mesh_lineage",
+          ]
+          assert writes.names() == [
+              "mesh_recheck",
+              "mesh_repair",
+              "mesh_resume",
+              "mesh_submit_evidence",
+          ]
+          assert published == sorted([*tools.names(), *writes.names()])
+          direct = {"mesh_reject", "mesh_invalidate", "mesh_set_status", "mesh_add_edge"}
+          assert direct.isdisjoint(published), direct & set(published)
           uris = sorted(str(r.uri) for r in asyncio.run(server.mcp.list_resources()))
           print("resources:", uris)
           templates = sorted(
@@ -101,9 +116,9 @@ jobs:
           )
           print("templates:", templates)
           assert "contextmesh://node/{node_id}" in templates
-          print("READ-ONLY SURFACE OK")
+          print("CONTROLLED MCP SURFACE OK")
           EOF
-          grep -q "READ-ONLY SURFACE OK" /tmp/mcp.txt
+          grep -q "CONTROLLED MCP SURFACE OK" /tmp/mcp.txt
 
       - name: The full suite, with the SDK present so nothing skips
         run: |
@@ -751,7 +766,7 @@ jobs:
               raise SystemExit("::error::" + out.stderr.strip().splitlines()[-1])
           result = json.loads(out.stdout)
           assert result["restored_head"] == run.ledger.head, "the ledger head moved"
-          print(" restored ledger head:", result["restored_head"][:32], "...")
+          print(" restored ledger head:  ", result["restored_head"][:32], "...")
           for name, (state, attempt, output) in sorted(result["tasks"].items()):
               print("   %-8s %-6s attempt %s  %s" % (name, state, attempt, output))
           assert result["tasks"]["hashing"][2] == {"impl": "bcrypt"}
