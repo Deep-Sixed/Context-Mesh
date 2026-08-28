@@ -46,3 +46,6 @@ select = ["E", "F", "W", "I"]
 # Provider adapter diagnostics are security/error messages whose exact wording
 # is more useful intact than split only to satisfy a display-column limit.
 "contextmesh/llm.py" = ["E501"]
+# This contract test keeps imports grouped by the authority boundary it tests;
+# all functional lint rules still apply.
+"tests/test_llm.py" = ["I001"]
