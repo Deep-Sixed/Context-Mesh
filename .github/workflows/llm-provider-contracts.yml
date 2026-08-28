@@ -1,0 +1,64 @@
+name: LLM provider contracts
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: llm-contracts-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contracts:
+    name: llm · provider contracts · no network
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+
+      - name: Core still has zero required dependencies
+        run: |
+          python - <<'EOF'
+          import pathlib
+          import tomllib
+
+          data = tomllib.loads(pathlib.Path("pyproject.toml").read_text())
+          assert data["project"]["dependencies"] == []
+          assert data["project"]["requires-python"] == ">=3.9"
+          print("core dependency boundary unchanged")
+          EOF
+
+      - name: Provider contract suite uses injected transports only
+        run: python -m unittest -v tests.test_llm
+
+      - name: No provider SDK became a core dependency
+        run: |
+          python - <<'EOF'
+          import ast
+          import pathlib
+
+          tree = ast.parse(pathlib.Path("contextmesh/llm.py").read_text())
+          forbidden = {
+              "anthropic",
+              "google",
+              "httpx",
+              "openai",
+              "requests",
+          }
+          imported = set()
+          for node in ast.walk(tree):
+              if isinstance(node, ast.Import):
+                  imported.update(alias.name.split(".")[0] for alias in node.names)
+              elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                  imported.add(node.module.split(".")[0])
+          found = sorted(imported & forbidden)
+          assert not found, f"provider SDK/dependency imported by core: {found}"
+          print("provider layer uses only stdlib + Context Mesh internals")
+          EOF
