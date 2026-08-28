@@ -312,9 +312,11 @@ jobs:
             rm -rf /tmp/broken && cp -r /tmp/session /tmp/broken
             python - "$1" <<'EOF'
           import json, pathlib, sys
+          from contextmesh_mcp.session import live_manifest_path
           how = sys.argv[1]
           root = pathlib.Path("/tmp/broken")
-          sfile = root / "session.json"
+          sfile = live_manifest_path(root)
+          assert sfile is not None
           data = json.loads(sfile.read_text())
           if how == "version":
               data["version"] = 99
