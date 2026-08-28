@@ -1,5 +1,8 @@
 """PR #8B-8D controlled-write integration over the native durable session."""
 
+import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -32,13 +35,18 @@ def deployment() -> TaskRegistry:
         # task may be repaired onto. This condition is load-bearing: without it
         # a successful bcrypt rerun would be rejected by evidence about argon2.
         if ctx.output.get("impl") != "argon2":
-            return ctx.ok("the active implementation is not affected by the Argon2 advisory")
+            return ctx.ok(
+                "the active implementation is not affected by the Argon2 advisory"
+            )
         for node in ctx.graph.nodes.values():
             if node.type is not NodeType.EVIDENCE:
                 continue
             record = node.attrs.get("evidence_intake", {})
             metadata = record.get("metadata", {})
-            if metadata.get("package") == "argon2" and metadata.get("severity") == "critical":
+            if (
+                metadata.get("package") == "argon2"
+                and metadata.get("severity") == "critical"
+            ):
                 return ctx.disproved(
                     "CVE-2026-9999 affects the active Argon2 implementation",
                     evidence_id=node.id,
@@ -237,16 +245,12 @@ class ControlledWriteIntegrationTest(unittest.TestCase):
     def test_the_complete_flow_survives_fresh_session_objects(self):
         self.submit_cve()
 
-        # Process-boundary equivalent #1: throw away every live object and bind
-        # the plan from durable keys in a fresh deployment registry.
         fresh_b = Session.load(self.root, registry=deployment())
         b_generation = fresh_b.generation
         cp_b = Checkpointer(fresh_b)
         after_recheck = mesh_recheck(fresh_b, cp_b).session
         self.assertEqual(after_recheck.generation, b_generation + 1)
 
-        # Process-boundary equivalent #2: another fresh registry sees the stale
-        # closure and changes executable identity before any rerun occurs.
         fresh_c = Session.load(self.root, registry=deployment())
         cp_c = Checkpointer(fresh_c)
         repaired = mesh_repair(
@@ -261,13 +265,10 @@ class ControlledWriteIntegrationTest(unittest.TestCase):
         self.assertEqual(repaired.runner["hashing"].worker_key, "auth.hash.bcrypt.v1")
         self.assertEqual(repaired.runner["hashing"].attempt, 1)
 
-        # Process-boundary equivalent #3: resume from disk, not from the object
-        # that performed the repair.
         fresh_d = Session.load(self.root, registry=deployment())
         cp_d = Checkpointer(fresh_d)
         final_write = mesh_resume(fresh_d, cp_d)
 
-        # And read it once more as a verifier that ran none of the mutations.
         verified = Session.load(self.root, registry=deployment())
         runner = verified.runner
         assert runner is not None
@@ -280,6 +281,112 @@ class ControlledWriteIntegrationTest(unittest.TestCase):
         )
         self.assertTrue(runner.ledger.verify())
         self.assertEqual(runner.ledger.head, final_write.payload["ledger_head"])
+
+    def test_8d_crosses_four_real_python_processes(self):
+        scripts = [
+            """
+import json, runpy, sys
+from contextmesh_mcp.session import Checkpointer, Session
+from contextmesh_mcp.writes import mesh_submit_evidence
+D = runpy.run_path('tests/test_controlled_writes.py', run_name='pr8defs')
+s = Session.load(sys.argv[1], registry=D['deployment']())
+cp = Checkpointer(s)
+r = mesh_submit_evidence(
+    s, cp,
+    text='CVE-2026-9999 affects Argon2',
+    source_id='source:vendor-advisory',
+    external_id='CVE-2026-9999',
+    metadata={'package': 'argon2', 'severity': 'critical'},
+)
+print(json.dumps({'generation': r.session.generation, 'evidence': r.payload['evidence_id']}))
+""",
+            """
+import json, runpy, sys
+from contextmesh_mcp.session import Checkpointer, Session
+from contextmesh_mcp.writes import mesh_recheck, mesh_repair
+D = runpy.run_path('tests/test_controlled_writes.py', run_name='pr8defs')
+s = Session.load(sys.argv[1], registry=D['deployment']())
+cp = Checkpointer(s)
+s = mesh_recheck(s, cp).session
+s = mesh_repair(
+    s, cp,
+    task='hashing',
+    worker_key='auth.hash.bcrypt.v1',
+    assumes='bcrypt has no open advisory',
+    produces=['Password Hasher'],
+).session
+r = s.runner
+assert r is not None
+print(json.dumps({
+    'generation': s.generation,
+    'worker_key': r['hashing'].worker_key,
+    'attempt': r['hashing'].attempt,
+    'states': {t.name: t.state.value for t in r.tasks},
+}))
+""",
+            """
+import json, runpy, sys
+from contextmesh_mcp.session import Checkpointer, Session
+from contextmesh_mcp.writes import mesh_resume
+D = runpy.run_path('tests/test_controlled_writes.py', run_name='pr8defs')
+s = Session.load(sys.argv[1], registry=D['deployment']())
+cp = Checkpointer(s)
+r = mesh_resume(s, cp)
+print(json.dumps({
+    'generation': r.session.generation,
+    'executed': r.payload['executed'],
+    'cached': r.payload['cached'],
+}))
+""",
+            """
+import json, runpy, sys
+from contextmesh_mcp.session import Session
+D = runpy.run_path('tests/test_controlled_writes.py', run_name='pr8defs')
+s = Session.load(sys.argv[1], registry=D['deployment']())
+r = s.runner
+assert r is not None
+assert r.ledger.verify()
+print(json.dumps({
+    'generation': s.generation,
+    'head': r.ledger.head,
+    'worker_key': r['hashing'].worker_key,
+    'hashing_output': r['hashing'].output,
+    'routes_output': r['routes'].output,
+    'attempts': {t.name: t.attempt for t in r.tasks},
+}))
+""",
+        ]
+
+        outputs = []
+        for index, script in enumerate(scripts, start=1):
+            proc = subprocess.run(
+                [sys.executable, "-c", script, str(self.root)],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            self.assertEqual(
+                proc.returncode,
+                0,
+                f"process {index} failed:\nstdout={proc.stdout}\nstderr={proc.stderr}",
+            )
+            outputs.append(json.loads(proc.stdout))
+
+        self.assertEqual(outputs[1]["worker_key"], "auth.hash.bcrypt.v1")
+        self.assertEqual(outputs[1]["attempt"], 1, "bcrypt must not run before restart")
+        self.assertEqual(set(outputs[2]["executed"]), {"hashing", "routes"})
+        self.assertEqual(set(outputs[2]["cached"]), {"schema", "tokens"})
+        self.assertEqual(outputs[3]["worker_key"], "auth.hash.bcrypt.v1")
+        self.assertEqual(outputs[3]["hashing_output"], {"impl": "bcrypt"})
+        self.assertEqual(outputs[3]["routes_output"], {"hasher": "bcrypt"})
+        self.assertEqual(
+            outputs[3]["attempts"],
+            {"schema": 1, "hashing": 2, "routes": 2, "tokens": 1},
+        )
+        self.assertEqual(
+            [row["generation"] for row in outputs],
+            sorted(row["generation"] for row in outputs),
+        )
 
 
 if __name__ == "__main__":
