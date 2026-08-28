@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import argparse
+import builtins
 import json
 import re
 import sys
@@ -27,6 +28,45 @@ DEFAULT_EXPORT = Path(__file__).resolve().parent.parent / "dashboard" / "data" /
 DASHBOARD_HTML = Path(__file__).resolve().parent.parent / "dashboard" / "index.html"
 
 RULE = "─" * 78
+
+ASCII_FALLBACKS = str.maketrans({
+    "─": "-",
+    "·": "*",
+    "→": "->",
+    "—": "-",
+    "✓": "+",
+    "✗": "x",
+    "…": "...",
+    "█": "#",
+})
+
+
+def _stream_supports_presentation(stream: Any) -> bool:
+    encoding = getattr(stream, "encoding", None) or "utf-8"
+    try:
+        "─ · → — ✓ ✗ … █".encode(encoding)
+    except (LookupError, UnicodeEncodeError):
+        return False
+    return True
+
+
+def _safe_text(value: Any, stream: Any) -> str:
+    text = str(value)
+    if _stream_supports_presentation(stream):
+        return text
+    return text.translate(ASCII_FALLBACKS)
+
+
+def print(
+    *values: Any,
+    sep: str = " ",
+    end: str = "\n",
+    file: Any = None,
+    flush: bool = False,
+) -> None:
+    stream = sys.stdout if file is None else file
+    safe_values = [_safe_text(value, stream) for value in values]
+    builtins.print(*safe_values, sep=sep, end=end, file=stream, flush=flush)
 
 
 def _h(title: str) -> None:
