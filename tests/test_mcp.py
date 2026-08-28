@@ -291,8 +291,11 @@ class SurfaceTest(unittest.TestCase):
             for forbidden in self.FORBIDDEN:
                 self.assertNotIn(forbidden, name)
 
-    def test_the_only_8a_write_is_evidence_intake(self):
-        self.assertEqual(writes.names(), ["mesh_submit_evidence"])
+    def test_controlled_write_registry_is_exact(self):
+        self.assertEqual(
+            writes.names(),
+            ["mesh_recheck", "mesh_repair", "mesh_resume", "mesh_submit_evidence"],
+        )
 
     def test_every_tool_declares_a_description(self):
         for registry in (tools.TOOLS, writes.WRITE_TOOLS):
@@ -358,13 +361,19 @@ class ServerTest(unittest.TestCase):
             return tools.TOOLS[name]
         return writes.WRITE_TOOLS[name]
 
-    def test_the_server_registers_read_tools_plus_controlled_writes(self):
+    def _published(self):
         import asyncio
 
         from contextmesh_mcp import server
 
-        registered = sorted(t.name for t in asyncio.run(server.mcp.list_tools()))
-        self.assertEqual(registered, sorted([*tools.names(), *writes.names()]))
+        return {tool.name: tool.input_schema for tool in asyncio.run(server.mcp.list_tools())}
+
+    def test_the_server_registers_read_tools_plus_controlled_writes(self):
+        published = self._published()
+        self.assertEqual(
+            sorted(published),
+            sorted([*tools.names(), *writes.names()]),
+        )
 
     def test_the_registered_schema_matches_each_tool_signature(self):
         import asyncio
@@ -389,14 +398,7 @@ class ServerTest(unittest.TestCase):
             )
 
     def test_evidence_schema_carries_no_verdict_or_edge_authority(self):
-        import asyncio
-
-        from contextmesh_mcp import server
-
-        published = {
-            tool.name: tool.input_schema for tool in asyncio.run(server.mcp.list_tools())
-        }
-        schema = published["mesh_submit_evidence"]
+        schema = self._published()["mesh_submit_evidence"]
         self.assertEqual(
             set(schema["properties"]),
             {"text", "source_id", "external_id", "metadata"},
@@ -408,6 +410,44 @@ class ServerTest(unittest.TestCase):
             "target",
             "target_id",
             "assumption_id",
+            "verdict",
+            "reject",
+            "invalidate",
+            "status",
+        }
+        self.assertTrue(forbidden.isdisjoint(schema["properties"]))
+
+    def test_recheck_and_resume_publish_no_client_authority(self):
+        published = self._published()
+        for name in ("mesh_recheck", "mesh_resume"):
+            self.assertEqual(published[name]["properties"], {}, name)
+            self.assertEqual(published[name].get("required", []), [], name)
+
+    def test_repair_publishes_keys_not_code_or_verdicts(self):
+        schema = self._published()["mesh_repair"]
+        self.assertEqual(
+            set(schema["properties"]),
+            {
+                "task",
+                "worker_key",
+                "assumes",
+                "auditor_key",
+                "produces",
+                "rationale",
+            },
+        )
+        self.assertEqual(
+            set(schema.get("required", [])),
+            {"task", "worker_key", "assumes"},
+        )
+        forbidden = {
+            "run",
+            "audit",
+            "callable",
+            "module",
+            "module_path",
+            "import",
+            "registry",
             "verdict",
             "reject",
             "invalidate",
