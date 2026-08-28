@@ -18,6 +18,7 @@ The pieces:
 - ``assumptions`` versioned assumptions and selective invalidation
 - ``evidence``    controlled observation intake; data enters without a verdict
 - ``execute``     re-runs exactly the work an invalidation knocked down
+- ``llm``         fail-closed provider adapters; model proposals are not verdicts
 - ``decisions``   append-only decision history
 - ``health``      the conditions that quietly make a graph useless
 - ``metrics``     the dashboard payload, computed from the live graph
@@ -51,6 +52,24 @@ from .graph import (
     SnapshotError,
 )
 from .health import Signal, check, report
+from .llm import (
+    LIVE_PROVIDERS,
+    AuditProposal,
+    LLMClient,
+    LLMConfig,
+    LLMConfigurationError,
+    LLMError,
+    LLMProviderError,
+    LLMProvenance,
+    LLMResponseError,
+    LLMResult,
+    LLMSchemaError,
+    LLMTransportError,
+    TokenUsage,
+    make_audit_proposer,
+    make_worker,
+    propose_audit,
+)
 from .metrics import snapshot
 from .model import (
     Assumption,
@@ -69,11 +88,13 @@ from .traverse import DeadEnd, Walk, Walker
 __version__ = "0.1.0"
 
 __all__ = [
+    "LIVE_PROVIDERS",
     "ONTOLOGY",
     "Assumption",
     "AssumptionLedger",
     "AssumptionStatus",
     "AuditContext",
+    "AuditProposal",
     "BuildReport",
     "ContextGraph",
     "DeadEnd",
@@ -88,6 +109,16 @@ __all__ = [
     "EvidenceReceipt",
     "ExecutionError",
     "InvalidationReport",
+    "LLMClient",
+    "LLMConfig",
+    "LLMConfigurationError",
+    "LLMError",
+    "LLMProviderError",
+    "LLMProvenance",
+    "LLMResponseError",
+    "LLMResult",
+    "LLMSchemaError",
+    "LLMTransportError",
     "Node",
     "NodeType",
     "Ontology",
@@ -106,11 +137,15 @@ __all__ = [
     "SnapshotError",
     "Task",
     "TaskState",
+    "TokenUsage",
     "Verdict",
     "Walk",
     "Walker",
     "check",
     "documents",
+    "make_audit_proposer",
+    "make_worker",
+    "propose_audit",
     "report",
     "snapshot",
     "submit_evidence",
