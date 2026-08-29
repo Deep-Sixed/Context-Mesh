@@ -1,6 +1,6 @@
 # Context Mesh
 
-> One graph · four node types · every answer walks a path you can read
+> One graph · six node types · every answer walks a path you can read
 
 Context Mesh is a typed context graph for long-running agents. It keeps not only
 *what* is connected, but *why* — where a claim came from, what a decision rested
@@ -21,8 +21,12 @@ histogram, the edge traffic, the dead-end reasons. Open
 in a single file, or rebuild it from your own data:
 
 ```bash
-python -m contextmesh export --inline && open dashboard/index.html
+python -m contextmesh export --inline
 ```
+
+Then open `dashboard/index.html` in a browser: `start dashboard/index.html` on
+Windows, `open dashboard/index.html` on macOS, or
+`xdg-open dashboard/index.html` on Linux.
 
 ```bash
 git clone https://github.com/charlessnydercareer/Context-Mesh
@@ -573,8 +577,10 @@ a measure of traffic.
 
 ```bash
 python -m contextmesh export --inline
-open dashboard/index.html
 ```
+
+Open `dashboard/index.html` with `start` on Windows, `open` on macOS, or
+`xdg-open` on Linux.
 
 Header stats, the build path, the live graph, the hop budget, the edge ledger,
 walk-vs-flat token cost, the traversal grid and the dead-end ledger — each panel
