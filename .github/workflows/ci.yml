@@ -632,7 +632,7 @@ jobs:
         run: |
           python - <<'EOF' | tee /tmp/symlink.txt
           import json, os, pathlib, shutil
-          from contextmesh_mcp.session import Session, SessionError, live_manifest_path
+          from contextmesh_mcp.session import Session, SessionError
 
           def fresh(case):
               root = pathlib.Path(f"/tmp/hostile-{case}")
@@ -794,8 +794,6 @@ jobs:
           tmp = Path(tempfile.mkdtemp()) / "session"
           base.save(tmp)
           manifest = json.loads((tmp / "session.json").read_text())
-          manifest_path = live_manifest_path(tmp)
-          assert manifest_path is not None
           print(" manifest version:", manifest["version"])
           assert manifest["version"] == 2
           for field in ("graph", "resolver", "execution", "ledger"):
@@ -859,7 +857,7 @@ jobs:
           import json, tempfile
           from pathlib import Path
           from contextmesh.execute import Event, RunLedger, Runner, TaskRegistry
-          from contextmesh_mcp.session import Session, SessionError
+          from contextmesh_mcp.session import Session, SessionError, live_manifest_path
 
           def deployment():
               r = TaskRegistry()
@@ -875,6 +873,8 @@ jobs:
           tmp = Path(tempfile.mkdtemp()) / "session"
           base.save(tmp)
           manifest = json.loads((tmp / "session.json").read_text())
+          manifest_path = live_manifest_path(tmp)
+          assert manifest_path is not None
 
           def refused(label, registry=deployment()):
               try:
