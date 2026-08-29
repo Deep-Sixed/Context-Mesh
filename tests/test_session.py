@@ -1401,9 +1401,10 @@ class WriterSymlinkTest(unittest.TestCase):
 
     def test_a_planted_link_at_the_next_generation_manifest_is_replaced(self):
         require_symlink(self.dir)
+        writer = Session.load(self.dir)
         planted = self.dir / manifest_name(self.next_generation())
         planted.symlink_to(self.outside)
-        Session.load(self.dir).checkpoint()
+        writer.checkpoint()
         self.assert_outside_untouched()
         self.assertFalse((self.dir / manifest_name(2)).is_symlink())
         self.assertEqual(Session.load(self.dir).generation, 2)

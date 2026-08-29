@@ -817,7 +817,7 @@ class Session:
         generations = []
         for entry in directory.iterdir():
             match = _GENERATION_MANIFEST_RE.fullmatch(entry.name)
-            if match and entry.is_file():
+            if match and not entry.is_symlink() and entry.is_file():
                 generations.append(int(match.group("generation")))
         if generations:
             return max(generations)
