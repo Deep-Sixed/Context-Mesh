@@ -7,26 +7,26 @@ assumption is written down rather than implied.
 A session on disk is a *directory*, not a file::
 
     session/
-      session.json           the manifest, and the commit point
+      session-000003.json    the manifest, and the commit point
+      session.json           latest-manifest pointer for humans and older tools
       graph-000003.json      contextmesh.graph    v1 (contextmesh/graph.py)
       resolver-000003.json   contextmesh.resolver v1 (contextmesh/resolve.py)
       execution-000003.json  contextmesh.execution v1 (contextmesh/execute.py)
       runledger-000003.json  contextmesh.runledger v1 (contextmesh/execute.py)
 
-The session file is the join, and it is the only place that can check the
+The generation manifest is the join, and it is the only place that can check the
 invariants the companions cannot see on their own. Session v1 held graph and
 resolver; v2 adds the execution plan and its run ledger.
 
 **Generations, because a session gets overwritten.** A save never overwrites a
 live companion. It writes a whole new generation under new names, and only then
-replaces ``session.json`` — one ``os.replace``, which the filesystem makes
-atomic. The manifest is the commit:
+publishes ``session-000NNN.json``. The generation manifest is the commit:
 
-    crash before the swap  →  the previous generation is still named, intact
-    crash during the swap  →  one manifest or the other, never half of one
-    crash after the swap   →  the new generation is named, and complete
+    crash before publication  ->  the previous generation is still named, intact
+    crash during publication  ->  one manifest or the other, never half of one
+    crash after publication   ->  the new generation is named, and complete
 
-Superseded generations are deleted after the swap, so an interrupted save costs
+Superseded generations are deleted after publication, so an interrupted save costs
 disk rather than correctness.
 """
 
@@ -73,7 +73,9 @@ SESSION_VERSION = 2
 READABLE_VERSIONS = (1, 2)
 
 SESSION_FILE = "session.json"
+SESSION_MANIFEST_STEM = "session"
 LOCK_FILE = "session.lock"
+LOCK_META_FILE = "session.lock.meta"
 #: Prefix for the short-lived file every write lands in first. Recognisable so
 #: an abandoned one can be swept, random so it cannot be pre-empted by a name
 #: planted in the directory.
@@ -105,6 +107,7 @@ _SESSION_V2_KEYS = frozenset(
     _SESSION_V1_KEYS | {"execution", "ledger", "ledger_head"}
 )
 _LEDGER_HEAD_RE = re.compile(r"^[0-9a-f]{64}$")
+_GENERATION_MANIFEST_RE = re.compile(r"^session-(?P<generation>[0-9]{6})[.]json$")
 
 #: How often a served session is written back. ``every-ask`` is the default
 #: because a question is a write here and a lost write is silent; the cost is
@@ -122,6 +125,10 @@ def generation_name(stem: str, generation: int) -> str:
     is the exact failure generations exist to prevent.
     """
     return f"{stem}-{generation:06d}.json"
+
+
+def manifest_name(generation: int) -> str:
+    return generation_name(SESSION_MANIFEST_STEM, generation)
 
 
 class SessionLockedError(Exception):
@@ -274,6 +281,121 @@ def write_in_place(directory: Path, name: str, payload: str) -> Path:
         raise
 
 
+def read_text_shared(path: Path) -> str:
+    """Read text without blocking a Windows rename over the same pathname.
+
+    POSIX lets a writer replace a file while another process has it open. On
+    Windows that works only if the reader opted into delete sharing. Context
+    Mesh readers are lock-free by design, so the manifest read takes that share
+    mode explicitly when the platform needs it.
+    """
+    if os.name != "nt":
+        return path.read_text(encoding="utf-8")
+
+    import ctypes
+    import msvcrt
+
+    GENERIC_READ = 0x80000000
+    FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_WRITE = 0x00000002
+    FILE_SHARE_DELETE = 0x00000004
+    OPEN_EXISTING = 3
+    FILE_ATTRIBUTE_NORMAL = 0x00000080
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    handle = kernel32.CreateFileW(
+        str(path),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        None,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        None,
+    )
+    if handle == INVALID_HANDLE_VALUE:
+        error = ctypes.get_last_error()
+        raise OSError(error, os.strerror(error), str(path))
+
+    try:
+        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY)
+    except BaseException:
+        kernel32.CloseHandle(handle)
+        raise
+    with os.fdopen(fd, "r", encoding="utf-8") as reader:
+        return reader.read()
+
+
+def read_session_manifest_text(directory: Path) -> str:
+    return read_text_shared(directory / SESSION_FILE)
+
+
+def live_manifest_path(directory: Path) -> Optional[Path]:
+    manifests: List[Tuple[int, Path]] = []
+    for entry in directory.iterdir():
+        match = _GENERATION_MANIFEST_RE.fullmatch(entry.name)
+        if match and entry.is_symlink():
+            raise SessionError(
+                f"{entry.name} is a symbolic link; a committed session manifest "
+                "must be a regular file inside the session directory"
+            )
+        if match and entry.is_file():
+            manifests.append((int(match.group("generation")), entry))
+    if manifests:
+        return max(manifests, key=lambda item: item[0])[1]
+    legacy = directory / SESSION_FILE
+    return legacy if legacy.is_file() else None
+
+
+def read_live_manifest_text(directory: Path) -> str:
+    path = live_manifest_path(directory)
+    if path is None:
+        raise FileNotFoundError(directory / SESSION_FILE)
+    return read_text_shared(path)
+
+
+def open_session_manifest_reader(directory: Path) -> Any:
+    """Open the committed manifest the same way ``Session.load`` chooses it."""
+    path = live_manifest_path(directory)
+    if path is None:
+        raise FileNotFoundError(directory / SESSION_FILE)
+    if os.name != "nt":
+        return open(path, "r", encoding="utf-8")
+
+    import ctypes
+    import msvcrt
+
+    GENERIC_READ = 0x80000000
+    FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_WRITE = 0x00000002
+    FILE_SHARE_DELETE = 0x00000004
+    OPEN_EXISTING = 3
+    FILE_ATTRIBUTE_NORMAL = 0x00000080
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    handle = kernel32.CreateFileW(
+        str(path),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        None,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        None,
+    )
+    if handle == INVALID_HANDLE_VALUE:
+        error = ctypes.get_last_error()
+        raise OSError(error, os.strerror(error), str(path))
+    try:
+        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY)
+    except BaseException:
+        kernel32.CloseHandle(handle)
+        raise
+    return os.fdopen(fd, "r", encoding="utf-8")
+
+
 def _open_lock_file(path: Path) -> Any:
     """Open the lock file without following a symlink, and check what it is.
 
@@ -381,7 +503,7 @@ def _unlock(handle: Any) -> None:
 def _holder(path: Path) -> str:
     """Best-effort description of whoever holds the lock, for the error."""
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads((path.parent / LOCK_META_FILE).read_text(encoding="utf-8"))
         return f"pid {data['pid']} on {data['host']}"
     except (OSError, ValueError, KeyError, TypeError):
         return "another process"
@@ -420,10 +542,14 @@ def writer_lock(directory: Any) -> Iterator[Path]:
         try:
             handle.seek(0)
             handle.truncate()
-            handle.write(
-                json.dumps({"pid": os.getpid(), "host": socket.gethostname()}) + "\n"
-            )
+            holder = json.dumps({"pid": os.getpid(), "host": socket.gethostname()}) + "\n"
+            handle.write(holder)
             handle.flush()
+            write_in_place(
+                target,
+                LOCK_META_FILE,
+                holder,
+            )
             yield path
         finally:
             _unlock(handle)
@@ -688,11 +814,19 @@ class Session:
 
     @staticmethod
     def _live_generation(directory: Path) -> int:
-        path = directory / SESSION_FILE
-        if not path.is_file():
+        generations = []
+        for entry in directory.iterdir():
+            match = _GENERATION_MANIFEST_RE.fullmatch(entry.name)
+            if match and not entry.is_symlink() and entry.is_file():
+                generations.append(int(match.group("generation")))
+        if generations:
+            return max(generations)
+
+        path = live_manifest_path(directory)
+        if path is None:
             return 0
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
+            data = json.loads(read_text_shared(path))
             generation = data["generation"]
         except (OSError, ValueError, KeyError, TypeError):
             return 0
@@ -721,18 +855,22 @@ class Session:
         if self.runner is not None:
             write_in_place(target, payload["execution"], self.runner.to_json())
             write_in_place(target, payload["ledger"], self.runner.ledger.to_json())
-        write_in_place(
-            target,
-            SESSION_FILE,
+        manifest_payload = (
             json.dumps(
                 payload, sort_keys=True, indent=2, ensure_ascii=False, allow_nan=False
             )
-            + "\n",
+            + "\n"
         )
+        write_in_place(target, manifest_name(generation), manifest_payload)
+        try:
+            write_in_place(target, SESSION_FILE, manifest_payload)
+        except PermissionError:
+            if os.name != "nt":
+                raise
         _fsync_dir(target)
         self._sweep(
             target,
-            keep={SESSION_FILE, LOCK_FILE}
+            keep={SESSION_FILE, LOCK_FILE, LOCK_META_FILE, manifest_name(generation)}
             | {payload[name] for name, _ in COMPANIONS if payload[name] is not None},
         )
         self.generation = generation
@@ -744,8 +882,9 @@ class Session:
             name = entry.name
             if name in keep or not entry.is_file():
                 continue
-            superseded = name.endswith(".json") and any(
-                name.startswith(f"{stem}-") for _, stem in COMPANIONS
+            superseded = name.endswith(".json") and (
+                any(name.startswith(f"{stem}-") for _, stem in COMPANIONS)
+                or name.startswith(f"{SESSION_MANIFEST_STEM}-")
             )
             abandoned = name.startswith(STAGING_PREFIX) and name.endswith(STAGING_SUFFIX)
             if superseded or abandoned:
@@ -793,14 +932,14 @@ class Session:
     def _load_once(
         cls, target: Path, registry: Optional[TaskRegistry] = None
     ) -> "Session":
-        session_path = target / SESSION_FILE
-        if not session_path.is_file():
+        session_path = live_manifest_path(target)
+        if session_path is None:
             raise SessionError(
                 f"{target} has no {SESSION_FILE}, so it is not a session "
                 "directory this build can read"
             )
         try:
-            raw = session_path.read_text(encoding="utf-8")
+            raw = read_text_shared(session_path)
         except FileNotFoundError:
             raise _Swept(SESSION_FILE, "manifest") from None
         try:

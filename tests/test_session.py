@@ -43,6 +43,7 @@ from contextmesh_mcp.session import (
     LOAD_ATTEMPTS,
     LOAD_BACKOFF,
     LOCK_FILE,
+    LOCK_META_FILE,
     RESOLVER_STEM,
     SESSION_FILE,
     SESSION_SCHEMA,
@@ -56,6 +57,9 @@ from contextmesh_mcp.session import (
     WalkerConfig,
     check_agreement,
     generation_name,
+    manifest_name,
+    open_session_manifest_reader,
+    read_live_manifest_text,
     write_in_place,
     writer_lock,
 )
@@ -69,7 +73,7 @@ def build(rounds: int = ROUNDS) -> Session:
 
 
 def manifest(directory: Path) -> dict:
-    return json.loads((directory / SESSION_FILE).read_text(encoding="utf-8"))
+    return json.loads(read_live_manifest_text(directory))
 
 
 def graph_file(directory: Path) -> Path:
@@ -87,6 +91,32 @@ def resolver_file(directory: Path) -> Path:
 
 def names(directory: Path) -> list:
     return sorted(p.name for p in directory.iterdir())
+
+
+def can_create_symlink(directory: Path) -> tuple[bool, str]:
+    target = directory / "symlink-target"
+    link = directory / "symlink-link"
+    target.write_text("x", encoding="utf-8")
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError) as exc:
+        return False, f"symlink creation unavailable: {exc}"
+    finally:
+        if link.exists() or link.is_symlink():
+            link.unlink()
+        target.unlink(missing_ok=True)
+    return True, ""
+
+
+def require_symlink(directory: Path) -> None:
+    ok, reason = can_create_symlink(directory)
+    if not ok:
+        raise unittest.SkipTest(reason)
+
+
+def require_fifo() -> None:
+    if not hasattr(os, "mkfifo"):
+        raise unittest.SkipTest("os.mkfifo is not available on this platform")
 
 
 def mention_question(mention: str) -> str:
@@ -114,7 +144,9 @@ class RoundTripTest(unittest.TestCase):
             names(self.dir),
             sorted([
                 SESSION_FILE,
+                manifest_name(1),
                 LOCK_FILE,
+                LOCK_META_FILE,
                 generation_name(GRAPH_STEM, 1),
                 generation_name(RESOLVER_STEM, 1),
             ]),
@@ -212,7 +244,9 @@ class GenerationTest(unittest.TestCase):
     def expected(self, generation: int) -> list:
         return sorted([
             SESSION_FILE,
+            manifest_name(generation),
             LOCK_FILE,
+            LOCK_META_FILE,
             generation_name(GRAPH_STEM, generation),
             generation_name(RESOLVER_STEM, generation),
         ])
@@ -267,11 +301,12 @@ class GenerationTest(unittest.TestCase):
         """
         live = self.dir / SESSION_FILE
         inode = live.stat().st_ino
-        with open(live, "r", encoding="utf-8") as reader:
+        with open_session_manifest_reader(self.dir) as reader:
             self.session.save(self.dir)
             held = json.loads(reader.read())
 
-        self.assertNotEqual(live.stat().st_ino, inode, "the manifest was written in place")
+        if os.name != "nt":
+            self.assertNotEqual(live.stat().st_ino, inode, "the manifest was written in place")
         self.assertEqual(held["generation"], 1)
         self.assertEqual(held["graph"], generation_name(GRAPH_STEM, 1))
         self.assertEqual(manifest(self.dir)["generation"], 2)
@@ -324,10 +359,12 @@ class GenerationTest(unittest.TestCase):
 
     def test_an_unreadable_manifest_does_not_roll_the_counter_back_to_zero(self):
         """A directory whose manifest is rubble still gets a valid next save."""
-        (self.dir / SESSION_FILE).write_text("{oops", encoding="utf-8")
+        (self.dir / manifest_name(manifest(self.dir)["generation"])).write_text(
+            "{oops", encoding="utf-8"
+        )
         self.session.save(self.dir)
-        self.assertEqual(manifest(self.dir)["generation"], 1)
-        self.assertEqual(Session.load(self.dir).generation, 1)
+        self.assertEqual(manifest(self.dir)["generation"], 2)
+        self.assertEqual(Session.load(self.dir).generation, 2)
 
     def test_the_counter_belongs_to_the_directory_not_the_session(self):
         """Saving one session into two directories keeps two counters."""
@@ -345,7 +382,9 @@ class GenerationTest(unittest.TestCase):
             graph_file(self.dir).read_text(encoding="utf-8"), encoding="utf-8"
         )
         data["graph"] = generation_name(GRAPH_STEM, 9)
-        (self.dir / SESSION_FILE).write_text(json.dumps(data), encoding="utf-8")
+        (self.dir / manifest_name(data["generation"])).write_text(
+            json.dumps(data), encoding="utf-8"
+        )
         with self.assertRaises(SessionError) as caught:
             Session.load(self.dir)
         self.assertIn("generation 1", str(caught.exception))
@@ -690,7 +729,7 @@ class RefusalTest(unittest.TestCase):
         path.write_text(json.dumps(data), encoding="utf-8")
 
     def edit_session(self, **changes):
-        return lambda d: self.rewrite(d / SESSION_FILE, **changes)
+        return lambda d: self.rewrite(d / manifest_name(manifest(d)["generation"]), **changes)
 
     # ── the directory itself ─────────────────────────────────────────────
     def test_good_directory_loads(self):
@@ -705,23 +744,32 @@ class RefusalTest(unittest.TestCase):
             Session.load(graph_file(self.good))
 
     def test_no_session_file(self):
-        self.refuses(lambda d: (d / SESSION_FILE).unlink(), SESSION_FILE)
+        def mutate(directory):
+            generation = manifest(directory)["generation"]
+            (directory / SESSION_FILE).unlink()
+            (directory / manifest_name(generation)).unlink()
+
+        self.refuses(mutate, SESSION_FILE)
 
     def test_session_file_is_not_json(self):
         self.refuses(
-            lambda d: (d / SESSION_FILE).write_text("{oops", encoding="utf-8"),
+            lambda d: (d / manifest_name(manifest(d)["generation"])).write_text(
+                "{oops", encoding="utf-8"
+            ),
             "not valid JSON",
         )
 
     def test_session_file_is_not_an_object(self):
         self.refuses(
-            lambda d: (d / SESSION_FILE).write_text("[]", encoding="utf-8"),
+            lambda d: (d / manifest_name(manifest(d)["generation"])).write_text(
+                "[]", encoding="utf-8"
+            ),
             "must contain an object",
         )
 
     def test_session_file_carries_nan(self):
         self.refuses(
-            lambda d: (d / SESSION_FILE).write_text(
+            lambda d: (d / manifest_name(manifest(d)["generation"])).write_text(
                 json.dumps(
                     {
                         "schema": SESSION_SCHEMA,
@@ -782,6 +830,7 @@ class RefusalTest(unittest.TestCase):
         self.refuses(self.edit_session(resolver="../resolver.json"), "plain filename")
 
     def test_a_companion_that_is_a_symlink_out_of_the_directory_is_refused(self):
+        require_symlink(Path(self.tmp))
         """``_bare_name`` stops the path traversing. It cannot stop the file.
 
         A session directory is something you can be handed, and a correctly
@@ -802,6 +851,7 @@ class RefusalTest(unittest.TestCase):
         self.assertIn(str(outside.name), message)
 
     def test_a_symlink_inside_the_directory_is_also_refused(self):
+        require_symlink(Path(self.tmp))
         """Containment is checked by resolution, not by prefix.
 
         A link to a sibling in the same directory is harmless in itself, but
@@ -819,6 +869,15 @@ class RefusalTest(unittest.TestCase):
             target.symlink_to(sibling)
 
         self.refuses(mutate, "outside the session directory")
+
+    def test_a_generation_manifest_that_is_a_symlink_is_refused(self):
+        require_symlink(Path(self.tmp))
+
+        def mutate(directory):
+            planted = directory / manifest_name(manifest(directory)["generation"] + 1)
+            planted.symlink_to(directory / SESSION_FILE)
+
+        self.refuses(mutate, "symbolic link")
 
     def test_filename_must_be_a_string(self):
         self.refuses(self.edit_session(graph=7), "must be a string")
@@ -1170,7 +1229,9 @@ class ProcessBoundaryTest(unittest.TestCase):
             sorted(wrote["files"]),
             sorted([
                 SESSION_FILE,
+                manifest_name(1),
                 LOCK_FILE,
+                LOCK_META_FILE,
                 generation_name(GRAPH_STEM, 1),
                 generation_name(RESOLVER_STEM, 1),
             ]),
@@ -1215,7 +1276,7 @@ class ProcessBoundaryTest(unittest.TestCase):
 
     def test_a_corrupt_session_refuses_at_the_shell(self):
         self.cli("--demo", "--rounds", str(ROUNDS), "--save", str(self.dir))
-        self.rewrite_version(self.dir / SESSION_FILE)
+        self.rewrite_version(self.dir / manifest_name(manifest(self.dir)["generation"]))
         proc = subprocess.run(
             [sys.executable, "-m", "contextmesh_mcp", "--session", str(self.dir)],
             cwd=REPO_ROOT,
@@ -1306,6 +1367,7 @@ class WriterSymlinkTest(unittest.TestCase):
 
     # ── the three names a save writes ────────────────────────────────────
     def test_a_planted_link_at_the_next_graph_name_is_replaced_not_followed(self):
+        require_symlink(self.dir)
         planted = self.dir / generation_name(GRAPH_STEM, self.next_generation())
         planted.symlink_to(self.outside)
         Session.load(self.dir).checkpoint()
@@ -1314,6 +1376,7 @@ class WriterSymlinkTest(unittest.TestCase):
         self.assertEqual(Session.load(self.dir).generation, 2)
 
     def test_a_planted_link_at_the_next_resolver_name_is_replaced(self):
+        require_symlink(self.dir)
         planted = self.dir / generation_name(RESOLVER_STEM, self.next_generation())
         planted.symlink_to(self.outside)
         Session.load(self.dir).checkpoint()
@@ -1321,6 +1384,7 @@ class WriterSymlinkTest(unittest.TestCase):
         self.assertFalse(resolver_file(self.dir).is_symlink())
 
     def test_a_link_at_the_manifest_itself_is_replaced(self):
+        require_symlink(self.dir)
         held = (self.dir / SESSION_FILE).read_text(encoding="utf-8")
         (self.dir / SESSION_FILE).unlink()
         (self.dir / SESSION_FILE).symlink_to(self.outside)
@@ -1335,7 +1399,18 @@ class WriterSymlinkTest(unittest.TestCase):
             self.outside.read_text(encoding="utf-8"), held, "wrote through the link"
         )
 
+    def test_a_planted_link_at_the_next_generation_manifest_is_replaced(self):
+        require_symlink(self.dir)
+        writer = Session.load(self.dir)
+        planted = self.dir / manifest_name(self.next_generation())
+        planted.symlink_to(self.outside)
+        writer.checkpoint()
+        self.assert_outside_untouched()
+        self.assertFalse((self.dir / manifest_name(2)).is_symlink())
+        self.assertEqual(Session.load(self.dir).generation, 2)
+
     def test_write_in_place_never_follows_a_link(self):
+        require_symlink(self.dir)
         """The primitive itself, independent of any caller."""
         planted = self.dir / "target.json"
         planted.symlink_to(self.outside)
@@ -1352,6 +1427,7 @@ class WriterSymlinkTest(unittest.TestCase):
 
     # ── the lock, which cannot be replaced ───────────────────────────────
     def test_a_symlinked_lock_file_is_refused(self):
+        require_symlink(self.dir)
         (self.dir / LOCK_FILE).unlink()
         (self.dir / LOCK_FILE).symlink_to(self.outside)
         with self.assertRaises(SessionError) as caught:
@@ -1360,6 +1436,7 @@ class WriterSymlinkTest(unittest.TestCase):
         self.assert_outside_untouched()
 
     def test_a_lock_file_that_is_a_fifo_is_refused(self):
+        require_fifo()
         (self.dir / LOCK_FILE).unlink()
         os.mkfifo(str(self.dir / LOCK_FILE))
         with self.assertRaises(SessionError) as caught:
@@ -1367,6 +1444,7 @@ class WriterSymlinkTest(unittest.TestCase):
         self.assertIn("regular file", str(caught.exception))
 
     def test_a_symlinked_lock_file_blocks_the_save_entirely(self):
+        require_symlink(self.dir)
         """Refused before anything is written, not halfway through."""
         before = manifest(self.dir)
         (self.dir / LOCK_FILE).unlink()
@@ -1565,11 +1643,12 @@ class ConcurrentWriterTest(unittest.TestCase):
         for path in (spared, doomed):
             path.write_text("{}", encoding="utf-8")
 
-        Session._sweep(self.dir, keep={SESSION_FILE, LOCK_FILE, spared.name})
+        Session._sweep(self.dir, keep={SESSION_FILE, LOCK_FILE, LOCK_META_FILE, spared.name})
 
         self.assertTrue(spared.is_file(), "a file named in keep was swept")
         self.assertFalse(doomed.is_file(), "an unreferenced generation survived")
         self.assertIn(LOCK_FILE, names(self.dir))
+        self.assertIn(LOCK_META_FILE, names(self.dir))
 
     def test_a_lock_file_left_behind_does_not_block_a_later_writer(self):
         """It is kernel-held, so there is no such thing as a stale one."""
@@ -1673,6 +1752,21 @@ class ProcessLockTest(unittest.TestCase):
         "again.checkpoint()\n"
         "print('B-RETRY-GENERATION', again.generation)\n"
     )
+    HOLD_READER = (
+        "import json, sys, time\n"
+        "from pathlib import Path\n"
+        "from contextmesh_mcp.session import open_session_manifest_reader\n"
+        "root, gate = Path(sys.argv[1]), Path(sys.argv[2])\n"
+        "done = gate.parent / 'writer-done'\n"
+        "with open_session_manifest_reader(root) as reader:\n"
+        "    gate.write_text('reader-open')\n"
+        "    deadline = time.time() + 60\n"
+        "    while not done.exists() and time.time() < deadline:\n"
+        "        time.sleep(0.02)\n"
+        "    held = json.loads(reader.read())\n"
+        "print('READER-GENERATION', held['generation'])\n"
+        "print('READER-GRAPH', held['graph'])\n"
+    )
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -1709,6 +1803,52 @@ class ProcessLockTest(unittest.TestCase):
         self.assertTrue(graph_file(self.dir).is_file())       # nothing committed
         self.assertTrue(resolver_file(self.dir).is_file())    # was swept
         self.assertEqual(Session.load(self.dir).generation, 3)
+
+    def test_a_reader_holding_the_manifest_does_not_block_publication(self):
+        reader = self.spawn(self.HOLD_READER)
+        deadline = time.time() + 60
+        while not self.gate.exists() and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(self.gate.exists(), "reader never opened the manifest")
+
+        writer = Session.load(self.dir)
+        writer.checkpoint()
+        (Path(self.tmp) / "writer-done").write_text("done", encoding="utf-8")
+
+        out, err = reader.communicate(timeout=120)
+        self.assertEqual(reader.returncode, 0, err)
+        self.assertIn("READER-GENERATION 1", out)
+        self.assertIn(f"READER-GRAPH {generation_name(GRAPH_STEM, 1)}", out)
+        self.assertEqual(manifest(self.dir)["generation"], 2)
+        self.assertEqual(Session.load(self.dir).generation, 2)
+
+    def test_a_crash_before_publication_leaves_the_committed_generation_serving(self):
+        """A real process dies after companions exist but before the commit point."""
+        crash = (
+            "import os, sys\n"
+            "from pathlib import Path\n"
+            "import contextmesh_mcp.session as sessionmod\n"
+            "root = Path(sys.argv[1])\n"
+            "original = sessionmod.write_in_place\n"
+            "def write_then_crash(directory, name, payload):\n"
+            "    path = original(directory, name, payload)\n"
+            "    if name.startswith('resolver-'):\n"
+            "        os._exit(73)\n"
+            "    return path\n"
+            "sessionmod.write_in_place = write_then_crash\n"
+            "sessionmod.Session.load(root).checkpoint()\n"
+        )
+        failed = self.spawn(crash)
+        failed.communicate(timeout=120)
+        self.assertEqual(failed.returncode, 73)
+
+        restored = Session.load(self.dir)
+        self.assertEqual(restored.generation, 1)
+        self.assertEqual(manifest(self.dir)["generation"], 1)
+
+        restored.checkpoint()
+        self.assertEqual(Session.load(self.dir).generation, 2)
+        self.assertEqual(names(self.dir), GenerationTest.expected(self, 2))
 
     def test_a_writer_killed_mid_transaction_does_not_hold_the_lock(self):
         """Kernel-held, so a SIGKILL releases it. No stale-lock guessing."""

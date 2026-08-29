@@ -35,6 +35,55 @@ jobs:
         # server-registration tests skip and are covered by the mcp job.
         run: python -m unittest discover -s tests -v
 
+  test-windows:
+    name: windows tests · python ${{ matrix.python }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run the meaningful suite on Windows
+        run: python -m unittest discover -s tests -v
+      - name: The demo CLI degrades deterministically on cp1252
+        shell: bash
+        run: |
+          python - <<'EOF'
+          import io, sys
+          from contextlib import redirect_stdout
+          from contextmesh import cli
+
+          raw = io.BytesIO()
+          stream = io.TextIOWrapper(raw, encoding="cp1252")
+          sys.stdout = stream
+          with redirect_stdout(stream):
+              assert cli.main(["--rounds", "1", "demo"]) == 0
+          stream.flush()
+          out = raw.getvalue().decode("cp1252")
+          assert "BUILD PATH * what earns a node in the graph" in out
+          assert "committed -> walkable" in out
+          print("CP1252 CLI FALLBACK OK", file=sys.__stdout__)
+          EOF
+
+  persistence-contract:
+    name: persistence contract · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Prove the unchanged cross-process persistence contract
+        run: python -m unittest -v tests.test_session.ProcessBoundaryTest.test_one_process_writes_and_another_reads tests.test_session.ProcessLockTest.test_a_reader_holding_the_manifest_does_not_block_publication tests.test_session.ProcessLockTest.test_the_second_writer_is_refused_then_succeeds_on_retry tests.test_session.ProcessLockTest.test_a_crash_before_publication_leaves_the_committed_generation_serving tests.test_session.ProcessLockTest.test_a_writer_killed_mid_transaction_does_not_hold_the_lock
+
   lint:
     name: ruff
     runs-on: ubuntu-latest
@@ -45,6 +94,22 @@ jobs:
           python-version: "3.12"
       - run: pipx install ruff
       - run: ruff check contextmesh contextmesh_mcp tests dashboard/bundle.py
+
+  package:
+    name: wheel + sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install build
+      - name: Build both distributions without deprecated license metadata
+        run: |
+          python -m build 2>&1 | tee /tmp/build.txt
+          ! grep -F "project.license as a TOML table is deprecated" /tmp/build.txt
+          test "$(find dist -maxdepth 1 -name '*.whl' | wc -l)" -eq 1
+          test "$(find dist -maxdepth 1 -name '*.tar.gz' | wc -l)" -eq 1
 
   leaks:
     name: no private data
@@ -147,7 +212,7 @@ jobs:
       - name: The server refuses a bad session before opening the transport
         run: |
           contextmesh-mcp --demo --rounds 2 --save /tmp/bad
-          python -c "import json,pathlib;p=pathlib.Path('/tmp/bad/session.json');d=json.loads(p.read_text());d['version']=99;p.write_text(json.dumps(d))"
+          python -c "import json,pathlib;from contextmesh_mcp.session import live_manifest_path;p=live_manifest_path(pathlib.Path('/tmp/bad'));assert p is not None;d=json.loads(p.read_text());d['version']=99;p.write_text(json.dumps(d))"
           if contextmesh-mcp --session /tmp/bad 2>/tmp/bad.txt; then
             echo "::error::the server accepted a session it cannot restore"; exit 1
           fi
@@ -173,6 +238,7 @@ jobs:
           root = pathlib.Path("/tmp/session")
           data = json.loads((root / "session.json").read_text())
           assert data["generation"] == 1, data["generation"]
+          assert (root / "session-000001.json").is_file(), "no immutable manifest"
           assert data["graph"] == "graph-000001.json", data["graph"]
           assert data["resolver"] == "resolver-000001.json", data["resolver"]
           for key in ("graph", "resolver"):
@@ -246,9 +312,11 @@ jobs:
             rm -rf /tmp/broken && cp -r /tmp/session /tmp/broken
             python - "$1" <<'EOF'
           import json, pathlib, sys
+          from contextmesh_mcp.session import live_manifest_path
           how = sys.argv[1]
           root = pathlib.Path("/tmp/broken")
-          sfile = root / "session.json"
+          sfile = live_manifest_path(root)
+          assert sfile is not None
           data = json.loads(sfile.read_text())
           if how == "version":
               data["version"] = 99
@@ -358,30 +426,34 @@ jobs:
         run: |
           python - <<'EOF' | tee /tmp/atomic.txt
           import json, os, pathlib, shutil
-          from contextmesh_mcp.session import Session
+          from contextmesh_mcp.session import Session, live_manifest_path
 
           shutil.rmtree("/tmp/gen", ignore_errors=True)
           shutil.copytree("/tmp/session", "/tmp/gen")
           root = pathlib.Path("/tmp/gen")
-          live = root / "session.json"
+          live = live_manifest_path(root)
+          assert live is not None
           session = Session.load(root)
 
-          # A reader holding the manifest across the commit must still see the
-          # previous generation, whole. That is what os.replace buys, and an
-          # in-place rewrite of the same bytes would not.
-          inode = live.stat().st_ino
+          # A reader holding an immutable manifest across the commit must still
+          # see the previous generation whole, even if the sweep unlinks its
+          # old pathname after publishing the next manifest.
           with open(live, encoding="utf-8") as reader:
               session.checkpoint()
               held = json.loads(reader.read())
-          assert live.stat().st_ino != inode, "the manifest was written in place"
           assert held["generation"] == session.generation - 1, held["generation"]
           assert (root / held["graph"]).name == held["graph"]
 
-          committed = json.loads(live.read_text())
+          committed_live = live_manifest_path(root)
+          assert committed_live is not None
+          assert committed_live != live, "the manifest was written in place"
+          committed = json.loads(committed_live.read_text())
           assert committed["generation"] == held["generation"] + 1
           leftovers = sorted(p.name for p in root.iterdir())
           assert leftovers == sorted(
-              ["session.json", "session.lock", committed["graph"], committed["resolver"]]
+              ["session.json", f"session-{committed['generation']:06d}.json",
+               "session.lock", "session.lock.meta",
+               committed["graph"], committed["resolver"]]
           ), leftovers
           print("generation", held["generation"], "->", committed["generation"], leftovers)
           print("COMMIT IS ATOMIC AND SWEPT")
@@ -414,7 +486,9 @@ jobs:
           after = json.loads((root / "session.json").read_text())
           leftovers = sorted(p.name for p in root.iterdir())
           assert leftovers == sorted(
-              ["session.json", "session.lock", after["graph"], after["resolver"]]
+              ["session.json", f"session-{after['generation']:06d}.json",
+               "session.lock", "session.lock.meta",
+               after["graph"], after["resolver"]]
           ), leftovers
           print("recovered to generation", after["generation"], leftovers)
           print("INTERRUPTED SAVE DID NOT MIX GENERATIONS")
@@ -783,7 +857,7 @@ jobs:
           import json, tempfile
           from pathlib import Path
           from contextmesh.execute import Event, RunLedger, Runner, TaskRegistry
-          from contextmesh_mcp.session import Session, SessionError
+          from contextmesh_mcp.session import Session, SessionError, live_manifest_path
 
           def deployment():
               r = TaskRegistry()
@@ -799,6 +873,8 @@ jobs:
           tmp = Path(tempfile.mkdtemp()) / "session"
           base.save(tmp)
           manifest = json.loads((tmp / "session.json").read_text())
+          manifest_path = live_manifest_path(tmp)
+          assert manifest_path is not None
 
           def refused(label, registry=deployment()):
               try:
@@ -837,19 +913,19 @@ jobs:
               dangling.record(1, Event.EXECUTED, "only", "ran", **kwargs)
               (tmp / manifest["ledger"]).write_text(json.dumps(dangling.snapshot()))
               moved = dict(manifest); moved["ledger_head"] = dangling.head
-              (tmp / "session.json").write_text(json.dumps(moved, indent=2))
+              manifest_path.write_text(json.dumps(moved, indent=2))
               if not refused(label):
                   raise SystemExit("::error::%s was accepted" % label)
           (tmp / manifest["ledger"]).write_text(json.dumps(run.ledger.snapshot()))
-          (tmp / "session.json").write_text(json.dumps(manifest, indent=2))
+          manifest_path.write_text(json.dumps(manifest, indent=2))
 
           # A plan with no history, and a history with no plan.
           for dropped, kept in (("ledger", "execution"), ("execution", "ledger")):
               broken = dict(manifest); broken[dropped] = None
-              (tmp / "session.json").write_text(json.dumps(broken, indent=2))
+              manifest_path.write_text(json.dumps(broken, indent=2))
               if not refused("%s with no %s" % (kept, dropped)):
                   raise SystemExit("::error::a half-committed pair was accepted")
-          (tmp / "session.json").write_text(json.dumps(manifest, indent=2))
+          manifest_path.write_text(json.dumps(manifest, indent=2))
 
           # And the one a directory can never supply.
           try:

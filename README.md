@@ -37,7 +37,7 @@ python -m contextmesh export --inline # regenerate the dashboard's data
 ```
 
 No dependencies. Python 3.9+. `python -m unittest discover -s tests` runs the
-suite (266 tests). CI runs it on 3.9 through 3.13, plus ruff and a set of
+suite. CI runs it on 3.9 through 3.13, plus Windows, ruff and a set of
 end-to-end smoke checks — including that a build is byte-identical across
 `PYTHONHASHSEED`, and that `dashboard/data/mesh.json` still matches what the
 engine produces.
@@ -460,16 +460,20 @@ what was being done about it:
 
 ```
 session/
-  session.json          the manifest, and the only thing that commits
+  session-000003.json   the immutable manifest that commits generation 3
+  session.json          compatibility pointer to the latest manifest
   graph-000003.json     what is known
   resolver-000003.json  how a question finds it
   execution-000003.json the plan, mid-repair
   runledger-000003.json the record of it getting there
 ```
 
-All four land in fresh files and are renamed into place; the manifest swap is
-still the single atomic commit, so a crash anywhere in between leaves the
-previous generation serving exactly as before. `execution` and `ledger` are
+All companions land in fresh files and are renamed into place; then the
+generation manifest is published under a previously nonexistent name. That
+immutable manifest is the single atomic commit, so a crash anywhere before it
+appears leaves the previous generation serving exactly as before. `session.json`
+is a latest pointer for humans and older tooling, not the correctness boundary.
+`execution` and `ledger` are
 `null` rather than absent when a session carries no plan — a reader can tell
 "no execution" from "field missing" — and a plan and its ledger are committed
 together or not at all.
@@ -662,11 +666,12 @@ python -m contextmesh_mcp --session ./session                  # inspect it
 
 A restored graph answers questions only if something can turn *"pgvector"* into
 `entity:pgvector-6db608`, and that is the resolver's job. So a session is a
-directory of three separately versioned files:
+directory of separately versioned files:
 
 ```
 session/
-  session.json           contextmesh.session  v1  — the manifest, and the commit
+  session-000003.json    contextmesh.session  v2  — the immutable commit manifest
+  session.json           latest-manifest pointer for humans and older tooling
   session.lock           the writer lock, created once and never deleted
   graph-000003.json      contextmesh.graph    v1
   resolver-000003.json   contextmesh.resolver v1
@@ -681,20 +686,19 @@ the join.
 files in sequence is safe the first time and unsafe every time after: crash
 between the graph and the resolver and the directory holds a new graph beside an
 old resolver — a pairing that never existed, and one that can still pass every
-check made on it. So each save commits a whole new *generation* under new names
-and then replaces `session.json` in a single `os.replace`:
+check made on it. So each save writes a whole new *generation* under new names
+and commits it by publishing a new immutable `session-000NNN.json` manifest:
 
 ```
-crash before the swap  →  the previous generation is still named, intact
-crash during the swap  →  one manifest or the other, never half of one
-crash after the swap   →  the new generation is named, and complete
+crash before manifest publication  ->  the previous generation is still named, intact
+crash during publication           ->  the old manifest or the new one, never half
+crash after publication            ->  the new generation is named, and complete
 ```
 
 Superseded files are swept after the commit, so an interrupted save costs disk
 rather than correctness. The guarantee is reader-visible and tested as such: a
-process holding `session.json` open across a save still reads the previous
-generation whole, because `os.replace` gives the manifest a new inode rather
-than rewriting the old one in place.
+Context Mesh reader holding the old committed manifest open across a save still
+reads the previous generation whole while another process publishes the next one.
 
 **Generations are atomic against a crash. They do nothing against a second
 writer**, and that failure is nastier because nothing about it looks torn. Two
