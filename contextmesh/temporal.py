@@ -146,6 +146,7 @@ class Timeline:
         self._anchors: Dict[str, Anchor] = {}
         for node in graph.nodes.values():
             self._anchors[node.id] = self._resolve(node)
+        self._anchor_artefacts()
 
     def _resolve(self, node: Node) -> Anchor:
         if node.type is NodeType.SOURCE:
@@ -163,6 +164,41 @@ class Timeline:
         # lifted from a document, so it has no source date to inherit. Its
         # lifecycle builds are its honest clock, and callers read those instead.
         return Anchor(node.id, None, "none", None)
+
+    def _anchor_artefacts(self) -> None:
+        """Date an artefact by the decision that brought it into being.
+
+        A second pass, because this is the one anchor that reads another
+        node's anchor rather than a source date, and the decision may not have
+        been resolved yet when the entity was. It depends only on the first
+        pass, so it terminates.
+
+        GRAPH.md defines ``produces`` as "the decision brought the target into
+        being", which is a statement about time as much as about structure: the
+        artefact was not there before, and it was there afterwards. Without
+        this an entity reached only by ``produces`` stays undated forever and
+        therefore never appears in any projection — and that is not a corner
+        case, because ``execute.py`` mints every artefact the Runner produces
+        exactly that way, with no ``derived_from`` edge to inherit from.
+
+        The earliest producer wins. Two decisions can produce the same
+        artefact; it existed from the first of them.
+        """
+        for node_id, anchor in list(self._anchors.items()):
+            if anchor.dated:
+                continue
+            node = self.graph.nodes.get(node_id)
+            if node is None or node.type is not NodeType.ENTITY:
+                continue
+            made: Optional[Anchor] = None
+            for edge in self.graph.in_edges(node_id, [EdgeType.PRODUCES], live_only=False):
+                maker = self._anchors.get(edge.src)
+                if maker is None or not maker.dated:
+                    continue
+                if made is None or maker.when < made.when:
+                    made = maker
+            if made is not None:
+                self._anchors[node_id] = Anchor(node_id, made.source_id, "produces", made.when)
 
     def anchor(self, node_id: str) -> Anchor:
         try:
@@ -304,7 +340,56 @@ def as_of_graph(graph: ContextGraph, as_of: Any) -> ContextGraph:
         if a["id"] in kept
     ]
     _mirror_status(payload)
-    return ContextGraph.from_dict(payload)
+    projection = ContextGraph.from_dict(payload)
+    _replay_invalidation(projection)
+    return projection
+
+
+def _replay_invalidation(projection: ContextGraph) -> None:
+    """Invalidation as it stood, derived rather than carried forward.
+
+    This is the difference between a reconstruction and a filter, and it is
+    not cosmetic. Copy today's ``invalidated`` flags into a June projection
+    and every node standing on an assumption that fell in July is already
+    dead in June — so a June walk dead-ends with "no longer walkable:
+    invalidated by a rejected assumption", naming an assumption that in June
+    had not been rejected. The path is the answer in this system, and that
+    path is a lie about what June could do.
+
+    So the flags are cleared and re-derived from the horizon's own facts. The
+    assumptions still standing at the horizon have already been rewound to
+    ACTIVE by :func:`_rewind_assumption`; what remains rejected is what had
+    genuinely fallen, and each of those takes its blast radius down again
+    through :func:`~contextmesh.assumptions.apply_invalidation` — the same
+    writer a live rejection goes through, so the projection cannot drift into
+    a second definition of what falls.
+
+    Order is the order they fell, because one rejection changes which edges
+    are live and so what the next one reaches. Ties break on the build and
+    then the id, so two runs agree.
+    """
+    from .assumptions import AssumptionLedger, apply_invalidation
+
+    for node in projection.nodes.values():
+        node.invalidated = False
+    for edge in projection.edges.values():
+        edge.invalidated = False
+
+    ledger = AssumptionLedger(projection)
+    fallen = [
+        record
+        for record in projection.assumptions.values()
+        if record.status is AssumptionStatus.REJECTED
+    ]
+    fallen.sort(
+        key=lambda r: (
+            _fell_at(projection, r.id) or date.max,
+            r.rejected_at_build if r.rejected_at_build is not None else 0,
+            r.id,
+        )
+    )
+    for record in fallen:
+        apply_invalidation(projection, record.id, ledger.blast_radius(record.id))
 
 
 def _rewind_assumption(

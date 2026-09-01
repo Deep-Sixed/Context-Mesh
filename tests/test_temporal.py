@@ -14,14 +14,17 @@ either — a test that passed on Tuesday and failed on Wednesday would not be
 testing history, it would be reporting the weather.
 """
 
+import json
 import unittest
 from datetime import date
 
 from contextmesh.assumptions import AssumptionLedger
 from contextmesh.decisions import DecisionLog
+from contextmesh.embed import embed
 from contextmesh.graph import ContextGraph
 from contextmesh.model import AssumptionStatus, EdgeType, NodeType, Provenance
-from contextmesh.reconstruct import reconstruct_decision
+from contextmesh.reconstruct import explain_as_of, reconstruct_decision
+from contextmesh.resolve import Resolver
 from contextmesh.temporal import (
     Horizon,
     TemporalError,
@@ -70,12 +73,14 @@ def calendar():
     # ── 21 June: the decision, standing on both ──────────────────────────
     graph.build = 3
     review = _source(graph, "review-june", JUNE_21, "Review thread, June")
+    rebuild = graph.add_node(NodeType.ENTITY, "Partitioned Rebuild")
     decision = decisions.decide(
         "Rebuild the index in partitions",
         "Per-shard peak memory is 2.1GB, inside the 4GB build ceiling.",
         source_id=review.id,
         supported_by=[measured.id],
         assumptions=[assumption.id],
+        produces=[rebuild.id],
     )
 
     # ── 8 July: evidence the June decision could not have had ────────────
@@ -103,6 +108,17 @@ def calendar():
     graph.add_edge(hindsight.id, EdgeType.DERIVED_FROM, postmortem.id)
     graph.add_edge(decision.id, EdgeType.DERIVED_FROM, hindsight.id)
 
+    # A source the June decision produced, whose retrieved_at will not parse.
+    # execute.py mints exactly this, stamping "at plan time" on the source it
+    # writes plan output to.
+    minted = graph.add_node(
+        NodeType.SOURCE,
+        "Plan output, partition rebuild",
+        id="source:minted",
+        attrs={"retrieved_at": "at plan time"},
+    )
+    graph.add_edge(decision.id, EdgeType.PRODUCES, minted.id)
+
     # An entity the June document names but only the August document dates.
     # Its edge runs from inside the June projection to outside it, which is the
     # one direction an endpoint check has to catch.
@@ -126,6 +142,9 @@ def calendar():
         "Size shards by tenant distribution, not corpus size",
         "Linear sizing under-provisions whenever one tenant dominates.",
         source_id=rethink.id,
+        # It still produces the same artefact. Two decisions produce it, and
+        # the artefact existed from the first of them, not the last.
+        produces=[rebuild.id],
         supersedes=decision.id,
     )
 
@@ -142,6 +161,8 @@ def calendar():
         "shard": shard.id,
         "rethink": rethink.id,
         "hindsight": hindsight.id,
+        "rebuild": rebuild.id,
+        "minted": minted.id,
         "tenant_mix": tenant_mix.id,
     }
 
@@ -231,6 +252,37 @@ class PlacingNodes(unittest.TestCase):
         with self.assertRaises(TemporalError):
             self.timeline.anchor("claim:never-existed")
 
+    def test_an_artefact_is_dated_by_the_decision_that_produced_it(self):
+        # GRAPH.md: produces means "the decision brought the target into
+        # being", which is a claim about time as much as about structure.
+        # Without it an entity reached only by produces stays undated forever
+        # and so appears in no projection at all — and execute.py mints every
+        # artefact the Runner produces exactly that way.
+        anchor = self.timeline.anchor(self.f["rebuild"])
+        self.assertEqual(anchor.via, "produces")
+        self.assertEqual(anchor.when, date(2026, 6, 21))
+
+    def test_an_artefact_with_two_producers_dates_from_the_first(self):
+        # The August decision produces it too. It did not stop existing in
+        # June because somebody decided about it again later.
+        self.assertEqual(self.timeline.when(self.f["rebuild"]), date(2026, 6, 21))
+        self.assertIs(
+            self.timeline.horizon(self.f["rebuild"], date(2026, 6, 21)), Horizon.THEN
+        )
+
+    def test_a_produced_source_is_not_given_a_date_it_never_had(self):
+        # The narrowing to entities is the point. An entity has no date field
+        # at all, so inheriting the producer's invents nothing. A source has
+        # one and it failed to parse — "at plan time" is what execute.py
+        # writes — and inheriting a date there would quietly repair the very
+        # value this module refuses to guess at.
+        anchor = self.timeline.anchor(self.f["minted"])
+        self.assertIsNone(anchor.when)
+        self.assertEqual(anchor.via, "self")
+        self.assertIs(
+            self.timeline.horizon(self.f["minted"], date(2026, 8, 1)), Horizon.UNDATED
+        )
+
     def test_the_span_is_the_dated_extent(self):
         self.assertEqual(self.timeline.span(), (date(2026, 6, 10), date(2026, 8, 12)))
 
@@ -296,6 +348,124 @@ class TheGraphAsItStood(unittest.TestCase):
             AssumptionStatus.REJECTED,
         )
         self.assertIn(self.f["contradiction"], self.f["graph"].nodes)
+
+
+class TheAcceptanceCase(unittest.TestCase):
+    """The gate: ask on 21 June, ask again in August, compare what comes back.
+
+    A June answer must be assembled out of June, and the July evidence and the
+    August decision must be visible as what came *after* rather than folded in
+    or dropped. This is the test that fails if any single piece regresses, so
+    it asks the way somebody would and reads the whole answer.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.f = calendar()
+        cls.graph = cls.f["graph"]
+        cls.resolver = Resolver()
+        for node in cls.graph.nodes.values():
+            if node.type is NodeType.ENTITY:
+                cls.resolver.register(node.id, node.label)
+            if node.embedding is None:
+                node.embedding = embed(f"{node.label} {node.attrs.get('rationale', '')}")
+
+    QUESTION = "What produced the Partitioned Rebuild?"
+
+    def answer(self, when):
+        return explain_as_of(self.graph, self.resolver, self.QUESTION, when)
+
+    def test_june_answers_with_a_walk_somebody_could_have_taken(self):
+        walk = self.answer(JUNE_21).walk
+        self.assertTrue(walk.resolved)
+        self.assertIsNone(walk.dead_end)
+
+    def test_every_step_of_the_june_walk_predates_the_horizon(self):
+        # The load-bearing assertion. Filtering a present-day walk afterwards
+        # would leave a path stepping through nodes that did not exist yet, and
+        # in this system the path is the answer.
+        timeline = Timeline(self.graph)
+        for step in self.answer(JUNE_21).walk.steps:
+            self.assertIsNot(
+                timeline.horizon(step.node_id, date(2026, 6, 21)),
+                Horizon.LATER,
+                step.node_id,
+            )
+
+    def test_june_does_not_report_july_or_august_as_contemporary(self):
+        answer = self.answer(JUNE_21)
+        contemporary = {p.node_id for p in answer.then + answer.decision}
+        self.assertNotIn(self.f["contradiction"], contemporary)
+        self.assertNotIn(self.f["successor"], contemporary)
+        self.assertNotIn(self.f["postmortem"], contemporary)
+
+    def test_june_reports_july_and_august_as_what_came_later(self):
+        # Not dropped either. "We did not know" and "there was nothing" are
+        # different answers, and only one of them is true here.
+        later = {p.node_id for p in self.answer(JUNE_21).later}
+        self.assertIn(self.f["contradiction"], later)
+        self.assertIn(self.f["successor"], later)
+
+    def test_the_june_answer_reports_the_assumption_as_it_stood_in_june(self):
+        # It fell on 8 July. Reporting today's status inside a June answer
+        # would credit June with July's finding — the same mistake as
+        # filtering today's walk, one field smaller.
+        placed = next(
+            p
+            for p in self.answer(JUNE_21).decision
+            if p.node_id == self.f["assumption"]
+        )
+        self.assertEqual(placed.status, AssumptionStatus.ACTIVE.value)
+        self.assertIsNone(placed.rejected_at_build)
+
+    def test_the_same_assumption_is_rejected_in_the_august_projection(self):
+        # Read from the projection rather than an answer, because by August
+        # the work it held up is invalidated and the walk cannot reach it.
+        record = as_of_graph(self.graph, AUGUST_12).assumptions[self.f["assumption"]]
+        self.assertIs(record.status, AssumptionStatus.REJECTED)
+        self.assertIsNotNone(record.rejected_at_build)
+
+    def test_the_june_walk_is_not_dead_from_a_july_rejection(self):
+        # The regression this guards is silent and total: carry today's
+        # invalidation flags into June and the walk dead-ends PRUNED_TOO_EARLY,
+        # blaming an assumption that in June had not been rejected.
+        june = as_of_graph(self.graph, JUNE_21)
+        self.assertTrue(june.nodes[self.f["decision"]].live)
+        self.assertTrue(june.nodes[self.f["rebuild"]].live)
+
+    def test_by_august_that_same_work_really_is_dead(self):
+        # The mirror image, and the reason the fix is a rewind rather than a
+        # blanket revival: the ground did give way, just not in June.
+        august = as_of_graph(self.graph, AUGUST_12)
+        self.assertFalse(august.nodes[self.f["decision"]].live)
+
+    def test_the_retrospective_shows_the_reasoning_and_what_changed(self):
+        # The other half of the gate. The walk cannot reach the artefact in
+        # August because it is genuinely invalidated by then — which is why
+        # the retrospective is a walk-back from the decision, not a question.
+        history = reconstruct_decision(self.graph, self.f["decision"], AUGUST_12)
+        stood = {g.placed.node_id for g in history.stood_on}
+        changed = {g.placed.node_id for g in history.later}
+        self.assertIn(self.f["measured"], stood)
+        self.assertIn(self.f["contradiction"], changed)
+        self.assertIn(self.f["successor"], changed)
+        self.assertIn(
+            self.f["assumption"], {g.placed.node_id for g in history.undated}
+        )
+
+    def test_the_whole_answer_is_json_and_says_which_clock_each_item_is_on(self):
+        payload = json.loads(json.dumps(self.answer(JUNE_21).to_dict()))
+        self.assertEqual(payload["as_of"], JUNE_21)
+        for bucket in ("then", "decision", "later", "undated", "not_yet_known"):
+            for item in payload[bucket]:
+                self.assertIn(item["horizon"], {"then", "later", "undated"})
+                self.assertIn("source_time", item)  # the source clock
+                self.assertIn("at_build", item)  # the processing clock
+                self.assertIn("anchored_via", item)  # why it has that date
+
+    def test_both_answers_are_deterministic(self):
+        for when in (JUNE_21, AUGUST_12):
+            self.assertEqual(self.answer(when).to_dict(), self.answer(when).to_dict())
 
 
 class WalkingBackFromADecision(unittest.TestCase):

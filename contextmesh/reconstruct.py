@@ -121,8 +121,24 @@ class Reconstruction:
         }
 
 
-def _place(node: Node, graph: ContextGraph, timeline: Timeline, as_of: date) -> Placed:
-    assumption = graph.assumptions.get(node.id)
+def _place(
+    node: Node,
+    graph: ContextGraph,
+    timeline: Timeline,
+    as_of: date,
+    records: Optional[Dict[str, Any]] = None,
+) -> Placed:
+    """Place one node, reading its lifecycle from ``records`` when given.
+
+    ``records`` is the projection's assumption table. An assumption rejected in
+    July was *active* in June, and reporting the live record inside a June
+    answer's contemporary buckets would import the finding the answer exists to
+    exclude — the same mistake as filtering today's walk, one field smaller.
+    Nodes absent from the projection fall back to the live record, which is
+    right for them: they are the hindsight.
+    """
+    table = graph.assumptions if records is None else records
+    assumption = table.get(node.id) or graph.assumptions.get(node.id)
     return Placed(
         node_id=node.id,
         type=node.type.value,
@@ -168,7 +184,9 @@ def explain_as_of(
             continue
         if canonical in graph.nodes and canonical not in past.nodes:
             seeded.add(canonical)
-            not_yet_known.append(_place(graph.nodes[canonical], graph, timeline, when))
+            not_yet_known.append(
+                _place(graph.nodes[canonical], graph, timeline, when, past.assumptions)
+            )
 
     walk: Optional[Walk] = None
     visited: List[str] = []
@@ -183,7 +201,7 @@ def explain_as_of(
         node = graph.nodes.get(node_id)
         if node is None:  # pragma: no cover - the projection is built from graph
             continue
-        placed = _place(node, graph, timeline, when)
+        placed = _place(node, graph, timeline, when, past.assumptions)
         if node.type in (NodeType.DECISION, NodeType.ASSUMPTION):
             decisions.append(placed)
         else:
@@ -197,7 +215,7 @@ def explain_as_of(
             ground = past.nodes.get(edge.dst)
             if ground is not None and ground.id not in seen:
                 seen.add(ground.id)
-                decisions.append(_place(ground, graph, timeline, when))
+                decisions.append(_place(ground, graph, timeline, when, past.assumptions))
 
     # Hindsight: what bears on any of it, and arrived after the horizon.
     later: List[Placed] = []
@@ -207,7 +225,7 @@ def explain_as_of(
             other = graph.nodes.get(edge.src)
             if other is None or other.id in seen:
                 continue
-            placed = _place(other, graph, timeline, when)
+            placed = _place(other, graph, timeline, when, past.assumptions)
             if placed.horizon is Horizon.LATER:
                 seen.add(other.id)
                 later.append(placed)
@@ -225,7 +243,7 @@ def explain_as_of(
             if witness is None or witness.id in seen:
                 continue
             seen.add(witness.id)
-            found = _place(witness, graph, timeline, when)
+            found = _place(witness, graph, timeline, when, past.assumptions)
             (later if found.horizon is not Horizon.UNDATED else undated).append(found)
 
     return Reconstruction(

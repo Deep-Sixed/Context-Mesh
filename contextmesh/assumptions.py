@@ -68,6 +68,27 @@ class InvalidationReport:
         }
 
 
+def apply_invalidation(
+    graph: "ContextGraph", assumption_id: str, radius: Dict[str, List[str]]
+) -> List[str]:
+    """Mark what a fallen assumption takes down with it. Returns the edge ids.
+
+    One writer for one rule. :meth:`AssumptionLedger.reject` calls this when an
+    assumption falls, and :func:`contextmesh.temporal.as_of_graph` calls it to
+    derive the invalidation a past projection had — which has to be *derived*
+    rather than copied forward, or the past inherits today's casualties.
+    """
+    graph.node(assumption_id).invalidated = True
+    invalidated_edges: List[str] = []
+    for edge in graph.edges.values():
+        if edge.assumption_id == assumption_id or (edge.src in radius and edge.dst in radius):
+            edge.invalidated = True
+            invalidated_edges.append(edge.id)
+    for node_id in radius:
+        graph.node(node_id).invalidated = True
+    return invalidated_edges
+
+
 class AssumptionLedger:
     """Creates, supersedes and rejects assumptions against a ContextGraph."""
 
@@ -199,15 +220,7 @@ class AssumptionLedger:
             assumption.evidence_ids.append(evidence_id)
             graph.add_edge(evidence_id, EdgeType.CONTRADICTS, assumption_id)
 
-        invalidated_edges: List[str] = []
-        for edge in graph.edges.values():
-            if edge.assumption_id == assumption_id or (
-                edge.src in radius and edge.dst in radius
-            ):
-                edge.invalidated = True
-                invalidated_edges.append(edge.id)
-        for node_id in radius:
-            graph.node(node_id).invalidated = True
+        invalidated_edges = apply_invalidation(graph, assumption_id, radius)
 
         preserved = sorted(
             n.id
