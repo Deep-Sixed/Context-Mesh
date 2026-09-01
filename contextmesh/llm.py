@@ -236,8 +236,31 @@ class LLMConfig:
         return cls(provider="simulation", model=model, mode="simulation", **kwargs)
 
 
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect out of a provider request.
+
+    ``urllib`` copies a request's headers onto the redirected request and strips
+    only the content headers, so following a 30x hands ``Authorization`` and
+    ``x-api-key`` to whatever host the response names — including a different
+    one — and returns 200 as though nothing happened. Nothing else in this
+    module lets the credential out: it is ``repr=False`` on the config, on the
+    request headers and on the body, and transport failures name no header.
+
+    Provider endpoints are a fixed HTTPS allowlist (``_ENDPOINTS``), so there is
+    no legitimate redirect to follow and no sanitising to get right. Returning
+    ``None`` here leaves the 30x unhandled, which surfaces it as an ordinary
+    non-2xx response and fails the request closed with its status intact.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D102
+        return None
+
+
 class UrllibTransport:
     """Small HTTP transport whose failures expose no request headers or body."""
+
+    def __init__(self) -> None:
+        self._opener = urllib.request.build_opener(_RefuseRedirects())
 
     def __call__(self, request: HTTPRequest) -> HTTPResponse:
         raw = urllib.request.Request(
@@ -247,7 +270,7 @@ class UrllibTransport:
             method=request.method,
         )
         try:
-            with urllib.request.urlopen(raw, timeout=request.timeout) as response:
+            with self._opener.open(raw, timeout=request.timeout) as response:
                 return HTTPResponse(
                     status=int(response.status),
                     headers={str(k): str(v) for k, v in response.headers.items()},

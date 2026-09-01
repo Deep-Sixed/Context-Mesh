@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List
 
 from contextmesh.evidence import submit_evidence
@@ -19,6 +21,7 @@ from contextmesh.llm import (
     LLMResponseError,
     LLMSchemaError,
     LLMTransportError,
+    UrllibTransport,
     make_audit_proposer,
     make_worker,
     propose_audit,
@@ -530,6 +533,113 @@ class WorkerTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(LLMConfigurationError, "reserved key"):
             make_worker(client, "Do work.", schema)
+
+
+class RedirectRefusalTest(unittest.TestCase):
+    """PR #12: a provider request never follows a redirect.
+
+    ``urllib`` copies request headers onto a redirected request and strips only
+    the content headers, so following a 30x hands ``Authorization`` and
+    ``x-api-key`` to the host the *response* names and returns 200 as though
+    the exchange were ordinary. Endpoints are a fixed HTTPS allowlist, so there
+    is no redirect worth following and nothing to sanitise: refuse them all and
+    let the status surface as an ordinary non-2xx failure.
+
+    These run against two real loopback servers because the behaviour under
+    test belongs to urllib, not to this module's own code. A fake transport
+    would assert nothing.
+    """
+
+    CREDENTIALS = {
+        "Authorization": "Bearer sk-not-a-real-key",
+        "x-api-key": "not-a-real-key",
+    }
+
+    def serve(self, handler):
+        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server.server_port
+
+    def setUp(self):
+        self.seen: List[Dict[str, str]] = []
+        received = self.seen
+
+        class Sink(BaseHTTPRequestHandler):
+            def respond(self):
+                received.append({k.lower(): v for k, v in self.headers.items()})
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"ok":true}')
+
+            do_GET = do_POST = respond
+
+            def log_message(self, *args):
+                pass
+
+        self.sink_port = self.serve(Sink)
+
+    def redirector(self, code, location):
+        class Redirect(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.send_response(code)
+                self.send_header("Location", location)
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        return self.serve(Redirect)
+
+    def request_to(self, port):
+        return HTTPRequest(
+            method="POST",
+            url=f"http://127.0.0.1:{port}/v1/responses",
+            headers=dict(self.CREDENTIALS, **{"Content-Type": "application/json"}),
+            body=b"{}",
+            timeout=5.0,
+        )
+
+    def credentials_that_escaped(self):
+        return [
+            {k: v for k, v in headers.items() if k in ("authorization", "x-api-key")}
+            for headers in self.seen
+        ]
+
+    def test_no_redirect_is_followed_and_no_credential_moves(self):
+        for code in (301, 302, 303, 307, 308):
+            with self.subTest(code=code):
+                port = self.redirector(code, f"http://127.0.0.1:{self.sink_port}/steal")
+                response = UrllibTransport()(self.request_to(port))
+                self.assertEqual(response.status, code)
+                self.assertEqual(self.seen, [])
+                self.assertEqual(self.credentials_that_escaped(), [])
+
+    def test_a_same_host_redirect_is_refused_too(self):
+        port = self.redirector(302, "/v1/responses-moved")
+        response = UrllibTransport()(self.request_to(port))
+        self.assertEqual(response.status, 302)
+
+    def test_a_refused_redirect_fails_the_request_closed(self):
+        port = self.redirector(302, f"http://127.0.0.1:{self.sink_port}/steal")
+        client = LLMClient(
+            LLMConfig(provider="openai", model="gpt-test", api_key="sk-not-a-real-key"),
+            transport=UrllibTransport(),
+            sleep=lambda _seconds: None,
+        )
+        with self.assertRaises(LLMProviderError) as caught:
+            client._send(self.request_to(port))
+        self.assertEqual(caught.exception.status, 302)
+        self.assertIn("failed closed", str(caught.exception))
+        self.assertEqual(self.seen, [])
+
+    def test_a_plain_response_still_arrives(self):
+        """The control: refusing redirects does not refuse ordinary replies."""
+        response = UrllibTransport()(self.request_to(self.sink_port))
+        self.assertEqual(response.status, 200)
+        self.assertEqual(json.loads(response.body), {"ok": True})
 
 
 if __name__ == "__main__":
