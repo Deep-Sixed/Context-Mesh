@@ -92,8 +92,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pipx install ruff
-      - run: ruff check contextmesh contextmesh_mcp tests dashboard/bundle.py
+      # Pinned on purpose. An unpinned `pipx install ruff` makes every new ruff
+      # release a potential red build on an unchanged tree, and the version that
+      # passes here should be the version a contributor can reproduce. Bump it
+      # deliberately, with whatever fixes the new release asks for.
+      - run: pipx install ruff==0.16.5
+      # The whole repository, not a path list: a new top-level .py should not
+      # have to be remembered to be linted. `examples/` and `ops/` were outside
+      # the old list and had accumulated 22 findings.
+      - run: ruff check .
 
   package:
     name: wheel + sdist

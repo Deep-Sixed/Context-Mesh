@@ -33,11 +33,11 @@ Node roles used in the demonstration:
 """
 
 from __future__ import annotations
-import uuid
-from dataclasses import dataclass, field, asdict
-from typing import Dict, Any, List, Optional, Set, Callable
-from enum import Enum
 
+import uuid
+from dataclasses import asdict, dataclass, field
+from enum import Enum
+from typing import Any, Callable, Dict, List, Optional, Set
 
 # ──────────────────────────────────────────────────────────────
 # Core data model
@@ -140,7 +140,13 @@ class EngineGraph:
         self.state.edges[eid] = edge
         self.state.adj.setdefault(source, []).append(eid)
 
-    def log_event(self, node: str, event_type: str, details: Any = None, assumption_id: Optional[str] = None):
+    def log_event(
+        self,
+        node: str,
+        event_type: str,
+        details: Any = None,
+        assumption_id: Optional[str] = None,
+    ):
         self.state.step_counter += 1
         entry = {
             "id": self.state.new_id("evt"),
@@ -156,7 +162,9 @@ class EngineGraph:
         """Only WORKER (or similar executors) should call this."""
         self.state.active_for_node[node] = assumption_id
 
-    def create_assumption(self, claim: str, created_by: str, supersedes: Optional[str] = None) -> Assumption:
+    def create_assumption(
+        self, claim: str, created_by: str, supersedes: Optional[str] = None
+    ) -> Assumption:
         aid = self.state.new_id("asm")
         asm = Assumption(
             id=aid,
@@ -173,7 +181,12 @@ class EngineGraph:
         self.state.assumptions[aid] = asm
         return asm
 
-    def record_evidence(self, kind: str, details: Dict[str, Any], related_assumption: Optional[str] = None) -> Evidence:
+    def record_evidence(
+        self,
+        kind: str,
+        details: Dict[str, Any],
+        related_assumption: Optional[str] = None,
+    ) -> Evidence:
         eid = self.state.new_id("ev")
         ev = Evidence(id=eid, kind=kind, details=details, related_assumption=related_assumption)
         self.state.evidence[eid] = ev
@@ -215,7 +228,10 @@ class EngineGraph:
             if n in self.visited:
                 self.visited.discard(n)
             # Clear active assumption for those nodes
-            if n in self.state.active_for_node and self.state.active_for_node[n] == failed_assumption_id:
+            if (
+                n in self.state.active_for_node
+                and self.state.active_for_node[n] == failed_assumption_id
+            ):
                 del self.state.active_for_node[n]
 
         self.state.invalidation_sets.append({
@@ -267,7 +283,6 @@ def intent_logic(ctx: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def decompose_logic(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    state: GraphState = ctx["state"]
     graph: EngineGraph = ctx["graph"]
 
     # Create initial assumption A
@@ -364,11 +379,16 @@ def audit_logic(ctx: Dict[str, Any]) -> Dict[str, Any]:
         # (In this demo the worker already filtered, but we force a failure on first pass)
         if worker_out.get("mode") == "unitless":
             passed = False
-            reason = "Audit rejected assumption A: data contains currency-formatted values that were incorrectly treated as unitless"
+            reason = (
+                "Audit rejected assumption A: data contains currency-formatted "
+                "values that were incorrectly treated as unitless"
+            )
 
     if not passed and asm:
         # Record rejection evidence
-        ev = graph.record_evidence("audit_failure", {"reason": reason}, related_assumption=asm.id)
+        graph.record_evidence(
+            "audit_failure", {"reason": reason}, related_assumption=asm.id
+        )
         graph.log_event("AUDIT", "REJECT", reason, assumption_id=asm.id)
 
         # Mark the assumption rejected (ROOT will supersede)
@@ -380,7 +400,12 @@ def audit_logic(ctx: Dict[str, Any]) -> Dict[str, Any]:
             created_by="ROOT",
             supersedes=asm.id,
         )
-        graph.log_event("ROOT", "SUPERSESSION", f"{asm.id} → {new_asm.id}", assumption_id=new_asm.id)
+        graph.log_event(
+            "ROOT",
+            "SUPERSESSION",
+            f"{asm.id} → {new_asm.id}",
+            assumption_id=new_asm.id,
+        )
 
         # Update the edge to point at the new assumption
         for e in state.edges.values():
@@ -393,7 +418,9 @@ def audit_logic(ctx: Dict[str, Any]) -> Dict[str, Any]:
         return {"passed": False, "reason": reason, "new_assumption": new_asm.id}
 
     # Pass case
-    graph.record_evidence("audit_pass", {"mode": worker_out.get("mode")}, related_assumption=active_id)
+    graph.record_evidence(
+        "audit_pass", {"mode": worker_out.get("mode")}, related_assumption=active_id
+    )
     graph.log_event("AUDIT", "PASS", worker_out.get("mode"), assumption_id=active_id)
     return {"passed": True, "reason": "Assumption validated"}
 
@@ -416,14 +443,12 @@ def drift_logic(ctx: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def branch_c1_logic(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    state: GraphState = ctx["state"]
     graph: EngineGraph = ctx["graph"]
     graph.log_event("BRANCH_C1", "EXECUTED", "unrelated independent work")
     return {"branch": "C1", "value": 42}
 
 
 def branch_c2_logic(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    state: GraphState = ctx["state"]
     graph: EngineGraph = ctx["graph"]
     graph.log_event("BRANCH_C2", "EXECUTED", "downstream of C1 – must be preserved")
     return {"branch": "C2", "value": 99}
@@ -437,7 +462,6 @@ def ledger_logic(ctx: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def root_logic(ctx: Dict[str, Any]) -> Dict[str, Any]:
-    state: GraphState = ctx["state"]
     graph: EngineGraph = ctx["graph"]
     graph.log_event("ROOT", "OWNERSHIP_CHECK", "graph integrity verified")
     return {"status": "owned"}
@@ -490,18 +514,31 @@ def run_demo():
 
     print("\n--- FINAL LEDGER ---")
     for log in shared.ledger:
-        print(f"  {log['id']} | {log['node']:<10} | {log['type']:<18} | {log.get('details') or log.get('justifying_assumption')}")
+        detail = log.get("details") or log.get("justifying_assumption")
+        print(
+            f"  {log['id']} | {log['node']:<10} | {log['type']:<18} | {detail}"
+        )
 
     print("\n--- ACCEPTANCE CHECKS ---")
     exec_counts: Dict[str, int] = {}
     for log in shared.ledger:
         n = log["node"]
-        if log["type"] in ("ESTABLISHED", "EXECUTED", "ASSUMPTION_CREATED", "PASS", "REJECT", "CHECK", "SNAPSHOT", "OWNERSHIP_CHECK"):
+        if log["type"] in (
+            "ESTABLISHED", "EXECUTED", "ASSUMPTION_CREATED", "PASS",
+            "REJECT", "CHECK", "SNAPSHOT", "OWNERSHIP_CHECK",
+        ):
             exec_counts[n] = exec_counts.get(n, 0) + 1
 
     # Find the two assumptions
     asms = list(shared.assumptions.values())
-    a_old = next((a for a in asms if a.status in (AssumptionStatus.REJECTED, AssumptionStatus.SUPERSEDED)), None)
+    a_old = next(
+        (
+            a
+            for a in asms
+            if a.status in (AssumptionStatus.REJECTED, AssumptionStatus.SUPERSEDED)
+        ),
+        None,
+    )
     a_new = next((a for a in asms if a.status == AssumptionStatus.ACTIVE and a.supersedes), None)
 
     inv = shared.invalidation_sets[0] if shared.invalidation_sets else {}
@@ -512,10 +549,14 @@ def run_demo():
         ("DECOMPOSE executes exactly once", exec_counts.get("DECOMPOSE", 0) == 1),
         ("WORKER executed under A then B", exec_counts.get("WORKER", 0) == 2),
         ("Assumption objects created (A + B)", len(shared.assumptions) >= 2),
-        ("A is REJECTED / SUPERSEDED", a_old is not None and a_old.status in (AssumptionStatus.REJECTED, AssumptionStatus.SUPERSEDED)),
-        ("B supersedes A", a_new is not None and a_old is not None and a_new.supersedes == a_old.id),
+        ("A is REJECTED / SUPERSEDED",
+         a_old is not None
+         and a_old.status in (AssumptionStatus.REJECTED, AssumptionStatus.SUPERSEDED)),
+        ("B supersedes A",
+         a_new is not None and a_old is not None and a_new.supersedes == a_old.id),
         ("DECOMPOSE→WORKER edge carries assumption",
-         any(e.source == "DECOMPOSE" and e.target == "WORKER" and e.assumption_id for e in shared.edges.values())),
+         any(e.source == "DECOMPOSE" and e.target == "WORKER" and e.assumption_id
+             for e in shared.edges.values())),
         ("Blast radius contains WORKER", "WORKER" in inv_nodes),
         ("Blast radius does NOT contain INTENT", "INTENT" not in inv_nodes),
         ("Blast radius does NOT contain DECOMPOSE", "DECOMPOSE" not in inv_nodes),
@@ -525,12 +566,15 @@ def run_demo():
         ("BRANCH_C2 output preserved", "BRANCH_C2" in shared.node_outputs),
         # Under B the "$3200" string is parsed rather than dropped, so the
         # re-run keeps five records where the first pass kept four.
-        ("Final WORKER kept 5 records", shared.node_outputs.get("WORKER", {}).get("kept_count") == 5),
+        ("Final WORKER kept 5 records",
+         shared.node_outputs.get("WORKER", {}).get("kept_count") == 5),
         ("Final AUDIT passed", shared.node_outputs.get("AUDIT", {}).get("passed") is True),
         ("active_for_node only tracks WORKER (clean)",
          set(shared.active_for_node.keys()) <= {"WORKER"}),
         ("No pollution of AUDIT/LEDGER/ROOT as active assumption holders",
-         "AUDIT" not in shared.active_for_node and "LEDGER" not in shared.active_for_node and "ROOT" not in shared.active_for_node),
+         "AUDIT" not in shared.active_for_node
+         and "LEDGER" not in shared.active_for_node
+         and "ROOT" not in shared.active_for_node),
     ]
 
     all_ok = True

@@ -281,16 +281,16 @@ def write_in_place(directory: Path, name: str, payload: str) -> Path:
         raise
 
 
-def read_text_shared(path: Path) -> str:
-    """Read text without blocking a Windows rename over the same pathname.
+def _open_shared_text(path: Path) -> Any:
+    """Open a text file without blocking a Windows rename over the same name.
 
     POSIX lets a writer replace a file while another process has it open. On
     Windows that works only if the reader opted into delete sharing. Context
-    Mesh readers are lock-free by design, so the manifest read takes that share
-    mode explicitly when the platform needs it.
+    Mesh readers are lock-free by design, so the open takes that share mode
+    explicitly when the platform needs it. The caller owns the returned file.
     """
     if os.name != "nt":
-        return path.read_text(encoding="utf-8")
+        return open(path, "r", encoding="utf-8")
 
     import ctypes
     import msvcrt
@@ -323,12 +323,13 @@ def read_text_shared(path: Path) -> str:
     except BaseException:
         kernel32.CloseHandle(handle)
         raise
-    with os.fdopen(fd, "r", encoding="utf-8") as reader:
+    return os.fdopen(fd, "r", encoding="utf-8")
+
+
+def read_text_shared(path: Path) -> str:
+    """Read a whole file under the shared mode described above."""
+    with _open_shared_text(path) as reader:
         return reader.read()
-
-
-def read_session_manifest_text(directory: Path) -> str:
-    return read_text_shared(directory / SESSION_FILE)
 
 
 def live_manifest_path(directory: Path) -> Optional[Path]:
@@ -360,40 +361,7 @@ def open_session_manifest_reader(directory: Path) -> Any:
     path = live_manifest_path(directory)
     if path is None:
         raise FileNotFoundError(directory / SESSION_FILE)
-    if os.name != "nt":
-        return open(path, "r", encoding="utf-8")
-
-    import ctypes
-    import msvcrt
-
-    GENERIC_READ = 0x80000000
-    FILE_SHARE_READ = 0x00000001
-    FILE_SHARE_WRITE = 0x00000002
-    FILE_SHARE_DELETE = 0x00000004
-    OPEN_EXISTING = 3
-    FILE_ATTRIBUTE_NORMAL = 0x00000080
-    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CreateFileW.restype = ctypes.c_void_p
-    handle = kernel32.CreateFileW(
-        str(path),
-        GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        None,
-        OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL,
-        None,
-    )
-    if handle == INVALID_HANDLE_VALUE:
-        error = ctypes.get_last_error()
-        raise OSError(error, os.strerror(error), str(path))
-    try:
-        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY)
-    except BaseException:
-        kernel32.CloseHandle(handle)
-        raise
-    return os.fdopen(fd, "r", encoding="utf-8")
+    return _open_shared_text(path)
 
 
 def _open_lock_file(path: Path) -> Any:

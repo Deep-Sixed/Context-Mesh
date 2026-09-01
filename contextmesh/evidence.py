@@ -115,6 +115,53 @@ def _digest(canonical: str) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def evidence_id_for(canonical: str) -> str:
+    """The durable id of an observation: its whole payload digest.
+
+    PR #8A derived this id with :func:`contextmesh.model.slug`, which is right
+    for prose — an entity label or an assumption statement puts real signal in
+    the 40-character body, and the six hex characters after it only break ties.
+    A canonical evidence payload puts no signal there at all. It opens with the
+    envelope's constant keys, so every observation from one source normalises to
+    the same body::
+
+        {"external_id":null,"metadata":{},"source_id":"source:sec-feed","text":...
+        external-id-null-metadata-source-id-sour   <- the whole 40-char budget
+
+    which left 24 bits to separate observations: two distinct ones collide after
+    a few thousand submissions, and the loser is then refused for good, because
+    its id is taken by content that is not it. Intake is the one boundary built
+    for untrusted, high-volume input, so it is the last place to spend a
+    truncated digest. ``submit`` already computes the full one to store.
+    """
+    return f"evidence:{_digest(canonical)}"
+
+
+def _legacy_evidence_id(canonical: str) -> str:
+    """The pre-PR #12 id, recognised on read so old intake stays deduplicated.
+
+    Never minted. A legacy node is adopted only when it really holds this
+    payload; one that holds different content is a collision victim of the
+    scheme above and must not go on blocking this observation.
+    """
+    return slug(canonical, "evidence")
+
+
+def _legacy_intake(
+    graph: ContextGraph, canonical: str, external_id: Optional[str]
+) -> Optional[Node]:
+    node = graph.get(_legacy_evidence_id(canonical))
+    if node is None:
+        return None
+    try:
+        stored_canonical, _, stored_external = _stored_canonical(node)
+    except EvidenceConflictError:
+        return None
+    if stored_canonical == canonical and stored_external == external_id:
+        return node
+    return None
+
+
 def _intake_record(node: Node) -> Dict[str, Any]:
     attrs = node.attrs if isinstance(node.attrs, dict) else {}
     record = attrs.get(INTAKE_ATTR)
@@ -218,7 +265,7 @@ class EvidenceIntake:
             metadata=clean_metadata,
         )
         payload_digest = _digest(canonical)
-        evidence_id = slug(canonical, "evidence")
+        evidence_id = evidence_id_for(canonical)
 
         existing = self.graph.get(evidence_id)
         if existing is not None:
@@ -232,6 +279,10 @@ class EvidenceIntake:
                     f"evidence id {evidence_id!r} already stores different content"
                 )
             return EvidenceReceipt(evidence_id, False, existing)
+
+        legacy = _legacy_intake(self.graph, canonical, external_id)
+        if legacy is not None:
+            return EvidenceReceipt(legacy.id, False, legacy)
 
         if external_id is not None:
             matches = _external_matches(self.graph, external_id)
@@ -295,6 +346,7 @@ __all__ = [
     "EvidenceIntakeError",
     "EvidenceReceipt",
     "canonical_payload",
+    "evidence_id_for",
     "submit_evidence",
     "validate_metadata",
 ]

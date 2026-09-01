@@ -19,7 +19,6 @@ import sys
 
 from contextmesh.llm import LLMClient, LLMConfig, LLMError
 
-
 SCHEMA = {
     "type": "object",
     "properties": {
