@@ -52,10 +52,10 @@ import re
 from dataclasses import dataclass
 from datetime import date
 from enum import Enum
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from .graph import ContextGraph
-from .model import EdgeType, Node, NodeType
+from .model import AssumptionStatus, EdgeType, Node, NodeType
 
 #: The source attribute GRAPH.md already requires a ``source`` to carry.
 SOURCE_TIME_ATTR = "retrieved_at"
@@ -186,12 +186,191 @@ class Timeline:
         return (min(dated), max(dated)) if dated else None
 
 
+def _source_time_of(graph: ContextGraph, node: Node) -> Optional[date]:
+    """One node's source date, resolved the way :class:`Timeline` resolves it."""
+    if node.type is NodeType.SOURCE:
+        return source_date(node)
+    provenance = node.provenance
+    if provenance is not None:
+        source = graph.nodes.get(provenance.source_id)
+        if source is not None:
+            return source_date(source)
+    for edge_type in _ANCHOR_EDGES:
+        for edge in graph.out_edges(node.id, [edge_type], live_only=False):
+            source = graph.nodes.get(edge.dst)
+            if source is not None and source.type is NodeType.SOURCE:
+                return source_date(source)
+    return None
+
+
+def _fell_at(graph: ContextGraph, assumption_id: str) -> Optional[date]:
+    """When an assumption fell, on the source clock.
+
+    Rule 7 of GRAPH.md: an assumption is only ever rejected by ``evidence``
+    that ``contradicts`` it. So the moment it stopped standing is the moment
+    that evidence became available — a source date, comparable to a horizon,
+    with no clock crossed. The earliest such witness wins; a second one
+    arriving later does not un-fell it.
+    """
+    fell: Optional[date] = None
+    for edge in graph.in_edges(assumption_id, [EdgeType.CONTRADICTS], live_only=False):
+        witness = graph.nodes.get(edge.src)
+        if witness is None or witness.type is not NodeType.EVIDENCE:
+            continue
+        when = _source_time_of(graph, witness)
+        if when is not None and (fell is None or when < fell):
+            fell = when
+    return fell
+
+
+def _standing_assumptions(
+    graph: ContextGraph, kept: Dict[str, Node], as_of: date
+) -> Dict[str, Node]:
+    """Assumptions the surviving work was standing on, still uncrossed clocks.
+
+    An assumption carries no source date of its own — it is not lifted from a
+    document — so it cannot be compared to the horizon directly. It gets its
+    position from two things the model already supplies, both on the source
+    clock:
+
+    it entered with the work that depends on it, which is in ``kept`` only
+    because its own source date cleared the horizon; and it fell when the
+    evidence contradicting it arrived, which is a source date too.
+
+    The build counter is kept as a second gate rather than the first. It is
+    real for work the Runner executes across rounds, and nearly flat for a
+    corpus ingested in one build — in the bundled demo a February decision and
+    the July evidence that felled its ground both sit at build 1, so build
+    comparison alone would drop an assumption out of the very decision it was
+    holding up. Source dates carry the history there; builds carry it in
+    execution. Neither is asked to do the other's job.
+    """
+    standing: Dict[str, Node] = {}
+    for node in kept.values():
+        for edge in graph.out_edges(node.id, [EdgeType.DEPENDS_ON], live_only=False):
+            assumption = graph.assumptions.get(edge.dst)
+            if assumption is None:
+                continue
+            if assumption.created_at_build > node.build:
+                continue
+            fell = _fell_at(graph, edge.dst)
+            if fell is not None and fell <= as_of:
+                continue
+            ground = graph.nodes.get(edge.dst)
+            if ground is not None:
+                standing[ground.id] = ground
+    return standing
+
+
+def as_of_graph(graph: ContextGraph, as_of: date) -> ContextGraph:
+    """The graph as it stood: a real graph, not today's with nodes greyed out.
+
+    A reconstruction has to be walkable by the ordinary walker, scored by the
+    ordinary policy and able to dead-end the ordinary way. Filtering a result
+    after the fact would still let the walk cross a claim that did not exist
+    yet, and the path — which is the answer in this system — would be one
+    nobody could have taken. So the projection is built first and walked
+    second.
+
+    Nodes survive when their source time is ``THEN``; assumptions survive when
+    the surviving work was standing on them. An edge survives only when both
+    of its endpoints do, so no edge points out of the past.
+    """
+    timeline = Timeline(graph)
+    kept: Dict[str, Node] = {
+        node.id: node
+        for node in graph.nodes.values()
+        if timeline.horizon(node.id, as_of) is Horizon.THEN
+    }
+    kept.update(_standing_assumptions(graph, kept, as_of))
+
+    payload = graph.to_dict()
+    payload["nodes"] = [n for n in payload["nodes"] if n["id"] in kept]
+    payload["edges"] = [
+        e for e in payload["edges"] if e["src"] in kept and e["dst"] in kept
+    ]
+    payload["assumptions"] = [
+        _rewind_assumption(a, kept, as_of, graph)
+        for a in payload["assumptions"]
+        if a["id"] in kept
+    ]
+    _mirror_status(payload)
+    return ContextGraph.from_dict(payload)
+
+
+def _rewind_assumption(
+    record: Dict[str, Any], kept: Dict[str, Node], as_of: date, graph: ContextGraph
+) -> Dict[str, Any]:
+    """State an assumption as it stood, rather than as it ended up.
+
+    Carrying today's record into a past projection would make the projection
+    lie in the one place it most needs to be honest: an assumption rejected in
+    July was *active* in February, and a February reconstruction that reports
+    it as rejected has quietly imported the finding it exists to exclude.
+
+    So each lifecycle field is wound back to the horizon:
+
+    ``status`` and ``rejected_at_build`` clear unless the contradicting
+    evidence had already arrived; ``evidence_ids`` keeps only witnesses that
+    had; ``supersedes`` and ``superseded_by`` clear when the other half of the
+    relationship is not in the projection, because a successor that did not
+    exist yet cannot already have replaced anything.
+
+    That last one is also what ``ContextGraph.from_dict`` demands — it refuses
+    a snapshot whose supersession is one-sided or dangling. The projection has
+    to be a graph the ordinary loader would accept, not a special case, or it
+    is not really the graph as it stood.
+    """
+    out = dict(record)
+    fell = _fell_at(graph, record["id"])
+    if fell is None or fell > as_of:
+        out["status"] = AssumptionStatus.ACTIVE.value
+        out["rejected_at_build"] = None
+    out["evidence_ids"] = [
+        eid
+        for eid in record.get("evidence_ids", [])
+        if eid in kept and _witness_arrived(graph, eid, as_of)
+    ]
+    for field_name in ("supersedes", "superseded_by"):
+        other = out.get(field_name)
+        if other is not None and other not in kept:
+            out[field_name] = None
+    return out
+
+
+def _witness_arrived(graph: ContextGraph, evidence_id: str, as_of: date) -> bool:
+    node = graph.nodes.get(evidence_id)
+    if node is None:
+        return False
+    when = _source_time_of(graph, node)
+    return when is not None and when <= as_of
+
+
+def _mirror_status(payload: Dict[str, Any]) -> None:
+    """Keep each assumption node's mirrored lifecycle equal to its record.
+
+    ``sync_assumption`` is the single writer of that mirror in a live graph and
+    ``from_dict`` refuses a snapshot where the two disagree. Winding a record
+    back without winding its node back would trip exactly that check — the
+    graph declining to hold two answers to one question, which is the rule
+    working rather than an obstacle to route around.
+    """
+    rewound = {a["id"]: a for a in payload["assumptions"]}
+    for node in payload["nodes"]:
+        record = rewound.get(node["id"])
+        if record is not None:
+            node["attrs"] = dict(node["attrs"])
+            node["attrs"]["status"] = record["status"]
+            node["attrs"]["version"] = record["version"]
+
+
 __all__ = [
     "Anchor",
     "Horizon",
     "SOURCE_TIME_ATTR",
     "TemporalError",
     "Timeline",
+    "as_of_graph",
     "parse_date",
     "source_date",
 ]
