@@ -156,7 +156,7 @@ jobs:
           print("core: 0 dependencies, requires-python >=3.9")
           EOF
 
-      - name: The server separates five reads from controlled writes
+      - name: The server separates seven reads from controlled writes
         run: |
           python - <<'EOF' | tee /tmp/mcp.txt
           import asyncio
@@ -168,9 +168,11 @@ jobs:
           assert tools.names() == [
               "mesh_ask",
               "mesh_blast_radius",
+              "mesh_explain_as_of",
               "mesh_get_node",
               "mesh_health",
               "mesh_lineage",
+              "mesh_reconstruct_decision",
           ]
           assert writes.names() == [
               "mesh_recheck",
