@@ -501,13 +501,15 @@ class SurfaceEquivalenceTest(unittest.TestCase):
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
     def test_every_tool_is_covered(self):
-        """So a sixth tool cannot be added without deciding whether it survives."""
+        """So a further tool cannot be added without deciding whether it survives."""
         covered = {
             "mesh_ask",
             "mesh_get_node",
             "mesh_health",
             "mesh_lineage",
             "mesh_blast_radius",
+            "mesh_explain_as_of",
+            "mesh_reconstruct_decision",
         }
         self.assertEqual(set(tools.TOOLS), covered)
 
@@ -548,6 +550,42 @@ class SurfaceEquivalenceTest(unittest.TestCase):
                 tools.call(fresh, "mesh_ask", {"question": question}),
                 question,
             )
+
+    def test_the_walk_back_matches_for_every_decision(self):
+        """History is the one thing that must not depend on when you ask.
+
+        Everything the reconstruction reads — source dates, provenance, typed
+        edges, assumption records — is in the snapshot, so a restart changes
+        nothing. Three horizons because one would not notice a projection that
+        was right at the ends and wrong in the middle.
+        """
+        decisions = [
+            n.id for n in self.session.graph.nodes.values() if n.type is NodeType.DECISION
+        ]
+        self.assertTrue(decisions)
+        for decision_id in decisions:
+            for as_of in ("2026-01-15", "2026-04-01", "2026-08-01"):
+                args = {"decision_id": decision_id, "as_of": as_of}
+                self.assertEqual(
+                    tools.call(self.restored, "mesh_reconstruct_decision", args),
+                    tools.call(self.session, "mesh_reconstruct_decision", args),
+                    f"{decision_id} @ {as_of}",
+                )
+
+    def test_the_as_of_answer_matches_across_a_restart(self):
+        """Asked in the same order on both sides, for the reason mesh_ask is."""
+        from contextmesh.demo import questions
+
+        fresh = build()
+        restored = Session.load(self.dir)
+        for question in questions(fresh.graph, 20):
+            for as_of in ("2026-02-01", "2026-06-01"):
+                args = {"question": question, "as_of": as_of}
+                self.assertEqual(
+                    tools.call(restored, "mesh_explain_as_of", args),
+                    tools.call(fresh, "mesh_explain_as_of", args),
+                    f"{question} @ {as_of}",
+                )
 
     def test_health_matches_apart_from_the_walk_log(self):
         before = tools.call(self.session, "mesh_health", {})

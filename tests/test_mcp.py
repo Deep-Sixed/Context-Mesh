@@ -11,6 +11,7 @@ import json
 import unittest
 
 from contextmesh.model import AssumptionStatus, EdgeType, NodeType
+from contextmesh.reconstruct import explain_as_of, reconstruct_decision
 from contextmesh_mcp import resources, tools, writes
 from contextmesh_mcp.session import Session
 
@@ -103,12 +104,23 @@ class ReadBoundaryTest(unittest.TestCase):
     def test_every_read_tool_in_one_pass(self):
         node_id = next(iter(self.session.graph.nodes))
         assumption_id = sorted(self.session.graph.assumptions)[0]
+        decision_id = next(
+            n.id for n in self.session.graph.nodes.values() if n.type is NodeType.DECISION
+        )
         args = {
             "mesh_ask": {"question": "Why did the Index Builder run out of memory?"},
             "mesh_get_node": {"node_id": node_id},
             "mesh_health": {},
             "mesh_lineage": {"assumption_id": assumption_id},
             "mesh_blast_radius": {"assumption_id": assumption_id},
+            "mesh_explain_as_of": {
+                "question": "Why did the Index Builder run out of memory?",
+                "as_of": "2026-03-01",
+            },
+            "mesh_reconstruct_decision": {
+                "decision_id": decision_id,
+                "as_of": "2026-03-01",
+            },
         }
         self.assertEqual(sorted(args), tools.names())
         for name in tools.names():
@@ -123,6 +135,77 @@ class ReadBoundaryTest(unittest.TestCase):
         resources.read(self.session, f"contextmesh://node/{node_id}")
         resources.read(self.session, f"contextmesh://assumption/{assumption_id}")
         self.assertStructureUnchanged()
+
+
+class TemporalToolsAreThinTest(unittest.TestCase):
+    """The wrapper marshals. Every temporal rule stays in the engine."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.session = Session.build(rounds=2)
+        cls.decision_id = next(
+            n.id
+            for n in cls.session.graph.nodes.values()
+            if n.type is NodeType.DECISION
+        )
+
+    def test_the_walk_back_is_exactly_what_the_engine_returns(self):
+        # Not a style preference. A wrapper that reshaped this would be a
+        # second answer to a question the engine already answers, and the two
+        # would drift the first time either changed.
+        self.assertEqual(
+            tools.mesh_reconstruct_decision(self.session, self.decision_id, "2026-03-01"),
+            reconstruct_decision(
+                self.session.graph, self.decision_id, "2026-03-01"
+            ).to_dict(),
+        )
+
+    def test_the_as_of_answer_is_exactly_what_the_engine_returns(self):
+        question = "Why did the Index Builder run out of memory?"
+        self.assertEqual(
+            tools.mesh_explain_as_of(self.session, question, "2026-03-01"),
+            explain_as_of(
+                self.session.graph, self.session.resolver, question, "2026-03-01"
+            ).to_dict(),
+        )
+
+    def test_a_loose_date_comes_back_as_a_tool_error(self):
+        # TemporalError is the engine's vocabulary. A caller of the tool layer
+        # gets the tool layer's, the same as for every other bad argument.
+        for bad in ("June 2026", "at plan time", "2026-02-30", ""):
+            with self.assertRaises(tools.MeshToolError):
+                tools.mesh_reconstruct_decision(self.session, self.decision_id, bad)
+
+    def test_a_loose_date_on_the_as_of_answer_is_a_tool_error_too(self):
+        with self.assertRaises(tools.MeshToolError):
+            tools.mesh_explain_as_of(self.session, "anything", "last spring")
+
+    def test_an_empty_question_is_refused(self):
+        with self.assertRaises(tools.MeshToolError):
+            tools.mesh_explain_as_of(self.session, "   ", "2026-03-01")
+
+    def test_walking_back_from_something_that_is_not_a_decision_is_refused(self):
+        source_id = next(
+            n.id for n in self.session.graph.nodes.values() if n.type is NodeType.SOURCE
+        )
+        with self.assertRaises(tools.MeshToolError) as caught:
+            tools.mesh_reconstruct_decision(self.session, source_id, "2026-03-01")
+        self.assertIn("source", str(caught.exception))
+
+    def test_an_unknown_decision_is_refused(self):
+        with self.assertRaises(tools.MeshToolError):
+            tools.mesh_reconstruct_decision(self.session, "decision:nope", "2026-03-01")
+
+    def test_neither_tool_moves_walk_telemetry(self):
+        # mesh_ask is declared mutating because a walk moves counters. These
+        # two walk a projection built for the call, so the live graph counts
+        # nothing — and the server declaration says so.
+        before = telemetry(self.session.graph)
+        tools.mesh_explain_as_of(
+            self.session, "Why did the Index Builder run out of memory?", "2026-03-01"
+        )
+        tools.mesh_reconstruct_decision(self.session, self.decision_id, "2026-03-01")
+        self.assertEqual(telemetry(self.session.graph), before)
 
 
 class FrozenStateTest(unittest.TestCase):
@@ -274,15 +357,17 @@ class SurfaceTest(unittest.TestCase):
     def setUp(self):
         self.session = Session.build(rounds=2)
 
-    def test_exactly_five_read_tools(self):
+    def test_exactly_seven_read_tools(self):
         self.assertEqual(
             tools.names(),
             [
                 "mesh_ask",
                 "mesh_blast_radius",
+                "mesh_explain_as_of",
                 "mesh_get_node",
                 "mesh_health",
                 "mesh_lineage",
+                "mesh_reconstruct_decision",
             ],
         )
 
@@ -332,12 +417,23 @@ class SurfaceTest(unittest.TestCase):
     def test_every_read_payload_is_json_serialisable(self):
         node_id = next(iter(self.session.graph.nodes))
         assumption_id = sorted(self.session.graph.assumptions)[0]
+        decision_id = next(
+            n.id for n in self.session.graph.nodes.values() if n.type is NodeType.DECISION
+        )
         args = {
             "mesh_ask": {"question": "What does pgvector store?"},
             "mesh_get_node": {"node_id": node_id},
             "mesh_health": {},
             "mesh_lineage": {"assumption_id": assumption_id},
             "mesh_blast_radius": {"assumption_id": assumption_id},
+            "mesh_explain_as_of": {
+                "question": "What does pgvector store?",
+                "as_of": "2026-03-01",
+            },
+            "mesh_reconstruct_decision": {
+                "decision_id": decision_id,
+                "as_of": "2026-03-01",
+            },
         }
         for name in tools.names():
             json.dumps(tools.call(self.session, name, args[name]))

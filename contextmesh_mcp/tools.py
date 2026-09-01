@@ -1,4 +1,4 @@
-"""The five read tools, as plain functions over the engine.
+"""The seven read tools, as plain functions over the engine.
 
 Nothing here imports the MCP SDK. Each returns a JSON-ready dict, so the tools
 can be exercised — and their safety asserted — without a protocol, a transport,
@@ -11,6 +11,8 @@ from typing import Any, Dict, List, Optional
 
 from contextmesh.health import report as health_report
 from contextmesh.model import AssumptionStatus, EdgeType, NodeType
+from contextmesh.reconstruct import explain_as_of, reconstruct_decision
+from contextmesh.temporal import TemporalError
 
 from .session import Session
 
@@ -197,6 +199,44 @@ def mesh_blast_radius(session: Session, assumption_id: str) -> Dict[str, Any]:
 #: schema from that signature, so a hand-written copy alongside it would be
 #: documentation shaped like a contract and free to drift from the real one.
 #: ``tests/test_mcp.py`` asserts the published schema against these signatures.
+def mesh_explain_as_of(session: Session, question: str, as_of: str) -> Dict[str, Any]:
+    """Answer a question from the graph as it stood, not from today's graph.
+
+    Every temporal rule lives in :mod:`contextmesh.reconstruct`. This marshals
+    arguments in and a dict out, and that is the whole of it: a wrapper that
+    started deciding what counts as contemporary would be a second answer to a
+    question the engine already answers, and the two would drift.
+
+    ``TemporalError`` is translated rather than propagated so a caller who
+    sends ``"June 2026"`` gets the tool error every other bad argument gets.
+    """
+    if not question or not question.strip():
+        raise MeshToolError("question is empty")
+    try:
+        return explain_as_of(session.graph, session.resolver, question, as_of).to_dict()
+    except TemporalError as exc:
+        raise MeshToolError(str(exc)) from None
+
+
+def mesh_reconstruct_decision(
+    session: Session, decision_id: str, as_of: str, depth: int = 3
+) -> Dict[str, Any]:
+    """Why a decision was made, and what happened to its reasons afterwards.
+
+    Read-only in the strict sense: unlike :func:`mesh_ask` this moves no walk
+    telemetry either, because it does not walk — it follows the typed edges a
+    decision already carries.
+    """
+    node = _require_node(session, decision_id)
+    if node.type is not NodeType.DECISION:
+        raise MeshToolError(f"{decision_id!r} is a {node.type.value}, not a decision")
+    try:
+        history = reconstruct_decision(session.graph, decision_id, as_of, depth=depth)
+    except TemporalError as exc:
+        raise MeshToolError(str(exc)) from None
+    return history.to_dict()
+
+
 TOOLS: Dict[str, Dict[str, Any]] = {
     "mesh_ask": {
         "fn": mesh_ask,
@@ -234,6 +274,23 @@ TOOLS: Dict[str, Dict[str, Any]] = {
             "this assumption turned out to be false. Changes nothing."
         ),
     },
+    "mesh_explain_as_of": {
+        "fn": mesh_explain_as_of,
+        "description": (
+            "Answer a question from the graph as it stood on a past date "
+            "(YYYY-MM-DD), walking a real projection rather than filtering "
+            "today's answer. Splits what was known then, what was decided, what "
+            "arrived later, and what carries no date at all."
+        ),
+    },
+    "mesh_reconstruct_decision": {
+        "fn": mesh_reconstruct_decision,
+        "description": (
+            "Walk back from one decision to the reasons it stood on, judged "
+            "against the decision's own date rather than today's. Reports "
+            "separately what came afterwards to contradict or supersede it."
+        ),
+    },
 }
 
 
@@ -256,8 +313,10 @@ __all__ = [
     "call",
     "mesh_ask",
     "mesh_blast_radius",
+    "mesh_explain_as_of",
     "mesh_get_node",
     "mesh_health",
     "mesh_lineage",
+    "mesh_reconstruct_decision",
     "names",
 ]
