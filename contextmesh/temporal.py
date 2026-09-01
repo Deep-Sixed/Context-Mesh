@@ -173,12 +173,19 @@ class Timeline:
     def when(self, node_id: str) -> Optional[date]:
         return self.anchor(node_id).when
 
-    def horizon(self, node_id: str, as_of: date) -> Horizon:
-        """Classify one node against a moment. Three outcomes, never two."""
+    def horizon(self, node_id: str, as_of: Any) -> Horizon:
+        """Classify one node against a moment. Three outcomes, never two.
+
+        The moment is parsed rather than trusted. A caller who passes the
+        string they read off a request would otherwise compare a ``date`` to a
+        ``str`` and get a ``TypeError`` from three frames down, which says
+        nothing about the date being wrong.
+        """
+        moment = parse_date(as_of, where="as_of")
         when = self.anchor(node_id).when
         if when is None:
             return Horizon.UNDATED
-        return Horizon.THEN if when <= as_of else Horizon.LATER
+        return Horizon.THEN if when <= moment else Horizon.LATER
 
     def span(self) -> Optional[tuple]:
         """The dated extent of this graph, or None when nothing is datable."""
@@ -223,29 +230,32 @@ def _fell_at(graph: ContextGraph, assumption_id: str) -> Optional[date]:
     return fell
 
 
-def _standing_assumptions(
-    graph: ContextGraph, kept: Dict[str, Node], as_of: date
-) -> Dict[str, Node]:
-    """Assumptions the surviving work was standing on, still uncrossed clocks.
+def _grounding_assumptions(graph: ContextGraph, kept: Dict[str, Node]) -> Dict[str, Node]:
+    """Assumptions the surviving work rested on, whether or not they survived it.
 
     An assumption carries no source date of its own — it is not lifted from a
-    document — so it cannot be compared to the horizon directly. It gets its
-    position from two things the model already supplies, both on the source
-    clock:
+    document — so it cannot be compared to the horizon directly. It takes its
+    position from the work that depends on it, which is in ``kept`` only
+    because its own source date cleared the horizon.
 
-    it entered with the work that depends on it, which is in ``kept`` only
-    because its own source date cleared the horizon; and it fell when the
-    evidence contradicting it arrived, which is a source date too.
+    Falling is not a reason to leave it out. An assumption that was disproved
+    before the horizon is *part of* what the horizon knew: the projection has
+    to be able to say the decision rested on something and that the something
+    gave way. Drop the node and the ``depends_on`` edge goes with it — both
+    endpoints have to survive — and the past loses the very structure this
+    module exists to show. What the fall changes is the assumption's *state*,
+    and :func:`_rewind_assumption` sets that from the contradicting evidence's
+    own source date.
 
-    The build counter is kept as a second gate rather than the first. It is
-    real for work the Runner executes across rounds, and nearly flat for a
-    corpus ingested in one build — in the bundled demo a February decision and
-    the July evidence that felled its ground both sit at build 1, so build
-    comparison alone would drop an assumption out of the very decision it was
-    holding up. Source dates carry the history there; builds carry it in
-    execution. Neither is asked to do the other's job.
+    The build counter is the one gate applied here, and only in the direction
+    it can be trusted: an assumption created after the work that names it did
+    not ground that work. It is real for work the Runner executes across
+    rounds and nearly flat for a corpus ingested in one build — in the bundled
+    demo a February decision and the July evidence that felled its ground both
+    sit at build 1 — so it is never asked to decide when something fell. Source
+    dates carry the history there; builds carry it in execution.
     """
-    standing: Dict[str, Node] = {}
+    grounding: Dict[str, Node] = {}
     for node in kept.values():
         for edge in graph.out_edges(node.id, [EdgeType.DEPENDS_ON], live_only=False):
             assumption = graph.assumptions.get(edge.dst)
@@ -253,16 +263,13 @@ def _standing_assumptions(
                 continue
             if assumption.created_at_build > node.build:
                 continue
-            fell = _fell_at(graph, edge.dst)
-            if fell is not None and fell <= as_of:
-                continue
             ground = graph.nodes.get(edge.dst)
             if ground is not None:
-                standing[ground.id] = ground
-    return standing
+                grounding[ground.id] = ground
+    return grounding
 
 
-def as_of_graph(graph: ContextGraph, as_of: date) -> ContextGraph:
+def as_of_graph(graph: ContextGraph, as_of: Any) -> ContextGraph:
     """The graph as it stood: a real graph, not today's with nodes greyed out.
 
     A reconstruction has to be walkable by the ordinary walker, scored by the
@@ -273,16 +280,18 @@ def as_of_graph(graph: ContextGraph, as_of: date) -> ContextGraph:
     second.
 
     Nodes survive when their source time is ``THEN``; assumptions survive when
-    the surviving work was standing on them. An edge survives only when both
-    of its endpoints do, so no edge points out of the past.
+    the surviving work rested on them, in the state they were in at the
+    horizon. An edge survives only when both of its endpoints do, so no edge
+    points out of the past.
     """
+    moment = parse_date(as_of, where="as_of")
     timeline = Timeline(graph)
     kept: Dict[str, Node] = {
         node.id: node
         for node in graph.nodes.values()
-        if timeline.horizon(node.id, as_of) is Horizon.THEN
+        if timeline.horizon(node.id, moment) is Horizon.THEN
     }
-    kept.update(_standing_assumptions(graph, kept, as_of))
+    kept.update(_grounding_assumptions(graph, kept))
 
     payload = graph.to_dict()
     payload["nodes"] = [n for n in payload["nodes"] if n["id"] in kept]
@@ -290,7 +299,7 @@ def as_of_graph(graph: ContextGraph, as_of: date) -> ContextGraph:
         e for e in payload["edges"] if e["src"] in kept and e["dst"] in kept
     ]
     payload["assumptions"] = [
-        _rewind_assumption(a, kept, as_of, graph)
+        _rewind_assumption(a, kept, moment, graph)
         for a in payload["assumptions"]
         if a["id"] in kept
     ]
