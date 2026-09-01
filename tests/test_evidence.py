@@ -1,5 +1,6 @@
 """PR #8A: observation enters as evidence, never as a client verdict."""
 
+import hashlib
 import inspect
 import math
 import tempfile
@@ -11,6 +12,7 @@ from contextmesh.evidence import (
     EvidenceIntake,
     EvidenceIntakeError,
     canonical_payload,
+    evidence_id_for,
     submit_evidence,
 )
 from contextmesh.graph import ContextGraph
@@ -151,8 +153,7 @@ class EvidenceIntakeTest(unittest.TestCase):
             external_id="CVE-2026-9999",
             metadata=metadata,
         )
-        eid = slug(canonical, "evidence")
-        self.graph.add_node(NodeType.CLAIM, "collision", id=eid)
+        self.graph.add_node(NodeType.CLAIM, "collision", id=evidence_id_for(canonical))
         with self.assertRaises(EvidenceConflictError):
             self.submit()
 
@@ -238,6 +239,123 @@ class EvidenceIntakeTest(unittest.TestCase):
                 source_id=self.source.id,
                 external_id="CVE-2026-9999",
             )
+
+
+class EvidenceIdentityTest(unittest.TestCase):
+    """PR #12: an observation is identified by its whole payload digest.
+
+    Intake used ``slug``, which is right for prose and wrong here. A canonical
+    evidence payload opens with the envelope's constant keys, so the 40-char
+    body slug derives its stem from is spent before ``text`` contributes
+    anything, and every observation from one source normalises identically.
+    That left the 6-hex-character sha1 tail — 24 bits — to tell observations
+    apart, and the loser of a collision was refused permanently.
+    """
+
+    #: Two ordinary observations whose *legacy* ids collide. The precondition is
+    #: asserted below rather than assumed, so this fixture cannot quietly stop
+    #: describing a collision and let the test pass for the wrong reason.
+    COLLIDING = ("observation 1340", "observation 1902")
+
+    def setUp(self):
+        self.graph = ContextGraph()
+        self.source = self.graph.add_node(
+            NodeType.SOURCE, "NVD feed", id="source:nvd"
+        )
+
+    def canonical(self, text, external_id=None, metadata=None):
+        return canonical_payload(
+            text=text,
+            source_id=self.source.id,
+            external_id=external_id,
+            metadata=metadata or {},
+        )
+
+    def legacy_id(self, canonical):
+        """The id intake minted before PR #12."""
+        return slug(canonical, "evidence")
+
+    def plant_legacy(self, text, node_type=NodeType.EVIDENCE, intake=True):
+        """A node ingested under the old scheme, as a restored graph would hold it."""
+        canonical = self.canonical(text)
+        attrs = {}
+        if intake:
+            attrs = {
+                "kind": "observation",
+                "evidence_intake": {
+                    "version": 1,
+                    "external_id": None,
+                    "payload_digest": hashlib.sha256(canonical.encode()).hexdigest(),
+                    "metadata": {},
+                },
+            }
+        return self.graph.add_node(
+            node_type,
+            text,
+            id=self.legacy_id(canonical),
+            attrs=attrs,
+            provenance=Provenance(source_id=self.source.id, extractor="legacy"),
+        )
+
+    def test_the_id_is_the_whole_payload_digest(self):
+        receipt = submit_evidence(
+            self.graph, text="a plain observation", source_id=self.source.id
+        )
+        canonical = self.canonical("a plain observation")
+        self.assertEqual(
+            receipt.evidence_id,
+            "evidence:" + hashlib.sha256(canonical.encode()).hexdigest(),
+        )
+        self.assertEqual(
+            receipt.node.attrs["evidence_intake"]["payload_digest"],
+            receipt.evidence_id.split(":", 1)[1],
+        )
+
+    def test_the_old_scheme_spent_its_whole_body_on_the_envelope(self):
+        left, right = (self.canonical(text) for text in self.COLLIDING)
+        self.assertNotEqual(left, right)
+        stem = self.legacy_id(left).split(":", 1)[1]
+        self.assertTrue(stem.startswith("external-id-null-metadata-source-id-"))
+        self.assertEqual(self.legacy_id(left), self.legacy_id(right))
+
+    def test_observations_that_collided_under_the_old_scheme_both_land(self):
+        first, second = (
+            submit_evidence(self.graph, text=text, source_id=self.source.id)
+            for text in self.COLLIDING
+        )
+        self.assertTrue(first.created)
+        self.assertTrue(second.created)
+        self.assertNotEqual(first.evidence_id, second.evidence_id)
+        self.assertEqual(
+            len(self.graph.by_type(NodeType.EVIDENCE, live_only=False)), 2
+        )
+
+    def test_evidence_ingested_under_the_old_scheme_is_still_deduplicated(self):
+        planted = self.plant_legacy("an older observation")
+        replay = submit_evidence(
+            self.graph, text="an older observation", source_id=self.source.id
+        )
+        self.assertFalse(replay.created)
+        self.assertEqual(replay.evidence_id, planted.id)
+        self.assertEqual(
+            len(self.graph.by_type(NodeType.EVIDENCE, live_only=False)), 1
+        )
+
+    def test_a_legacy_id_holding_other_content_no_longer_blocks(self):
+        squatter = self.plant_legacy(self.COLLIDING[0])
+        receipt = submit_evidence(
+            self.graph, text=self.COLLIDING[1], source_id=self.source.id
+        )
+        self.assertTrue(receipt.created)
+        self.assertNotEqual(receipt.evidence_id, squatter.id)
+        self.assertEqual(receipt.node.label, self.COLLIDING[1])
+
+    def test_a_foreign_node_on_a_legacy_id_no_longer_blocks(self):
+        self.plant_legacy(self.COLLIDING[0], node_type=NodeType.CLAIM, intake=False)
+        receipt = submit_evidence(
+            self.graph, text=self.COLLIDING[1], source_id=self.source.id
+        )
+        self.assertTrue(receipt.created)
 
 
 class DurableEvidenceWriteTest(unittest.TestCase):
