@@ -7,7 +7,8 @@ record without mutating engine state or altering execution behavior.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Tuple
+from types import MappingProxyType
+from typing import Any, Dict, Mapping, Tuple
 
 from .graph import ContextGraph
 from .metrics import DEAD_END_LABELS, LEDGER_EDGES, _hop_histogram, _traversal_grid
@@ -67,7 +68,7 @@ class GraphTypeMetrics:
     nodes_live: int
     edges_total: int
     untyped_edges: int
-    type_counts: Dict[str, int]
+    type_counts: Mapping[str, int]
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -106,8 +107,8 @@ class HopMetrics:
     """
 
     median_hops: int
-    hops_histogram: Dict[int, int]
-    bins: Tuple[Dict[str, int], ...]
+    hops_histogram: Mapping[int, int]
+    bins: Tuple[Mapping[str, int], ...]
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -174,7 +175,7 @@ class DeadEndLedger:
     total: int
     resolved_rate: float
     rows: Tuple[DeadEndRow, ...]
-    counts: Dict[str, int]
+    counts: Mapping[str, int]
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -286,7 +287,7 @@ class TelemetryProjection:
             nodes_live=live_nodes_count,
             edges_total=len(graph.edges),
             untyped_edges=graph.untyped_edges,
-            type_counts=dict(graph.type_counts()),
+            type_counts=MappingProxyType(dict(graph.type_counts())),
         )
 
         # 3. Walk summary
@@ -300,10 +301,12 @@ class TelemetryProjection:
         )
 
         # 4. Hop metrics (preserves Walk.hops under its existing name)
-        bins_data = tuple(_hop_histogram(walker, span=hop_span))
+        bins_data = tuple(
+            MappingProxyType(dict(b)) for b in _hop_histogram(walker, span=hop_span)
+        )
         hop_metrics = HopMetrics(
             median_hops=walker.median_hops(),
-            hops_histogram=dict(walker.hop_histogram()),
+            hops_histogram=MappingProxyType(dict(walker.hop_histogram())),
             bins=bins_data,
         )
 
@@ -339,7 +342,7 @@ class TelemetryProjection:
             total=dead_walks_count,
             resolved_rate=round(walker.resolved_rate, 4),
             rows=dead_rows,
-            counts=dict(dead_counts),
+            counts=MappingProxyType(dict(dead_counts)),
         )
 
         # 7. Token savings

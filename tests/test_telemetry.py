@@ -163,7 +163,7 @@ class TelemetryProjectionDeterminismTest(unittest.TestCase):
         self.assertEqual(proj1, proj2)
         self.assertEqual(proj1.to_dict(), proj2.to_dict())
 
-    def test_projections_are_immutable(self) -> None:
+    def test_projections_are_shallow_immutable(self) -> None:
         graph, walker, build = _create_sample_engine()
         proj = project_telemetry(graph=graph, walker=walker, build=build)
 
@@ -172,6 +172,48 @@ class TelemetryProjectionDeterminismTest(unittest.TestCase):
 
         with self.assertRaises(dataclasses.FrozenInstanceError):
             proj.build.number = 999  # type: ignore[misc]
+
+    def test_nested_collections_are_deeply_immutable(self) -> None:
+        graph, walker, build = _create_sample_engine()
+        proj = project_telemetry(graph=graph, walker=walker, build=build)
+
+        # 1. GraphTypeMetrics.type_counts refuses item assignment and deletion
+        with self.assertRaises(TypeError):
+            proj.graph.type_counts["entity"] = 999  # type: ignore[index]
+        with self.assertRaises(TypeError):
+            del proj.graph.type_counts["entity"]  # type: ignore[attr-defined]
+
+        # 2. HopMetrics.hops_histogram refuses item assignment and deletion
+        with self.assertRaises(TypeError):
+            proj.hop_metrics.hops_histogram[1] = 999  # type: ignore[index]
+        with self.assertRaises(TypeError):
+            del proj.hop_metrics.hops_histogram[1]  # type: ignore[attr-defined]
+
+        # 3. HopMetrics.bins elements refuse item assignment
+        if proj.hop_metrics.bins:
+            with self.assertRaises(TypeError):
+                proj.hop_metrics.bins[0]["count"] = 999  # type: ignore[index]
+
+        # 4. DeadEndLedger.counts refuses item assignment and deletion
+        with self.assertRaises(TypeError):
+            proj.dead_ends.counts["no_typed_edge"] = 999  # type: ignore[index]
+        with self.assertRaises(TypeError):
+            del proj.dead_ends.counts["no_typed_edge"]  # type: ignore[attr-defined]
+
+        # 5. Row structures are frozen dataclasses
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            proj.build.stages[0].admitted = 999  # type: ignore[misc]
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            proj.edge_traversals.rows[0].traversals = 999  # type: ignore[misc]
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            proj.dead_ends.rows[0].count = 999  # type: ignore[misc]
+        if proj.token_savings.series:
+            with self.assertRaises(dataclasses.FrozenInstanceError):
+                proj.token_savings.series[0].walk = 999  # type: ignore[misc]
+
+        # 6. Tuple collections refuse item assignment
+        with self.assertRaises(TypeError):
+            proj.traversal_grid.cells[0] = 999  # type: ignore[index]
 
 
 class TelemetryZeroObserverEffectTest(unittest.TestCase):
