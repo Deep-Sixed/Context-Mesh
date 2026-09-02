@@ -373,6 +373,11 @@ def reconstruct_decision(
     is reported as ``later``. That is the three-valued discipline failing
     closed, not an omission.
 
+    ``decision_id`` must name a ``decision``. That is this function's rule to
+    enforce and not a caller's to remember: a wrapper that checked it would be
+    a second place where the meaning of "reconstruct a decision" lives, and
+    every caller that is not that wrapper would go unchecked.
+
     Hindsight is gathered from everything the walk reached, the ``undated``
     included. An assumption has no source date, so it can only ever land in
     ``undated`` — and in this system an assumption is the most common thing for
@@ -383,6 +388,15 @@ def reconstruct_decision(
     node = graph.nodes.get(decision_id)
     if node is None:
         raise KeyError(f"{decision_id!r} is not in this graph")
+    # The traversal is defined against a decision: ``_GROUNDING_EDGES`` are the
+    # edges GRAPH.md gives a *decision* for saying why it was made, and the
+    # hindsight pass reads supersession, which only a decision has. Point it at
+    # a claim and none of that is wrong enough to fail — it simply follows the
+    # claim's own edges and hands back a DecisionHistory with a plausible
+    # ``stood_on`` in it. A wrong answer that looks right is worse than a
+    # refusal, so this refuses.
+    if node.type is not NodeType.DECISION:
+        raise ValueError(f"{decision_id!r} is a {node.type.value}, not a decision")
     timeline = Timeline(graph)
 
     stood_on: List[Grounding] = []

@@ -961,7 +961,7 @@ contextmesh_mcp/             read-only MCP server (optional extra, 3.10+)
 dashboard/                   the rebuilt dashboard
 docs/                        the capture spec and the architecture notes
 examples/                    the original standalone control-layer sketch
-tests/                       801 tests over the invariants above
+tests/                       805 tests over the invariants above
 ```
 
 ## Staying publishable

@@ -226,14 +226,19 @@ def mesh_reconstruct_decision(
     Read-only in the strict sense: unlike :func:`mesh_ask` this moves no walk
     telemetry either, because it does not walk — it follows the typed edges a
     decision already carries.
+
+    Every refusal here is the engine's, restated in this layer's vocabulary.
+    Whether an id names a decision is a fact about the graph, so checking it
+    here as well would put the rule in two places and leave every direct Python
+    caller — the engine's whole other audience — unguarded.
     """
-    node = _require_node(session, decision_id)
-    if node.type is not NodeType.DECISION:
-        raise MeshToolError(f"{decision_id!r} is a {node.type.value}, not a decision")
     try:
         history = reconstruct_decision(session.graph, decision_id, as_of, depth=depth)
-    except TemporalError as exc:
-        raise MeshToolError(str(exc)) from None
+    except (KeyError, ValueError) as exc:
+        # KeyError stringifies as the repr of its argument, so read the message
+        # off args. TemporalError is a ValueError, so a loose date lands here
+        # too, and the caller sees one error type for every bad argument.
+        raise MeshToolError(str(exc.args[0]) if exc.args else str(exc)) from None
     return history.to_dict()
 
 

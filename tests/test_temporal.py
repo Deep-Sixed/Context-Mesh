@@ -576,6 +576,27 @@ class WalkingBackFromADecision(unittest.TestCase):
         with self.assertRaises(KeyError):
             reconstruct_decision(self.f["graph"], "decision:never-taken", JUNE_21)
 
+    def test_only_a_decision_can_be_walked_back_from(self):
+        """Every other node type is refused, by the engine and not by a caller.
+
+        Not a defensive nicety. The traversal is defined against a decision, so
+        pointing it at a claim is not wrong enough to fail on its own: it
+        follows the claim's edges and returns a DecisionHistory with a
+        plausible ``stood_on`` in it. Before this refusal existed all four of
+        these came back as answers.
+        """
+        for key in ("measured", "bench", "rebuild", "assumption"):
+            node_id = self.f[key]
+            kind = self.f["graph"].nodes[node_id].type.value
+            with self.assertRaises(ValueError, msg=kind) as caught:
+                reconstruct_decision(self.f["graph"], node_id, JUNE_21)
+            self.assertIn(kind, str(caught.exception))
+            self.assertIn("not a decision", str(caught.exception))
+
+    def test_a_decision_is_still_walked_back_from(self):
+        # The refusal above is worthless if it also turned the real case off.
+        self.assertTrue(self.history(JUNE_21).stood_on)
+
 
 if __name__ == "__main__":
     unittest.main()

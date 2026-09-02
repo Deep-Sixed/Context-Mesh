@@ -192,6 +192,33 @@ class TemporalToolsAreThinTest(unittest.TestCase):
             tools.mesh_reconstruct_decision(self.session, source_id, "2026-03-01")
         self.assertIn("source", str(caught.exception))
 
+    def test_that_refusal_is_the_engine_s_own_and_is_only_translated(self):
+        """The failure contract is thin too, not just the success path.
+
+        The equality tests above prove the wrapper does not reshape a
+        successful answer. This proves it does not *originate* a refusal: the
+        engine rejects the same input, and the tool's message is the engine's
+        message rather than one this layer composed. Re-add an independent
+        check here and the two messages stop matching.
+        """
+        source_id = next(
+            n.id for n in self.session.graph.nodes.values() if n.type is NodeType.SOURCE
+        )
+        with self.assertRaises(ValueError) as from_engine:
+            reconstruct_decision(self.session.graph, source_id, "2026-03-01")
+        with self.assertRaises(tools.MeshToolError) as from_tool:
+            tools.mesh_reconstruct_decision(self.session, source_id, "2026-03-01")
+        self.assertEqual(str(from_tool.exception), str(from_engine.exception))
+
+    def test_an_absent_decision_is_refused_with_the_engine_s_message(self):
+        # KeyError stringifies as a repr, so a wrapper that passed str(exc)
+        # straight through would hand the caller a double-quoted message.
+        with self.assertRaises(KeyError) as from_engine:
+            reconstruct_decision(self.session.graph, "decision:nope", "2026-03-01")
+        with self.assertRaises(tools.MeshToolError) as from_tool:
+            tools.mesh_reconstruct_decision(self.session, "decision:nope", "2026-03-01")
+        self.assertEqual(str(from_tool.exception), from_engine.exception.args[0])
+
     def test_an_unknown_decision_is_refused(self):
         with self.assertRaises(tools.MeshToolError):
             tools.mesh_reconstruct_decision(self.session, "decision:nope", "2026-03-01")
