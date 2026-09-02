@@ -232,13 +232,19 @@ def run(*, rounds: int = 40, reject: bool = True) -> DemoResult:
 
     invalidation: Optional[InvalidationReport] = None
     if reject:
+        source = graph.add_node(
+            NodeType.SOURCE,
+            "Postmortem 233",
+            id="source:postmortem-233",
+            attrs={"origin": "incident-review", "retrieved_at": "2026-07-08"},
+        )
         evidence = graph.add_node(
             NodeType.EVIDENCE,
             "Postmortem 233: one tenant held 31% of chunks in a single shard, "
             "which exceeded the 4GB per-shard build ceiling",
             attrs={"kind": "postmortem"},
             provenance=Provenance(
-                source_id="source:postmortem-233",
+                source_id=source.id,
                 extractor="incident-review",
                 checks=["reproduced", "signed-off"],
                 recorded_at_build=graph.build,
