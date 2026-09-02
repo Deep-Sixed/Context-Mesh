@@ -93,7 +93,6 @@ def calendar():
     )
     # Evidence is dated through its provenance, not through an edge: GRAPH.md
     # gives ``derived_from`` to claims and entities, and the ontology says so.
-    graph.add_edge(contradiction.id, EdgeType.CONTRADICTS, assumption.id)
     ledger.reject(assumption.id, evidence_id=contradiction.id)
 
     # A July claim wired under the June decision as if it had supported it.
@@ -596,6 +595,106 @@ class WalkingBackFromADecision(unittest.TestCase):
     def test_a_decision_is_still_walked_back_from(self):
         # The refusal above is worthless if it also turned the real case off.
         self.assertTrue(self.history(JUNE_21).stood_on)
+
+
+class Rule7TemporalHorizonTest(unittest.TestCase):
+    """Rule 7 temporal horizon proof: evidence source time T governs reconstruction."""
+
+    def setUp(self):
+        self.f = calendar()
+        self.graph = self.f["graph"]
+        self.assumption_id = self.f["assumption"]
+        self.decision_id = self.f["decision"]
+        self.rebuild_id = self.f["rebuild"]
+        # Contradiction evidence source date T is JULY_08
+        self.t_evidence = JULY_08
+        self.t_before = date(2026, 7, 7)
+        self.t_after = date(2026, 7, 9)
+
+    def test_horizon_before_evidence_source_date_reconstructs_as_active(self):
+        # as_of < T: assumption is ACTIVE, contradiction edge has not taken effect,
+        # and downstream work is alive.
+        projection = as_of_graph(self.graph, self.t_before)
+        assumption = projection.assumptions[self.assumption_id]
+
+        self.assertIs(assumption.status, AssumptionStatus.ACTIVE)
+        self.assertIsNone(assumption.rejected_at_build)
+        self.assertFalse(projection.node(self.assumption_id).invalidated)
+        self.assertTrue(projection.node(self.decision_id).live)
+        self.assertTrue(projection.node(self.rebuild_id).live)
+
+    def test_horizon_at_evidence_source_date_reconstructs_as_rejected(self):
+        # as_of = T: assumption is REJECTED, contradiction is effective,
+        # and downstream work is invalidated.
+        projection = as_of_graph(self.graph, self.t_evidence)
+        assumption = projection.assumptions[self.assumption_id]
+
+        self.assertIs(assumption.status, AssumptionStatus.REJECTED)
+        self.assertIsNotNone(assumption.rejected_at_build)
+        self.assertTrue(projection.node(self.assumption_id).invalidated)
+        self.assertFalse(projection.node(self.decision_id).live)
+        self.assertFalse(projection.node(self.rebuild_id).live)
+
+    def test_horizon_after_evidence_source_date_remains_durably_rejected(self):
+        # as_of > T: rejection remains historically durable and downstream work does not resurrect.
+        projection = as_of_graph(self.graph, self.t_after)
+        assumption = projection.assumptions[self.assumption_id]
+
+        self.assertIs(assumption.status, AssumptionStatus.REJECTED)
+        self.assertIsNotNone(assumption.rejected_at_build)
+        self.assertTrue(projection.node(self.assumption_id).invalidated)
+        self.assertFalse(projection.node(self.decision_id).live)
+        self.assertFalse(projection.node(self.rebuild_id).live)
+
+    def test_horizon_derives_strictly_from_evidence_source_clock_not_build_counter(self):
+        # Even if rejected at a much later processing build, the historical fall
+        # horizon is anchored strictly to the evidence source date T.
+        graph = ContextGraph()
+        graph.build = 1
+        ledger = AssumptionLedger(graph)
+        decisions = DecisionLog(graph)
+
+        src_june = _source(graph, "src-june", JUNE_21, "Source June")
+        assumption = ledger.assume("Shards grow linearly")
+        decision = decisions.decide(
+            "June partition plan",
+            "Initial decision",
+            source_id=src_june.id,
+            assumptions=[assumption.id],
+        )
+
+        # Rejection happens at build 99, but evidence is grounded in a 2026-07-08 document
+        graph.build = 99
+        src_july = _source(graph, "src-july", JULY_08, "Source July")
+        contradiction = graph.add_node(
+            NodeType.EVIDENCE,
+            "Skew disproof",
+            provenance=Provenance(source_id=src_july.id, recorded_at_build=99),
+        )
+        ledger.reject(assumption.id, evidence_id=contradiction.id)
+
+        # Before evidence date: ACTIVE despite high build counter
+        proj_before = as_of_graph(graph, date(2026, 7, 7))
+        self.assertIs(proj_before.assumptions[assumption.id].status, AssumptionStatus.ACTIVE)
+        self.assertTrue(proj_before.node(decision.id).live)
+
+        # At/after evidence date: REJECTED
+        proj_at = as_of_graph(graph, JULY_08)
+        self.assertIs(proj_at.assumptions[assumption.id].status, AssumptionStatus.REJECTED)
+        self.assertFalse(proj_at.node(decision.id).live)
+
+    def test_temporal_reconstruction_is_preserved_across_snapshot_round_trip(self):
+        # Verify that serializing and reloading the graph preserves exact temporal reconstruction
+        payload = self.graph.to_dict()
+        reloaded = ContextGraph.from_dict(payload)
+
+        proj_before = as_of_graph(reloaded, self.t_before)
+        self.assertIs(proj_before.assumptions[self.assumption_id].status, AssumptionStatus.ACTIVE)
+        self.assertTrue(proj_before.node(self.decision_id).live)
+
+        proj_at = as_of_graph(reloaded, self.t_evidence)
+        self.assertIs(proj_at.assumptions[self.assumption_id].status, AssumptionStatus.REJECTED)
+        self.assertFalse(proj_at.node(self.decision_id).live)
 
 
 if __name__ == "__main__":
