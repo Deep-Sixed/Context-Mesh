@@ -8,11 +8,16 @@ Verifies:
 4. Zero observer effect: taking a projection does not mutate graph, walker, or build state.
 5. Invariant preservation: Walk.hops is preserved under 'hops' (no answer_depth),
    and no timing/live-event modifications are introduced.
+6. Structural immutability: the deep-immutability guarantee holds for any
+   construction path, not only project(), and to_dict() remains the one
+   mutable boundary out.
 """
 
 from __future__ import annotations
 
+import copy
 import dataclasses
+import json
 import unittest
 
 from contextmesh import (
@@ -23,6 +28,7 @@ from contextmesh import (
     documents,
     project_telemetry,
 )
+from contextmesh.telemetry import DeadEndLedger, DeadEndRow, GraphTypeMetrics, HopMetrics
 
 
 def _create_sample_engine() -> tuple[ContextGraph, Walker, BuildReport]:
@@ -214,6 +220,96 @@ class TelemetryProjectionDeterminismTest(unittest.TestCase):
         # 6. Tuple collections refuse item assignment
         with self.assertRaises(TypeError):
             proj.traversal_grid.cells[0] = 999  # type: ignore[index]
+
+
+class TelemetryStructuralImmutabilityTest(unittest.TestCase):
+    """The guarantee has to survive construction that does not go through project().
+
+    Wrapping the mappings where project() assembles them makes every
+    projection *it* builds safe, and says nothing about one built any other
+    way -- a test fixture, an adapter, a future caller assembling a section
+    by hand. Coercing in ``__post_init__`` instead moves the guarantee into
+    the type, so there is no construction path that quietly opts out of it.
+    """
+
+    def test_a_section_built_by_hand_is_immutable_too(self) -> None:
+        metrics = GraphTypeMetrics(
+            nodes_total=1,
+            nodes_live=1,
+            edges_total=0,
+            untyped_edges=0,
+            type_counts={"claim": 1},
+        )
+        with self.assertRaises(TypeError):
+            metrics.type_counts["claim"] = 2  # type: ignore[index]
+
+        hops = HopMetrics(median_hops=1, hops_histogram={1: 1}, bins=[{"hops": 1, "count": 1}])
+        with self.assertRaises(TypeError):
+            hops.bins[0]["count"] = 2  # type: ignore[index]
+        self.assertIsInstance(hops.bins, tuple, "a list of bins stayed a list")
+
+        ledger = DeadEndLedger(
+            total=0,
+            resolved_rate=1.0,
+            rows=[DeadEndRow(reason="r", label="R", count=0)],
+            counts={"r": 0},
+        )
+        self.assertIsInstance(ledger.rows, tuple, "a list of rows stayed a list")
+        with self.assertRaises(TypeError):
+            ledger.counts["r"] = 1  # type: ignore[index]
+
+    def test_a_caller_holding_the_source_mapping_cannot_reach_inside(self) -> None:
+        """A view over the caller's own dict is still the caller's to edit."""
+        source = {"claim": 1}
+        metrics = GraphTypeMetrics(
+            nodes_total=1,
+            nodes_live=1,
+            edges_total=0,
+            untyped_edges=0,
+            type_counts=source,
+        )
+        source["claim"] = 999
+        self.assertEqual(metrics.type_counts["claim"], 1)
+
+
+class TelemetrySerializationBoundaryTest(unittest.TestCase):
+    """to_dict() is the one place a projection becomes mutable again."""
+
+    def setUp(self) -> None:
+        self.graph, self.walker, self.build = _create_sample_engine()
+        self.projection = project_telemetry(graph=self.graph, walker=self.walker, build=self.build)
+
+    def test_to_dict_returns_plain_mutable_containers(self) -> None:
+        payload = self.projection.to_dict()
+        self.assertIs(type(payload["graph"]["type_counts"]), dict)
+        self.assertIs(type(payload["hop_metrics"]["hops_histogram"]), dict)
+        self.assertIs(type(payload["dead_ends"]["counts"]), dict)
+        self.assertIs(type(payload["hop_metrics"]["bins"]), list)
+        self.assertIs(type(payload["dead_ends"]["rows"]), list)
+        self.assertIs(type(payload["traversal_grid"]["cells"]), list)
+        if payload["hop_metrics"]["bins"]:
+            self.assertIs(type(payload["hop_metrics"]["bins"][0]), dict)
+
+        # Editable, which is the whole point of the boundary.
+        payload["graph"]["type_counts"]["claim"] = -1
+        payload["dead_ends"]["rows"].append({"forged": True})
+
+    def test_editing_the_serialized_copy_does_not_reach_the_projection(self) -> None:
+        before = self.projection.to_dict()
+        payload = self.projection.to_dict()
+        payload["graph"]["type_counts"]["claim"] = -1
+        payload["hop_metrics"]["hops_histogram"][42] = 777
+        payload["dead_ends"]["counts"]["forged"] = 1
+        payload["traversal_grid"]["cells"].append(9)
+        if payload["hop_metrics"]["bins"]:
+            payload["hop_metrics"]["bins"][0]["count"] = 555
+
+        self.assertEqual(self.projection.to_dict(), before)
+
+    def test_the_serialized_copy_is_json_encodable_and_copyable(self) -> None:
+        payload = self.projection.to_dict()
+        self.assertEqual(json.loads(json.dumps(payload))["graph"], payload["graph"])
+        self.assertEqual(copy.deepcopy(payload), payload)
 
 
 class TelemetryZeroObserverEffectTest(unittest.TestCase):

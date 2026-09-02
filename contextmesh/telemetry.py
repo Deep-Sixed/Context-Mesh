@@ -2,6 +2,24 @@
 
 Exposes what ContextGraph, Walker, and BuildReport already authoritatively
 record without mutating engine state or altering execution behavior.
+
+No duplicate semantic algorithms; projection performs read-only aggregation
+over existing authoritative engine state and methods.
+
+Immutability here is deep, not shallow. ``frozen=True`` stops an attribute
+being rebound, but it leaves a nested ``dict`` -- or a ``dict`` sitting
+inside a tuple -- fully writable, so a caller could edit a projection in
+place and watch the edit surface again in :meth:`to_dict`. Every container
+is therefore coerced to an immutable form in ``__post_init__`` rather than
+at the point of construction: tuples for sequences, read-only views for
+mappings. Doing it in the dataclass makes the guarantee structural, so it
+holds for anything that builds one of these by hand and does not depend on
+:meth:`TelemetryProjection.project` remaining the only way in.
+
+:meth:`to_dict` is the mutable serialization boundary, and stays one. It
+copies each read-only view back out into a plain ``dict`` or ``list``, so
+callers get something they may freely edit, JSON-encode, or hand onward
+without reaching back into the projection it came from.
 """
 
 from __future__ import annotations
@@ -16,6 +34,16 @@ from .pipeline import BuildReport
 from .traverse import DeadEnd, Walker
 
 
+def _frozen_mapping(mapping: Mapping[Any, Any]) -> Mapping[Any, Any]:
+    """A read-only view over a *private copy* of ``mapping``.
+
+    The copy earns its keep as much as the view does: wrapping the caller's
+    own dict would leave them holding a writable handle on the projection's
+    insides, which is the same defect one indirection further out.
+    """
+    return MappingProxyType(dict(mapping))
+
+
 @dataclass(frozen=True)
 class StageMetrics:
     """Read-only metrics for a single build pipeline stage."""
@@ -25,6 +53,9 @@ class StageMetrics:
     admitted: int
     dropped: int
     notes: Tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "notes", tuple(self.notes))
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -48,6 +79,9 @@ class BuildMetrics:
     pruned_nodes: int
     stages: Tuple[StageMetrics, ...]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "stages", tuple(self.stages))
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "number": self.number,
@@ -69,6 +103,9 @@ class GraphTypeMetrics:
     edges_total: int
     untyped_edges: int
     type_counts: Mapping[str, int]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "type_counts", _frozen_mapping(self.type_counts))
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -110,6 +147,10 @@ class HopMetrics:
     hops_histogram: Mapping[int, int]
     bins: Tuple[Mapping[str, int], ...]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "hops_histogram", _frozen_mapping(self.hops_histogram))
+        object.__setattr__(self, "bins", tuple(_frozen_mapping(b) for b in self.bins))
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "median_hops": self.median_hops,
@@ -144,6 +185,9 @@ class EdgeTraversals:
     untyped: int
     rows: Tuple[EdgeLedgerRow, ...]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "rows", tuple(self.rows))
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "total": self.total,
@@ -177,6 +221,10 @@ class DeadEndLedger:
     rows: Tuple[DeadEndRow, ...]
     counts: Mapping[str, int]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "rows", tuple(self.rows))
+        object.__setattr__(self, "counts", _frozen_mapping(self.counts))
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "total": self.total,
@@ -208,6 +256,9 @@ class TokenSavings:
     walk_typical: int
     series: Tuple[TokenSeriesPoint, ...]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "series", tuple(self.series))
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "saving": self.saving,
@@ -225,6 +276,9 @@ class TraversalGrid:
 
     cells: Tuple[int, ...]
     capacity: int
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "cells", tuple(self.cells))
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -287,7 +341,7 @@ class TelemetryProjection:
             nodes_live=live_nodes_count,
             edges_total=len(graph.edges),
             untyped_edges=graph.untyped_edges,
-            type_counts=MappingProxyType(dict(graph.type_counts())),
+            type_counts=graph.type_counts(),
         )
 
         # 3. Walk summary
@@ -301,13 +355,10 @@ class TelemetryProjection:
         )
 
         # 4. Hop metrics (preserves Walk.hops under its existing name)
-        bins_data = tuple(
-            MappingProxyType(dict(b)) for b in _hop_histogram(walker, span=hop_span)
-        )
         hop_metrics = HopMetrics(
             median_hops=walker.median_hops(),
-            hops_histogram=MappingProxyType(dict(walker.hop_histogram())),
-            bins=bins_data,
+            hops_histogram=walker.hop_histogram(),
+            bins=_hop_histogram(walker, span=hop_span),
         )
 
         # 5. Edge traversals
@@ -342,7 +393,7 @@ class TelemetryProjection:
             total=dead_walks_count,
             resolved_rate=round(walker.resolved_rate, 4),
             rows=dead_rows,
-            counts=MappingProxyType(dict(dead_counts)),
+            counts=dead_counts,
         )
 
         # 7. Token savings
@@ -386,7 +437,12 @@ class TelemetryProjection:
         )
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert projection to serializable dictionary."""
+        """The mutable serialization boundary, in plain dicts and lists.
+
+        The projection itself is deeply immutable; what comes back from here
+        is a fresh, freely editable copy. Callers may mutate it, encode it,
+        or pass it on without any of that reaching the projection.
+        """
         return {
             "build": self.build.to_dict(),
             "graph": self.graph.to_dict(),
