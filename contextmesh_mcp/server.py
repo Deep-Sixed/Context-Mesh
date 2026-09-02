@@ -160,6 +160,28 @@ def mesh_blast_radius(assumption_id: str) -> str:
     return _run("mesh_blast_radius", {"assumption_id": assumption_id})
 
 
+@mcp.tool(
+    name="mesh_explain_as_of",
+    description=tools.TOOLS["mesh_explain_as_of"]["description"],
+)
+def mesh_explain_as_of(question: str, as_of: str) -> str:
+    # ``mutates`` stays off. ``mesh_ask`` sets it because a walk moves
+    # telemetry; this walks a projection built for the call and thrown away
+    # after it, so the live graph counts nothing.
+    return _run("mesh_explain_as_of", {"question": question, "as_of": as_of})
+
+
+@mcp.tool(
+    name="mesh_reconstruct_decision",
+    description=tools.TOOLS["mesh_reconstruct_decision"]["description"],
+)
+def mesh_reconstruct_decision(decision_id: str, as_of: str, depth: int = 3) -> str:
+    return _run(
+        "mesh_reconstruct_decision",
+        {"decision_id": decision_id, "as_of": as_of, "depth": depth},
+    )
+
+
 # ── controlled writes ────────────────────────────────────────────────────
 @mcp.tool(
     name="mesh_submit_evidence",

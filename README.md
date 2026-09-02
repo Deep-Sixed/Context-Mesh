@@ -855,9 +855,16 @@ contextmesh-mcp --session ./session  # a graph that outlives it
 ```
 
 An MCP server over the graph, so an agent can query it as memory instead of
-being handed chunks. Five tools — `mesh_ask`, `mesh_get_node`, `mesh_health`,
-`mesh_lineage`, `mesh_blast_radius` — plus `contextmesh://schema`, `health`,
+being handed chunks. Seven tools — `mesh_ask`, `mesh_get_node`, `mesh_health`,
+`mesh_lineage`, `mesh_blast_radius`, `mesh_explain_as_of`,
+`mesh_reconstruct_decision` — plus `contextmesh://schema`, `health`,
 `session`, `assumptions`, and templates for `node/{id}` and `assumption/{id}`.
+
+The last two answer from the graph *as it stood* rather than as it is. They
+are wrappers and nothing else: every temporal rule lives in
+`contextmesh/temporal.py` and `contextmesh/reconstruct.py`, and
+`tests/test_mcp.py` asserts the tool returns exactly what the engine returns,
+so a rule cannot start living in two places.
 
 ```json
 {
@@ -939,6 +946,10 @@ contextmesh/
   assumptions.py             versioned assumptions, blast radius, rejection
   execute.py                 re-runs exactly the closure an invalidation felled
   decisions.py               append-only decision history
+  temporal.py                source time vs processing time, and the graph as
+                             it stood on a given date
+  reconstruct.py             answering from that past graph, and walking back
+                             from a decision to the reasons it stood on
   health.py                  the signals that make a graph quietly useless
   metrics.py                 the dashboard payload
   corpus.py  demo.py  cli.py the worked example
@@ -950,7 +961,7 @@ contextmesh_mcp/             read-only MCP server (optional extra, 3.10+)
 dashboard/                   the rebuilt dashboard
 docs/                        the capture spec and the architecture notes
 examples/                    the original standalone control-layer sketch
-tests/                       733 tests over the invariants above
+tests/                       805 tests over the invariants above
 ```
 
 ## Staying publishable
