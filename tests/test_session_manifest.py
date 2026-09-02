@@ -7,17 +7,39 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from contextmesh.evidence import submit_evidence
 from contextmesh.execute import Runner, TaskRegistry
+from contextmesh.model import NodeType
 from contextmesh_mcp.session import Session, SessionError, live_manifest_path
 
 
 class Advisory:
     def __init__(self) -> None:
-        self.published = False
+        self.evidence_id = None
+
+    def publish(self, graph, *, retrieved_at="2026-07-08"):
+        """The CVE arrives the way anything from outside does: a dated source,
+        then an observation ingested against it. The auditor reads it; rule 7
+        will not let it write its own."""
+        source = graph.add_node(
+            NodeType.SOURCE,
+            "Security advisory feed",
+            id="source:advisory-feed",
+            attrs={"origin": "advisory-feed", "retrieved_at": retrieved_at},
+        )
+        self.evidence_id = submit_evidence(
+            graph,
+            text="CVE-2026-9999 published for argon2id",
+            source_id=source.id,
+            metadata={"package": "argon2"},
+        ).evidence_id
+        return self.evidence_id
 
     def __call__(self, ctx):
-        if self.published and ctx.output.get("impl") == "argon2":
-            return ctx.disproved("CVE-2026-9999 published for argon2id")
+        if self.evidence_id and ctx.output.get("impl") == "argon2":
+            return ctx.disproved(
+                "CVE-2026-9999 published for argon2id", evidence_id=self.evidence_id
+            )
         return True
 
 
@@ -57,7 +79,7 @@ def session_with_a_plan():
         produces=("Tokens",),
     )
     runner.run()
-    advisory.published = True
+    advisory.publish(runner.graph)
     runner.recheck()
     runner.repair(
         "hashing",

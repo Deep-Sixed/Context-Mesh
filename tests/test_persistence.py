@@ -743,7 +743,25 @@ class AssumptionMirrorTest(unittest.TestCase):
         graph.build = 1
         ledger = AssumptionLedger(graph)
         original = ledger.assume("shards grow linearly")
-        report = ledger.reject(original.id, replacement="shards grow with tenant skew")
+        # The witness is incidental to what this test asserts — that the node
+        # and the record agree after a replacement — but rule 7 requires one,
+        # and it has to be datable.
+        source = graph.add_node(
+            NodeType.SOURCE,
+            "Postmortem 233",
+            attrs={"origin": "incident-review", "retrieved_at": "2026-07-08"},
+        )
+        evidence = graph.add_node(
+            NodeType.EVIDENCE,
+            "one tenant held 31% of chunks in a single shard",
+            attrs={"kind": "postmortem"},
+            provenance=Provenance(source_id=source.id, recorded_at_build=graph.build),
+        )
+        report = ledger.reject(
+            original.id,
+            evidence_id=evidence.id,
+            replacement="shards grow with tenant skew",
+        )
         self.assertIsNotNone(report.replacement_id)
         replacement = graph.assumptions[report.replacement_id]
         self.assertEqual(replacement.version, original.version + 1)

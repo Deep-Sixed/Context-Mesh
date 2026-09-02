@@ -46,6 +46,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from .assumptions import AssumptionLedger, InvalidationReport
 from .decisions import DecisionLog
+from .evidence import submit_evidence
 from .graph import ContextGraph
 from .model import Assumption, AssumptionStatus, EdgeType, NodeType, slug
 
@@ -119,11 +120,23 @@ class Verdict:
     blast radii, and an auditor that cannot say which one it found forces the
     engine to guess. A plain failure fails one task; a disproof rejects an
     assumption and takes down everything that stood on it.
+
+    ``evidence_id`` names the already-ingested EVIDENCE node the disproof
+    rests on. An auditor may conclude that evidence disproves an assumption;
+    it may not create the evidence out of its own conclusion, because evidence
+    minted from the finding it is supposed to support proves only that the
+    auditor said so. GRAPH.md rule 7 wants an answer inside the graph, and a
+    rejection is a historical transition, so that answer has to be an
+    observation that came from somewhere and can be placed in time.
+
+    It is optional here and required at the rejection boundary: old code may
+    still build a verdict without it, but it may no longer use one to reject.
     """
 
     ok: bool
     reason: str
     disproves: bool = False
+    evidence_id: Optional[str] = None
 
 
 def _coerce(result: Any) -> Verdict:
@@ -165,9 +178,14 @@ class AuditContext:
         """The work is wrong. Fails this task; invalidates nothing."""
         return Verdict(False, reason)
 
-    def disproved(self, reason: str) -> Verdict:
-        """The ground is false. Rejects the assumption and invalidates its radius."""
-        return Verdict(False, reason, disproves=True)
+    def disproved(self, reason: str, *, evidence_id: Optional[str] = None) -> Verdict:
+        """The ground is false. Rejects the assumption and invalidates its radius.
+
+        ``evidence_id`` names the observation that disproves it — an EVIDENCE
+        node already in the graph, not one this verdict asks to have created.
+        Rule 7 refuses the rejection without it.
+        """
+        return Verdict(False, reason, disproves=True, evidence_id=evidence_id)
 
 
 Worker = Callable[[RunContext], Dict[str, Any]]
@@ -1654,7 +1672,7 @@ class Runner:
             if verdict.ok:
                 continue
             if verdict.disproves:
-                reports.append(self._disprove(task, assumption, verdict.reason))
+                reports.append(self._disprove(task, assumption, verdict))
             else:
                 task.state = TaskState.FAILED
                 self.ledger.record(
@@ -2128,7 +2146,7 @@ class Runner:
         )
         if not verdict.ok:
             if verdict.disproves:
-                return self._disprove(task, assumption, verdict.reason)
+                return self._disprove(task, assumption, verdict)
             task.state = TaskState.FAILED
             self.ledger.record(
                 self.round, Event.FAILED, task.name, verdict.reason, assumption_id=assumption.id
@@ -2203,15 +2221,33 @@ class Runner:
         )
 
     def _disprove(
-        self, task: Task, assumption: Assumption, reason: str
+        self, task: Task, assumption: Assumption, verdict: Verdict
     ) -> InvalidationReport:
-        """An auditor found the ground false. Reject it and mark what fell."""
-        evidence = self.graph.add_node(
-            NodeType.EVIDENCE,
-            f"disproof from {task.name}: {reason}",
-            attrs={"kind": "disproof"},
-        )
-        report = self.assumptions.reject(assumption.id, evidence_id=evidence.id)
+        """An auditor found the ground false. Reject it and mark what fell.
+
+        The observation has to arrive from outside. This used to mint an
+        EVIDENCE node out of the auditor's own ``reason`` string and hand it
+        straight back as the proof — the runner concluding the ground was
+        false, then manufacturing the evidence that said so. Circular, and
+        undatable: a node invented mid-run has no source, so every temporal
+        projection reported the assumption still standing (GRAPH.md rule 7,
+        and *Declared, not yet realized*).
+
+        So the auditor now names evidence that is already in the graph, put
+        there by the ordinary intake path with provenance to a real source.
+        The runner still decides what the observation *means* for this task;
+        it no longer supplies the observation.
+        """
+        reason = verdict.reason
+        if not verdict.evidence_id:
+            raise ExecutionError(
+                f"{task.name}: the audit disproved {assumption.id!r} but bound no "
+                f"evidence. GRAPH.md rule 7 rejects an assumption only on evidence "
+                f"that contradicts it, so the auditor must name an already-ingested "
+                f"EVIDENCE node — ctx.disproved(reason, evidence_id=...)"
+            )
+        report = self.assumptions.reject(assumption.id, evidence_id=verdict.evidence_id)
+        evidence = self.graph.node(verdict.evidence_id)
 
         # The whole event as one entry: which ground failed, what disproved it,
         # exactly what fell and by which chain, and what was deliberately left
@@ -2286,13 +2322,22 @@ class Advisories:
     appears outside the graph, and the hashing auditor *discovers* it on the
     next recheck. If the auditor were removed, nothing would fall over, which
     is exactly the property a fake demo cannot have.
+
+    It maps a package to the id of an **already-ingested** EVIDENCE node, not
+    to advisory prose. The observation and its date belong to the ordinary
+    intake path — a SOURCE the caller dates, evidence submitted against it —
+    and this feed only says which of those observations is now relevant. That
+    keeps the demo honest about where a disproof comes from without turning a
+    stand-in into a security-feed domain model with its own publication
+    semantics.
     """
 
     def __init__(self, open_advisories: Iterable[Tuple[str, str]] = ()) -> None:
         self._open: Dict[str, str] = dict(open_advisories)
 
-    def publish(self, package: str, advisory: str) -> None:
-        self._open[package] = advisory
+    def publish(self, package: str, evidence_id: str) -> None:
+        """Flag a package, naming the evidence node that already records why."""
+        self._open[package] = evidence_id
 
     def withdraw(self, package: str) -> None:
         self._open.pop(package, None)
@@ -2301,6 +2346,7 @@ class Advisories:
         return package not in self._open
 
     def advisory(self, package: str) -> Optional[str]:
+        """The id of the evidence against this package, or None."""
         return self._open.get(package)
 
 
@@ -2324,13 +2370,22 @@ def _hasher(package: str, params: str, artefact: str) -> Worker:
 
 
 def _audit_hashing(feed: Advisories) -> Auditor:
-    """The only auditor that reads the world instead of just the output."""
+    """The only auditor that reads the world instead of just the output.
+
+    What it reads is an observation someone else already put in the graph. It
+    judges what that observation means for this task and binds its id to the
+    verdict; it does not write the observation down itself.
+    """
 
     def audit(ctx: AuditContext) -> Verdict:
         package = ctx.output["package"]
-        advisory = feed.advisory(package)
-        if advisory is not None:
-            return ctx.disproved(f"{package} has an open advisory — {advisory}")
+        evidence_id = feed.advisory(package)
+        if evidence_id is not None:
+            observation = ctx.graph.node(evidence_id).label
+            return ctx.disproved(
+                f"{package} has an open advisory — {observation}",
+                evidence_id=evidence_id,
+            )
         return ctx.ok(f"{package} carries no open advisory")
 
     return audit
@@ -2410,8 +2465,27 @@ def demo(feed: Optional[Advisories] = None) -> DemoRun:
 
     runner.run()
 
-    # The world moves. Nothing in the graph is touched by this line.
-    feed.publish("argon2-cffi", "CVE-2026-9999: memory-hard parameters silently downgraded")
+    # The world moves. The advisory arrives the way anything from outside
+    # arrives: a dated source, then an observation ingested against it. The
+    # date is the publication date the caller knows, not a clock read here —
+    # the ledger stays timeless and the build counters keep ordering the work.
+    # This is what lets a July disproof be absent from a June reconstruction
+    # instead of silently true at every horizon.
+    advisory_source = runner.graph.add_node(
+        NodeType.SOURCE,
+        "Security advisory feed",
+        id="source:advisory-feed",
+        attrs={"origin": "advisory-feed", "retrieved_at": "2026-07-08"},
+    )
+    advisory = submit_evidence(
+        runner.graph,
+        text="CVE-2026-9999: memory-hard parameters silently downgraded",
+        source_id=advisory_source.id,
+        metadata={"package": "argon2-cffi", "advisory": "CVE-2026-9999"},
+    )
+    # Only now does the feed know about it, and all it knows is which
+    # observation to point at.
+    feed.publish("argon2-cffi", advisory.evidence_id)
 
     invalidations = runner.recheck()
 

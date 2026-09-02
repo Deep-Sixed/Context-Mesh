@@ -29,6 +29,7 @@ its own contents.
 import json
 import unittest
 
+from contextmesh.evidence import submit_evidence
 from contextmesh.execute import (
     EXECUTION_SCHEMA,
     EXECUTION_VERSION,
@@ -52,11 +53,35 @@ class Advisory:
     """
 
     def __init__(self):
-        self.published = False
+        self.evidence_id = None
+
+    def publish(self, graph, *, retrieved_at="2026-07-08"):
+        """The CVE arrives the way anything from outside does.
+
+        A dated source, then an observation ingested against it. The auditor
+        below reads that observation; it never writes it. Rule 7 needs the
+        disproof to have come from somewhere and to be placeable in time, and
+        an auditor that mints its own evidence can offer neither.
+        """
+        source = graph.add_node(
+            NodeType.SOURCE,
+            "Security advisory feed",
+            id="source:advisory-feed",
+            attrs={"origin": "advisory-feed", "retrieved_at": retrieved_at},
+        )
+        self.evidence_id = submit_evidence(
+            graph,
+            text="CVE-2026-9999 published for argon2id",
+            source_id=source.id,
+            metadata={"package": "argon2"},
+        ).evidence_id
+        return self.evidence_id
 
     def __call__(self, ctx):
-        if self.published and ctx.output.get("impl") == "argon2":
-            return ctx.disproved("CVE-2026-9999 published for argon2id")
+        if self.evidence_id and ctx.output.get("impl") == "argon2":
+            return ctx.disproved(
+                "CVE-2026-9999 published for argon2id", evidence_id=self.evidence_id
+            )
         return True
 
 
@@ -91,7 +116,7 @@ def to_the_boundary():
     advisory = Advisory()
     runner = plan(deployment(advisory))
     runner.run()
-    advisory.published = True
+    advisory.publish(runner.graph)
     runner.recheck()
     runner.repair("hashing", assumes="bcrypt has no open advisory",
                   worker_key="auth.hash.bcrypt.v1")
@@ -793,7 +818,7 @@ class ArgonToBcryptRestartTest(unittest.TestCase):
         restarted, _ = to_the_boundary()
 
         published = Advisory()
-        published.published = True
+        published.publish(restarted.graph)
         restored = Runner.from_snapshot(
             restarted.snapshot(), graph=restarted.graph,
             registry=deployment(published), ledger=restarted.ledger,
@@ -811,7 +836,7 @@ class ArgonToBcryptRestartTest(unittest.TestCase):
     def test_the_unaffected_tasks_never_reran(self):
         runner, _ = to_the_boundary()
         published = Advisory()
-        published.published = True
+        published.publish(runner.graph)
         restored = Runner.from_snapshot(
             runner.snapshot(), graph=runner.graph,
             registry=deployment(published), ledger=runner.ledger,
@@ -826,7 +851,7 @@ class ArgonToBcryptRestartTest(unittest.TestCase):
         runner, _ = to_the_boundary()
         head = runner.ledger.head
         published = Advisory()
-        published.published = True
+        published.publish(runner.graph)
         restored = Runner.from_snapshot(
             runner.snapshot(), graph=runner.graph,
             registry=deployment(published), ledger=runner.ledger,
@@ -843,7 +868,7 @@ class ArgonToBcryptRestartTest(unittest.TestCase):
         row["worker_key"] = "auth.hash.argon2.v1"
 
         published = Advisory()
-        published.published = True
+        published.publish(runner.graph)
         resurrected = Runner.from_snapshot(
             snapshot, graph=runner.graph, registry=deployment(published)
         )

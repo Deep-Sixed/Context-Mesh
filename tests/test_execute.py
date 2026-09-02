@@ -4,6 +4,7 @@ import dataclasses
 import json
 import unittest
 
+from contextmesh.evidence import submit_evidence
 from contextmesh.execute import (
     Advisories,
     AuditContext,
@@ -29,6 +30,43 @@ def counted(name, calls, **output):
     return run
 
 
+def publish_advisory(feed, graph, package="argon2-cffi", text="CVE-2026-9999"):
+    """The advisory arrives from outside the graph, the way anything does.
+
+    A source the caller dates, an observation ingested against it, and only
+    then a feed entry pointing at the result. Rule 7 rejects an assumption on
+    evidence that contradicts it, and a rejection is a historical transition,
+    so the observation has to have a source and a date before it can be the
+    reason anything fell.
+    """
+    source = graph.add_node(
+        NodeType.SOURCE,
+        "Security advisory feed",
+        id="source:advisory-feed",
+        attrs={"origin": "advisory-feed", "retrieved_at": "2026-07-08"},
+    )
+    receipt = submit_evidence(
+        graph, text=text, source_id=source.id, metadata={"package": package}
+    )
+    feed.publish(package, receipt.evidence_id)
+    return receipt.evidence_id
+
+
+def _hashing_auditor(feed):
+    """Reads the feed, binds the observation it names. Writes nothing."""
+
+    def audit(ctx):
+        evidence_id = feed.advisory(ctx.output["package"])
+        if evidence_id is None:
+            return ctx.ok("no open advisory")
+        return ctx.disproved(
+            f"open advisory: {ctx.graph.node(evidence_id).label}",
+            evidence_id=evidence_id,
+        )
+
+    return audit
+
+
 def plan(calls, feed):
     """Two independent branches; only one of them stands on the feed."""
     runner = Runner("test plan")
@@ -44,11 +82,7 @@ def plan(calls, feed):
         counted("hashing", calls, package="argon2-cffi"),
         assumes="argon2-cffi has no open advisory",
         produces=("Hasher", "Argon2 Parameters"),
-        audit=lambda ctx: (
-            ctx.disproved(f"open advisory: {feed.advisory(ctx.output['package'])}")
-            if not feed.clear(ctx.output["package"])
-            else ctx.ok("no open advisory")
-        ),
+        audit=_hashing_auditor(feed),
     )
     runner.task(
         "routes",
@@ -129,13 +163,13 @@ class DiscoveryTest(unittest.TestCase):
             self.assertIs(task.state, TaskState.DONE)
 
     def test_the_auditor_finds_the_advisory_without_being_told(self):
-        self.feed.publish("argon2-cffi", "CVE-2026-9999")
+        publish_advisory(self.feed, self.runner.graph)
         reports = self.runner.recheck()
         self.assertEqual(len(reports), 1)
         self.assertEqual(reports[0].statement, "argon2-cffi has no open advisory")
 
     def test_the_disproof_is_recorded_as_evidence_against_the_assumption(self):
-        self.feed.publish("argon2-cffi", "CVE-2026-9999")
+        publish_advisory(self.feed, self.runner.graph)
         report = self.runner.recheck()[0]
         graph = self.runner.graph
         contradictions = [
@@ -149,7 +183,7 @@ class DiscoveryTest(unittest.TestCase):
 
     def test_recheck_executes_nothing(self):
         self.calls.clear()
-        self.feed.publish("argon2-cffi", "CVE-2026-9999")
+        publish_advisory(self.feed, self.runner.graph)
         self.runner.recheck()
         self.assertEqual(self.calls, [])
 
@@ -163,7 +197,7 @@ class SelectiveRerunTest(unittest.TestCase):
         self.runner = plan(self.calls, self.feed)
         self.runner.run()
         self.before = {t.name: t.node_id for t in self.runner.tasks}
-        self.feed.publish("argon2-cffi", "CVE-2026-9999")
+        publish_advisory(self.feed, self.runner.graph)
         self.report = self.runner.recheck()[0]
         self.calls.clear()
 
@@ -551,7 +585,12 @@ class ReceiptTest(unittest.TestCase):
         self.assertEqual(receipt["assumption"], "argon2-cffi has no open advisory")
         self.assertEqual(receipt["disproved_by"], "hashing")
         self.assertIn("CVE-2026-9999", receipt["reason"])
-        self.assertIn("disproof", self.run.runner.graph.node(receipt["evidence_id"]).label)
+        witness = self.run.runner.graph.node(receipt["evidence_id"])
+        self.assertIn("CVE-2026-9999", witness.label)
+        # The receipt names an observation that arrived from outside, not one
+        # the runner wrote about its own conclusion. That is what makes the
+        # rejection datable, and the receipt worth reading.
+        self.assertEqual(witness.provenance.source_id, "source:advisory-feed")
 
     def test_it_carries_the_closure_with_a_reason_chain_for_each_node(self):
         receipt = self.receipts[0]

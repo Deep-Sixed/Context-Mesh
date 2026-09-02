@@ -63,6 +63,10 @@ def saved_auth_session(root: Path) -> Session:
         NodeType.SOURCE,
         "Vendor advisory feed",
         id="source:vendor-advisory",
+        # Dated, because evidence ingested against it is what a remote recheck
+        # rejects an assumption on, and rule 7 will not date a fall from a
+        # source that cannot say when anything was retrieved.
+        attrs={"origin": "vendor-feed", "retrieved_at": "2026-07-08"},
     )
     runner = Runner("auth", graph=base.graph, registry=deployment())
     runner.task(

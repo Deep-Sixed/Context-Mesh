@@ -1,11 +1,14 @@
 """Selective invalidation: exactly the dependent work falls, and nothing else."""
 
 import unittest
+from datetime import date
 
 from contextmesh.assumptions import AssumptionLedger
 from contextmesh.decisions import DecisionLog
 from contextmesh.graph import ContextGraph
 from contextmesh.model import AssumptionStatus, EdgeType, NodeType, Provenance
+from contextmesh.ontology import OntologyError
+from contextmesh.temporal import _fell_at
 
 
 def scenario():
@@ -95,8 +98,20 @@ class RejectionTest(unittest.TestCase):
             self.artefact,
             self.unrelated_claim,
         ) = scenario()
+        # Rule 7 wants the witness to be datable, so it gets the source it
+        # always implied: the postmortem the observation was lifted from.
+        self.postmortem = self.graph.add_node(
+            NodeType.SOURCE,
+            "Postmortem 233",
+            attrs={"origin": "incident-review", "retrieved_at": "2026-07-08"},
+        )
         self.evidence = self.graph.add_node(
-            NodeType.EVIDENCE, "One tenant held 31% of chunks in a single shard"
+            NodeType.EVIDENCE,
+            "One tenant held 31% of chunks in a single shard",
+            attrs={"kind": "postmortem"},
+            provenance=Provenance(
+                source_id=self.postmortem.id, recorded_at_build=self.graph.build
+            ),
         )
         self.report = self.ledger.reject(
             self.assumption.id,
@@ -192,6 +207,133 @@ class DecisionHistoryTest(unittest.TestCase):
         current = {r.decision_id for r in decisions.current()}
         self.assertIn(replacement.id, current)
         self.assertNotIn(dependent.id, current)
+
+
+class Rule7WriteBoundaryTest(unittest.TestCase):
+    """GRAPH.md rule 7 at the moment of the write, not after it.
+
+    An assumption is only ever rejected by evidence that contradicts it,
+    "because 'why did this fall over' has to have an answer inside the graph".
+    A rejection is also a *historical* transition: ``temporal._fell_at`` reads
+    the fall date off that evidence and nothing else, so a witness with no
+    source date leaves the assumption reported ACTIVE at every horizon,
+    including horizons long after it fell.
+
+    Each case below checks two things — that the write is refused, and that
+    the graph is exactly as it was. Validation used to run after the mutation,
+    so a bad witness left a rejected assumption with no edge saying why.
+    """
+
+    def setUp(self):
+        self.graph = ContextGraph()
+        self.graph.build = 1
+        self.ledger = AssumptionLedger(self.graph)
+        self.assumption = self.ledger.assume("shards grow linearly")
+
+    def untouched(self):
+        """Every field a rejection would have moved, still where it started."""
+        record = self.graph.assumptions[self.assumption.id]
+        node = self.graph.node(self.assumption.id)
+        return {
+            "status": record.status,
+            "rejected_at_build": record.rejected_at_build,
+            "evidence_ids": list(record.evidence_ids),
+            "invalidated": node.invalidated,
+            "mirrored_status": node.attrs.get("status"),
+            "contradictions": len(
+                self.graph.in_edges(
+                    self.assumption.id, [EdgeType.CONTRADICTS], live_only=False
+                )
+            ),
+        }
+
+    def refuses(self, evidence_id, expected):
+        before = self.untouched()
+        with self.assertRaisesRegex(OntologyError, expected):
+            self.ledger.reject(self.assumption.id, evidence_id=evidence_id)
+        self.assertEqual(self.untouched(), before)
+
+    def dated_witness(self, retrieved_at="2026-07-08"):
+        source = self.graph.add_node(
+            NodeType.SOURCE,
+            "Postmortem 233",
+            attrs={"origin": "incident-review", "retrieved_at": retrieved_at},
+        )
+        return self.graph.add_node(
+            NodeType.EVIDENCE,
+            "one tenant held 31% of chunks in a single shard",
+            attrs={"kind": "postmortem"},
+            provenance=Provenance(source_id=source.id, recorded_at_build=1),
+        )
+
+    # ── the four conditions ──────────────────────────────────────────────
+    def test_a_rejection_with_no_witness_at_all_does_not_typecheck(self):
+        """The signature is the first refusal: evidence_id has no default."""
+        with self.assertRaises(TypeError):
+            self.ledger.reject(self.assumption.id)
+        self.assertIs(
+            self.graph.assumptions[self.assumption.id].status, AssumptionStatus.ACTIVE
+        )
+
+    def test_a_witness_that_is_not_in_the_graph_is_refused(self):
+        self.refuses("evidence:never-ingested", "is not in this graph")
+
+    def test_a_witness_of_the_wrong_type_is_refused(self):
+        claim = self.graph.add_node(NodeType.CLAIM, "not an observation")
+        self.refuses(claim.id, "is a claim, not evidence")
+
+    def test_an_invalidated_witness_is_refused(self):
+        witness = self.dated_witness()
+        witness.invalidated = True
+        self.refuses(witness.id, "is not live")
+
+    def test_a_witness_with_no_provenance_is_refused(self):
+        bare = self.graph.add_node(
+            NodeType.EVIDENCE, "someone said so", attrs={"kind": "hearsay"}
+        )
+        self.refuses(bare.id, "has no source provenance")
+
+    def test_a_witness_whose_source_carries_no_date_is_refused(self):
+        """The case the old signature could not see.
+
+        Evidence, contradicting, properly provenanced — and still unable to
+        say *when*, because the source it came from is undated. Accepting it
+        would record a fall no reconstruction could ever place.
+        """
+        self.refuses(
+            self.dated_witness(retrieved_at="at plan time").id, "no usable retrieved_at"
+        )
+
+    # ── and the case that must still work ────────────────────────────────
+    def test_a_dated_witness_rejects_and_the_fall_is_reconstructible(self):
+        witness = self.dated_witness()
+        report = self.ledger.reject(self.assumption.id, evidence_id=witness.id)
+
+        record = self.graph.assumptions[self.assumption.id]
+        self.assertIs(record.status, AssumptionStatus.REJECTED)
+        self.assertEqual(record.evidence_ids, [witness.id])
+        self.assertEqual(report.assumption_id, self.assumption.id)
+        self.assertEqual(
+            len(
+                self.graph.in_edges(
+                    self.assumption.id, [EdgeType.CONTRADICTS], live_only=False
+                )
+            ),
+            1,
+        )
+        # The point of the whole guard: the moment is recoverable, on the
+        # source clock, without the build counter or a wall clock.
+        self.assertEqual(_fell_at(self.graph, self.assumption.id), date(2026, 7, 8))
+
+    def test_the_witness_edge_is_created_once_even_if_the_caller_added_it(self):
+        """Callers used to add the contradicts edge themselves and double it."""
+        witness = self.dated_witness()
+        self.graph.add_edge(witness.id, EdgeType.CONTRADICTS, self.assumption.id)
+        self.ledger.reject(self.assumption.id, evidence_id=witness.id)
+        edges = self.graph.in_edges(
+            self.assumption.id, [EdgeType.CONTRADICTS], live_only=False
+        )
+        self.assertEqual(len(edges), 1)
 
 
 if __name__ == "__main__":

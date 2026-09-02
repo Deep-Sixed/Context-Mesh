@@ -240,12 +240,22 @@ class AssumptionLedger:
             )
         from .temporal import source_time_of
 
+        # Provenance is the only route for evidence: the ontology gives
+        # `derived_from` and `cites` to claims, decisions and entities, so an
+        # evidence node cannot be anchored by an edge even in principle.
+        if node.provenance is None:
+            raise OntologyError(
+                f"rejecting {assumption_id!r}: evidence {evidence_id!r} has no source "
+                f"provenance, so nothing says where the observation came from. "
+                f"Ingest it against a source — see contextmesh.evidence — before "
+                f"rejecting with it"
+            )
         if source_time_of(self.graph, node) is None:
             raise OntologyError(
-                f"rejecting {assumption_id!r}: evidence {evidence_id!r} carries no "
-                f"source date, so the moment it fell could not be reconstructed. "
-                f"Anchor the evidence to a dated source — through its provenance, "
-                f"or a derived_from or cites edge — before rejecting with it"
+                f"rejecting {assumption_id!r}: evidence {evidence_id!r} comes from "
+                f"source {node.provenance.source_id!r}, which carries no usable "
+                f"retrieved_at, so the moment the assumption fell could not be "
+                f"reconstructed. Date the source before rejecting with its evidence"
             )
         return node
 

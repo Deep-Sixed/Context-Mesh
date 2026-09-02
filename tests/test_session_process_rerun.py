@@ -24,17 +24,36 @@ _CREATE = r'''
 import json
 import sys
 
+from contextmesh.evidence import submit_evidence
 from contextmesh.execute import Runner, TaskRegistry
+from contextmesh.model import NodeType
 from contextmesh_mcp.session import Session
 
 
 class Advisory:
     def __init__(self):
-        self.published = False
+        self.evidence_id = None
+
+    def publish(self, graph):
+        source = graph.add_node(
+            NodeType.SOURCE,
+            "Security advisory feed",
+            id="source:advisory-feed",
+            attrs={"origin": "advisory-feed", "retrieved_at": "2026-07-08"},
+        )
+        self.evidence_id = submit_evidence(
+            graph,
+            text="CVE-2026-9999 published for argon2id",
+            source_id=source.id,
+            metadata={"package": "argon2"},
+        ).evidence_id
+        return self.evidence_id
 
     def __call__(self, ctx):
-        if self.published and ctx.output.get("impl") == "argon2":
-            return ctx.disproved("CVE-2026-9999 published for argon2id")
+        if self.evidence_id and ctx.output.get("impl") == "argon2":
+            return ctx.disproved(
+                "CVE-2026-9999 published for argon2id", evidence_id=self.evidence_id
+            )
         return True
 
 
@@ -74,7 +93,7 @@ runner.task(
     produces=("Tokens",),
 )
 runner.run()
-advisory.published = True
+advisory.publish(runner.graph)
 runner.recheck()
 runner.repair(
     "hashing",
@@ -101,13 +120,24 @@ import json
 import sys
 
 from contextmesh.execute import TaskRegistry
+from contextmesh.model import NodeType
 from contextmesh_mcp.session import Session
 
 
 class Advisory:
     def __call__(self, ctx):
         if ctx.output.get("impl") == "argon2":
-            return ctx.disproved("CVE-2026-9999 published for argon2id")
+            # Ingested before the save, restored with the graph. The auditor
+            # identifies the observation; rule 7 forbids it inventing one.
+            observed = next(
+                node
+                for node in ctx.graph.by_type(NodeType.EVIDENCE, live_only=False)
+                if node.provenance is not None
+                and node.provenance.source_id == "source:advisory-feed"
+            )
+            return ctx.disproved(
+                "CVE-2026-9999 published for argon2id", evidence_id=observed.id
+            )
         return True
 
 
@@ -154,13 +184,24 @@ import json
 import sys
 
 from contextmesh.execute import TaskRegistry
+from contextmesh.model import NodeType
 from contextmesh_mcp.session import Session
 
 
 class Advisory:
     def __call__(self, ctx):
         if ctx.output.get("impl") == "argon2":
-            return ctx.disproved("CVE-2026-9999 published for argon2id")
+            # Ingested before the save, restored with the graph. The auditor
+            # identifies the observation; rule 7 forbids it inventing one.
+            observed = next(
+                node
+                for node in ctx.graph.by_type(NodeType.EVIDENCE, live_only=False)
+                if node.provenance is not None
+                and node.provenance.source_id == "source:advisory-feed"
+            )
+            return ctx.disproved(
+                "CVE-2026-9999 published for argon2id", evidence_id=observed.id
+            )
         return True
 
 

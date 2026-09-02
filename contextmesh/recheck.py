@@ -211,9 +211,11 @@ def recheck(
             continue
         if verdict.disproves:
             if verdict.evidence_id is None:
-                # Backward-compatible in-process behaviour. Controlled MCP
-                # rechecks use require_evidence=True and can never reach this.
-                reports.append(runner._disprove(task, assumption, verdict.reason))
+                # The in-process path. It used to let the Runner mint evidence
+                # from the auditor's own reason; rule 7 now refuses that there,
+                # so an unbound disproof fails closed here too rather than
+                # quietly taking a different route to the same rejection.
+                reports.append(runner._disprove(task, assumption, verdict))
             else:
                 reports.append(
                     _disprove_with_evidence(runner, task, assumption, verdict)

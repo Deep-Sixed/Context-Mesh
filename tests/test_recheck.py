@@ -3,7 +3,13 @@
 import unittest
 
 from contextmesh.evidence import submit_evidence
-from contextmesh.execute import Event, Runner, TaskRegistry, TaskState
+from contextmesh.execute import (
+    Event,
+    ExecutionError,
+    Runner,
+    TaskRegistry,
+    TaskState,
+)
 from contextmesh.graph import ContextGraph
 from contextmesh.model import AssumptionStatus, EdgeType, NodeType
 from contextmesh.recheck import EvidenceRecheckError, recheck
@@ -16,6 +22,10 @@ class EvidenceBoundRecheckTest(unittest.TestCase):
             NodeType.SOURCE,
             "Vendor advisory feed",
             id="source:vendor-advisory",
+            # Dated: rule 7 takes the moment an assumption fell from the
+            # contradicting evidence's source, so an undated feed could never
+            # be the reason for a rejection.
+            attrs={"origin": "vendor-feed", "retrieved_at": "2026-07-08"},
         )
         registry = TaskRegistry()
         registry.register_worker("auth.hash.argon2.v1", lambda ctx: {"impl": "argon2"})
@@ -162,18 +172,31 @@ class EvidenceBoundRecheckTest(unittest.TestCase):
             evidence_before,
         )
 
-    def test_in_process_compatibility_can_still_generate_disproof_evidence(self):
+    def test_the_in_process_path_can_no_longer_manufacture_its_own_evidence(self):
+        """The old in-process behaviour, now refused rather than accommodated.
+
+        This used to mint an EVIDENCE node from the auditor's own reason and
+        reject on it — the runner deciding the ground was false and then
+        writing the proof that said so. Rule 7 wants the answer to "why did
+        this fall over" to be in the graph, and evidence invented from the
+        finding it supports is not an answer. It was also undatable, so every
+        projection reported the assumption still standing.
+        """
         runner, _ = self.build(lambda ctx: ctx.disproved("legacy disproof"))
+        task = runner["hashing"]
+        assumption = runner.graph.assumptions[task.assumption_id]
         before = len(runner.graph.by_type(NodeType.EVIDENCE, live_only=False))
 
-        reports = recheck(runner)
+        with self.assertRaisesRegex(ExecutionError, "bound no evidence"):
+            recheck(runner)
 
-        self.assertEqual(len(reports), 1)
+        self.assertIs(assumption.status, AssumptionStatus.ACTIVE)
         self.assertEqual(
             len(runner.graph.by_type(NodeType.EVIDENCE, live_only=False)),
-            before + 1,
+            before,
         )
-        self.assertIs(runner["hashing"].state, TaskState.STALE)
+        # The refusal costs nothing: no rejection, so no closure went stale.
+        self.assertIs(runner["hashing"].state, TaskState.DONE)
 
 
 if __name__ == "__main__":
