@@ -24,7 +24,7 @@ The pieces:
 - ``metrics``     the dashboard payload, computed from the live graph
 """
 
-from .assumptions import AssumptionLedger, InvalidationReport
+from .assumptions import AssumptionError, AssumptionLedger, InvalidationReport
 from .corpus import documents
 from .decisions import DecisionLog, DecisionRecord
 from .evidence import (
@@ -91,6 +91,7 @@ __all__ = [
     "LIVE_PROVIDERS",
     "ONTOLOGY",
     "Assumption",
+    "AssumptionError",
     "AssumptionLedger",
     "AssumptionStatus",
     "AuditContext",
