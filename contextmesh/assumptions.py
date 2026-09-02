@@ -17,9 +17,11 @@ from .model import (
     Assumption,
     AssumptionStatus,
     EdgeType,
+    Node,
     NodeType,
     slug,
 )
+from .ontology import OntologyError
 
 # Failure travels along these edges and no others (GRAPH.md rule 2), and the
 # direction matters:
@@ -198,16 +200,71 @@ class AssumptionLedger:
                     )
         return reached
 
+    def _witness(self, assumption_id: str, evidence_id: str) -> Node:
+        """The evidence a rejection stands on, checked before anything moves.
+
+        GRAPH.md rule 7 says an assumption is only ever rejected by evidence
+        that contradicts it, "because 'why did this fall over' has to have an
+        answer inside the graph". A rejection is a *historical* state
+        transition, so the answer has to be locatable in time as well as in
+        the graph: :func:`contextmesh.temporal._fell_at` reads the fall date
+        off this witness and nothing else, and an assumption whose witness
+        carries no source date reconstructs as ``ACTIVE`` at every horizon —
+        including horizons long after it fell.
+
+        So all four conditions are checked here, together, and before the
+        first field is written. Rejecting is not the place to find out that
+        the witness was unusable: the caller gets a refusal and a graph that
+        never moved, rather than an exception thrown across a half-applied
+        mutation.
+
+        This is a precondition of *this mutation*, not a new rule for evidence
+        in general. Evidence still carries only ``kind``; evidence offered as
+        the reason an assumption fell has to be datable.
+        """
+        node = self.graph.nodes.get(evidence_id)
+        if node is None:
+            raise OntologyError(
+                f"rejecting {assumption_id!r}: evidence {evidence_id!r} is not in this graph"
+            )
+        if node.type is not NodeType.EVIDENCE:
+            raise OntologyError(
+                f"rejecting {assumption_id!r}: {evidence_id!r} is a "
+                f"{node.type.value}, not evidence — GRAPH.md rule 7 allows only "
+                f"evidence to contradict an assumption"
+            )
+        if not node.live:
+            raise OntologyError(
+                f"rejecting {assumption_id!r}: evidence {evidence_id!r} is not live, "
+                f"so it cannot be why anything fell"
+            )
+        from .temporal import source_time_of
+
+        if source_time_of(self.graph, node) is None:
+            raise OntologyError(
+                f"rejecting {assumption_id!r}: evidence {evidence_id!r} carries no "
+                f"source date, so the moment it fell could not be reconstructed. "
+                f"Anchor the evidence to a dated source — through its provenance, "
+                f"or a derived_from or cites edge — before rejecting with it"
+            )
+        return node
+
     def reject(
         self,
         assumption_id: str,
         *,
-        evidence_id: Optional[str] = None,
+        evidence_id: str,
         replacement: Optional[str] = None,
     ) -> InvalidationReport:
-        """Disprove an assumption and invalidate exactly what stood on it."""
+        """Disprove an assumption and invalidate exactly what stood on it.
+
+        ``evidence_id`` is required. Rule 7 gives a caller no way to mark an
+        assumption false directly, and a default of ``None`` was exactly that
+        way — see :meth:`_witness` for what the witness has to satisfy.
+        """
         graph = self.graph
         assumption = graph.assumptions[assumption_id]
+        self._witness(assumption_id, evidence_id)
         radius = self.blast_radius(assumption_id)
 
         assumption.status = AssumptionStatus.REJECTED
@@ -216,9 +273,8 @@ class AssumptionLedger:
         node.attrs["status"] = assumption.status.value
         node.invalidated = True
 
-        if evidence_id:
-            assumption.evidence_ids.append(evidence_id)
-            graph.add_edge(evidence_id, EdgeType.CONTRADICTS, assumption_id)
+        assumption.evidence_ids.append(evidence_id)
+        graph.add_edge(evidence_id, EdgeType.CONTRADICTS, assumption_id)
 
         invalidated_edges = apply_invalidation(graph, assumption_id, radius)
 

@@ -229,8 +229,14 @@ class Timeline:
         return (min(dated), max(dated)) if dated else None
 
 
-def _source_time_of(graph: ContextGraph, node: Node) -> Optional[date]:
-    """One node's source date, resolved the way :class:`Timeline` resolves it."""
+def source_time_of(graph: ContextGraph, node: Node) -> Optional[date]:
+    """One node's source date, resolved the way :class:`Timeline` resolves it.
+
+    Public because the write boundary needs the same answer this module needs.
+    :meth:`AssumptionLedger.reject` refuses a witness this returns ``None`` for,
+    so that a rejection cannot be recorded that :func:`_fell_at` could never
+    date — one resolution rule, asked before the mutation and again after it.
+    """
     if node.type is NodeType.SOURCE:
         return source_date(node)
     provenance = node.provenance
@@ -260,7 +266,7 @@ def _fell_at(graph: ContextGraph, assumption_id: str) -> Optional[date]:
         witness = graph.nodes.get(edge.src)
         if witness is None or witness.type is not NodeType.EVIDENCE:
             continue
-        when = _source_time_of(graph, witness)
+        when = source_time_of(graph, witness)
         if when is not None and (fell is None or when < fell):
             fell = when
     return fell
@@ -436,7 +442,7 @@ def _witness_arrived(graph: ContextGraph, evidence_id: str, as_of: date) -> bool
     node = graph.nodes.get(evidence_id)
     if node is None:
         return False
-    when = _source_time_of(graph, node)
+    when = source_time_of(graph, node)
     return when is not None and when <= as_of
 
 
