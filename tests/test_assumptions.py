@@ -2,7 +2,7 @@
 
 import unittest
 
-from contextmesh.assumptions import AssumptionLedger
+from contextmesh.assumptions import AssumptionError, AssumptionLedger
 from contextmesh.decisions import DecisionLog
 from contextmesh.graph import ContextGraph
 from contextmesh.model import AssumptionStatus, EdgeType, NodeType, Provenance
@@ -192,6 +192,132 @@ class DecisionHistoryTest(unittest.TestCase):
         current = {r.decision_id for r in decisions.current()}
         self.assertIn(replacement.id, current)
         self.assertNotIn(dependent.id, current)
+
+
+class Rule7PreconditionTest(unittest.TestCase):
+    def setUp(self):
+        self.graph, self.ledger, _, self.assumption, self.dependent, *_ = scenario()
+        self.evidence = self.graph.add_node(
+            NodeType.EVIDENCE, "One tenant held 31% of chunks in a single shard"
+        )
+
+    def test_reject_requires_non_empty_evidence_id(self):
+        with self.assertRaises(AssumptionError):
+            self.ledger.reject(self.assumption.id, evidence_id=None)
+        with self.assertRaises(AssumptionError):
+            self.ledger.reject(self.assumption.id, evidence_id="")
+        # Status must remain ACTIVE and node must not be invalidated
+        self.assertIs(self.graph.assumptions[self.assumption.id].status, AssumptionStatus.ACTIVE)
+        self.assertFalse(self.graph.node(self.assumption.id).invalidated)
+
+    def test_reject_refuses_nonexistent_evidence_id(self):
+        with self.assertRaises(AssumptionError):
+            self.ledger.reject(self.assumption.id, evidence_id="nonexistent-evidence-id")
+        self.assertIs(self.graph.assumptions[self.assumption.id].status, AssumptionStatus.ACTIVE)
+        self.assertFalse(self.graph.node(self.assumption.id).invalidated)
+
+    def test_reject_refuses_non_evidence_node_type(self):
+        claim_node = next(n for n in self.graph.nodes.values() if n.type is NodeType.CLAIM)
+        with self.assertRaises(AssumptionError):
+            self.ledger.reject(self.assumption.id, evidence_id=claim_node.id)
+        self.assertIs(self.graph.assumptions[self.assumption.id].status, AssumptionStatus.ACTIVE)
+        self.assertFalse(self.graph.node(self.assumption.id).invalidated)
+
+    def test_reject_refuses_invalidated_evidence(self):
+        self.evidence.invalidated = True
+        with self.assertRaises(AssumptionError):
+            self.ledger.reject(self.assumption.id, evidence_id=self.evidence.id)
+        self.assertIs(self.graph.assumptions[self.assumption.id].status, AssumptionStatus.ACTIVE)
+        self.assertFalse(self.graph.node(self.assumption.id).invalidated)
+
+    def test_reject_refuses_nonexistent_assumption(self):
+        with self.assertRaises(AssumptionError):
+            self.ledger.reject("nonexistent-assumption-id", evidence_id=self.evidence.id)
+
+    def test_reject_refuses_already_rejected_assumption(self):
+        self.ledger.reject(self.assumption.id, evidence_id=self.evidence.id)
+        second_evidence = self.graph.add_node(
+            NodeType.EVIDENCE, "Second contradictory evidence node"
+        )
+        with self.assertRaises(AssumptionError):
+            self.ledger.reject(self.assumption.id, evidence_id=second_evidence.id)
+
+    def test_reject_refuses_superseded_assumption(self):
+        new_assumption = self.ledger.supersede(self.assumption.id, "Latency budget is 150ms")
+        with self.assertRaises(AssumptionError):
+            self.ledger.reject(self.assumption.id, evidence_id=self.evidence.id)
+        # New assumption remains ACTIVE
+        self.assertIs(self.graph.assumptions[new_assumption.id].status, AssumptionStatus.ACTIVE)
+
+    def test_failure_leaves_graph_and_dependent_work_unmodified(self):
+        initial_edges = len(self.graph.edges)
+        with self.assertRaises(AssumptionError):
+            self.ledger.reject(self.assumption.id, evidence_id="bad-id")
+        self.assertIs(self.graph.assumptions[self.assumption.id].status, AssumptionStatus.ACTIVE)
+        self.assertFalse(self.graph.node(self.assumption.id).invalidated)
+        self.assertFalse(self.graph.node(self.dependent.id).invalidated)
+        self.assertEqual(len(self.graph.edges), initial_edges)
+
+
+class Rule7AtomicCommitTest(unittest.TestCase):
+    def setUp(self):
+        self.graph, self.ledger, _, self.assumption, self.dependent, *_ = scenario()
+        self.evidence = self.graph.add_node(
+            NodeType.EVIDENCE, "One tenant held 31% of chunks in a single shard"
+        )
+
+    def test_successful_rejection_atomically_mints_contradiction_edge_and_rejects(self):
+        # Pre-state: active, not invalidated, no contradiction edge
+        self.assertIs(self.graph.assumptions[self.assumption.id].status, AssumptionStatus.ACTIVE)
+        self.assertFalse(self.graph.node(self.assumption.id).invalidated)
+        self.assertEqual(
+            self.graph.in_edges(self.assumption.id, (EdgeType.CONTRADICTS,), live_only=False),
+            [],
+        )
+
+        report = self.ledger.reject(self.assumption.id, evidence_id=self.evidence.id)
+        self.assertIsNotNone(report)
+
+        # Post-state: status REJECTED, node invalidated, contradiction edge established
+        self.assertIs(self.graph.assumptions[self.assumption.id].status, AssumptionStatus.REJECTED)
+        self.assertTrue(self.graph.node(self.assumption.id).invalidated)
+        self.assertIn(self.evidence.id, self.graph.assumptions[self.assumption.id].evidence_ids)
+
+        edges = self.graph.in_edges(self.assumption.id, (EdgeType.CONTRADICTS,), live_only=False)
+        self.assertEqual(len(edges), 1)
+        self.assertEqual(edges[0].src, self.evidence.id)
+        self.assertEqual(edges[0].dst, self.assumption.id)
+        self.assertEqual(edges[0].type, EdgeType.CONTRADICTS)
+
+    def test_induced_failure_during_commit_rolls_back_without_partial_state(self):
+        initial_edges = len(self.graph.edges)
+        key = (self.evidence.id, EdgeType.CONTRADICTS.value, self.assumption.id)
+
+        # Induce an exception midway through the commit block (when setting node status)
+        node = self.graph.node(self.assumption.id)
+        class FaultyDict(dict):
+            def __setitem__(self, k, v):
+                if k == "status" and v == "rejected":
+                    raise RuntimeError("induced commit error")
+                super().__setitem__(k, v)
+
+        node.attrs = FaultyDict(node.attrs)
+        with self.assertRaises(RuntimeError):
+            self.ledger.reject(self.assumption.id, evidence_id=self.evidence.id)
+
+        # Restore plain dict for assertions
+        node.attrs = dict(node.attrs)
+
+        # Assert clean rollback: neither contradiction edge nor REJECTED status committed
+        self.assertIs(self.graph.assumptions[self.assumption.id].status, AssumptionStatus.ACTIVE)
+        self.assertFalse(self.graph.node(self.assumption.id).invalidated)
+        self.assertNotIn(self.evidence.id, self.graph.assumptions[self.assumption.id].evidence_ids)
+        self.assertNotIn(key, self.graph._edge_key)
+        self.assertEqual(
+            self.graph.in_edges(self.assumption.id, (EdgeType.CONTRADICTS,), live_only=False),
+            [],
+        )
+        self.assertEqual(len(self.graph.edges), initial_edges)
 
 
 if __name__ == "__main__":

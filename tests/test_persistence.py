@@ -743,7 +743,16 @@ class AssumptionMirrorTest(unittest.TestCase):
         graph.build = 1
         ledger = AssumptionLedger(graph)
         original = ledger.assume("shards grow linearly")
-        report = ledger.reject(original.id, replacement="shards grow with tenant skew")
+        evidence = graph.add_node(
+            NodeType.EVIDENCE,
+            "One tenant held 31% of chunks in a single shard",
+            attrs={"kind": "disproof"},
+        )
+        report = ledger.reject(
+            original.id,
+            evidence_id=evidence.id,
+            replacement="shards grow with tenant skew",
+        )
         self.assertIsNotNone(report.replacement_id)
         replacement = graph.assumptions[report.replacement_id]
         self.assertEqual(replacement.version, original.version + 1)

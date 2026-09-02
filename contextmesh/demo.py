@@ -244,7 +244,6 @@ def run(*, rounds: int = 40, reject: bool = True) -> DemoResult:
                 recorded_at_build=graph.build,
             ),
         )
-        graph.add_edge(evidence.id, EdgeType.CONTRADICTS, a_linear.id)
         invalidation = ledger.reject(
             a_linear.id,
             evidence_id=evidence.id,

@@ -35,6 +35,10 @@ FORWARD: Tuple[EdgeType, ...] = (EdgeType.PRODUCES,)
 PROPAGATING: Tuple[EdgeType, ...] = BACKWARD + FORWARD
 
 
+class AssumptionError(Exception):
+    """Raised when an assumption operation violates graph invariants."""
+
+
 @dataclass
 class InvalidationReport:
     assumption_id: str
@@ -202,23 +206,91 @@ class AssumptionLedger:
         self,
         assumption_id: str,
         *,
-        evidence_id: Optional[str] = None,
+        evidence_id: str,
         replacement: Optional[str] = None,
     ) -> InvalidationReport:
-        """Disprove an assumption and invalidate exactly what stood on it."""
+        """Disprove an assumption and invalidate exactly what stood on it.
+
+        GRAPH.md Rule 7: An assumption is only ever rejected by evidence that
+        contradicts it. A valid, live NodeType.EVIDENCE node is required.
+        """
+        if not evidence_id or not isinstance(evidence_id, str):
+            raise AssumptionError("reject() requires a non-empty evidence_id string")
+
         graph = self.graph
+        if assumption_id not in graph.assumptions or assumption_id not in graph.nodes:
+            raise AssumptionError(f"no assumption {assumption_id!r} in this graph")
+
         assumption = graph.assumptions[assumption_id]
+        if assumption.status is not AssumptionStatus.ACTIVE:
+            raise AssumptionError(
+                f"cannot reject assumption {assumption_id!r}: "
+                f"status is {assumption.status.value}, not active"
+            )
+
+        evidence_node = graph.nodes.get(evidence_id)
+        if evidence_node is None:
+            raise AssumptionError(
+                f"evidence_id {evidence_id!r} is not in this graph"
+            )
+        if evidence_node.type is not NodeType.EVIDENCE:
+            raise AssumptionError(
+                f"evidence_id {evidence_id!r} is a {evidence_node.type.value}, not evidence"
+            )
+        if evidence_node.invalidated:
+            raise AssumptionError(
+                f"evidence_id {evidence_id!r} is invalidated"
+            )
+
         radius = self.blast_radius(assumption_id)
-
-        assumption.status = AssumptionStatus.REJECTED
-        assumption.rejected_at_build = graph.build
         node = graph.node(assumption_id)
-        node.attrs["status"] = assumption.status.value
-        node.invalidated = True
 
-        if evidence_id:
-            assumption.evidence_ids.append(evidence_id)
-            graph.add_edge(evidence_id, EdgeType.CONTRADICTS, assumption_id)
+        # Pre-mutation state snapshot for atomic rollback
+        original_status = assumption.status
+        original_rejected_build = assumption.rejected_at_build
+        original_node_status = node.attrs.get("status")
+        original_node_invalidated = node.invalidated
+        original_evidence_ids = list(assumption.evidence_ids)
+        key = (evidence_id, EdgeType.CONTRADICTS.value, assumption_id)
+        edge_already_existed = key in graph._edge_key
+        created_edge_id: Optional[str] = None
+
+        try:
+            # 1. Establish the typed contradiction edge
+            edge = graph.add_edge(evidence_id, EdgeType.CONTRADICTS, assumption_id)
+            if not edge_already_existed:
+                created_edge_id = edge.id
+
+            # 2. Append evidence_id if not already present
+            if evidence_id not in assumption.evidence_ids:
+                assumption.evidence_ids.append(evidence_id)
+
+            # 3. Commit REJECTED transition
+            assumption.status = AssumptionStatus.REJECTED
+            assumption.rejected_at_build = graph.build
+            node.attrs["status"] = assumption.status.value
+            node.invalidated = True
+        except Exception:
+            # Rollback: guarantee neither edge nor status commits alone
+            assumption.status = original_status
+            assumption.rejected_at_build = original_rejected_build
+            if original_node_status is not None:
+                node.attrs["status"] = original_node_status
+            else:
+                node.attrs.pop("status", None)
+            try:
+                node.invalidated = original_node_invalidated
+            except Exception:
+                pass
+            assumption.evidence_ids = list(original_evidence_ids)
+            if created_edge_id is not None:
+                graph.edges.pop(created_edge_id, None)
+                graph._edge_key.pop(key, None)
+                if created_edge_id in graph._out.get(evidence_id, []):
+                    graph._out[evidence_id].remove(created_edge_id)
+                if created_edge_id in graph._in.get(assumption_id, []):
+                    graph._in[assumption_id].remove(created_edge_id)
+            raise
 
         invalidated_edges = apply_invalidation(graph, assumption_id, radius)
 
