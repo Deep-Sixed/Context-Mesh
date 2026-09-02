@@ -276,6 +276,7 @@ class Rule7AtomicCommitTest(unittest.TestCase):
         )
 
         report = self.ledger.reject(self.assumption.id, evidence_id=self.evidence.id)
+        self.assertIsNotNone(report)
 
         # Post-state: status REJECTED, node invalidated, contradiction edge established
         self.assertIs(self.graph.assumptions[self.assumption.id].status, AssumptionStatus.REJECTED)

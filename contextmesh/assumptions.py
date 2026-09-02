@@ -224,7 +224,8 @@ class AssumptionLedger:
         assumption = graph.assumptions[assumption_id]
         if assumption.status is not AssumptionStatus.ACTIVE:
             raise AssumptionError(
-                f"cannot reject assumption {assumption_id!r}: status is {assumption.status.value}, not active"
+                f"cannot reject assumption {assumption_id!r}: "
+                f"status is {assumption.status.value}, not active"
             )
 
         evidence_node = graph.nodes.get(evidence_id)
