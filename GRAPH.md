@@ -24,9 +24,10 @@ that currently are not.
 may carry more. It is satisfied by a node `attrs` key **or** by a `Node` field of
 that name — `provenance` is a field, not an attribute. It requires the value to
 be **present**, not to be well-formed: `contextmesh/execute.py` mints sources
-with `retrieved_at="at plan time"`, which satisfies the requirement, and the
-temporal layer separately classifies such a source as `UNDATED` rather than
-guessing a date. Nothing enforces this column today; see *Open items*.
+with `retrieved_at="at plan time"`, which satisfies the presence requirement
+defined here, and the temporal layer separately classifies such a source as
+`UNDATED` rather than guessing a date. Nothing enforces this column today; see
+*Open items*.
 
 **Code is evidence, not authority.** A behaviour may be written into this file
 when the implementation *structurally guarantees* it — when no caller can make
@@ -96,7 +97,7 @@ None of them may be relied on until it appears above this line.
 
 | Declared | State | Missing |
 |---|---|---|
-| `resolves_to` | In the edge table; in `EdgeType`; weighted `0.3` by the walker | No writer. Also no lifecycle: an `entity` is excluded from `justified_by`, `contradicts`, `supersedes`, `supports`, `depends_on` and `cites`, so an identity assertion recorded this way could not be justified, disputed or retired. |
+| `resolves_to` | In the edge table; in `EdgeType`; weighted `0.3` by the walker | No realized lifecycle today: no production writer creates it, and no node-level justification, contradiction, supersession, support, dependency or citation path is legal for `entity` endpoints. Edge-level assumption binding exists separately, but it too has no production writer and its semantics remain open. |
 | Edge-level assumption binding | `Edge.assumption_id`; `AssumptionLedger.justifies`; serialized, and validated on load | No writer. The keyword is never supplied by library code; a full demo build carries 404 edges, none bound. |
 | Walk-driven `PRUNE` (rule 5, second half) | `Pipeline.prune_unwalked_nodes`, correct semantics, enabled by default | No caller. Consequence: prose elsewhere describing walk telemetry as feeding `PRUNE` describes a consumer that does not run. |
 
