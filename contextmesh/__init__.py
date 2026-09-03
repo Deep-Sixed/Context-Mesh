@@ -83,6 +83,7 @@ from .model import (
 from .ontology import ONTOLOGY, Ontology, OntologyError
 from .pipeline import BuildReport, Document, Pipeline
 from .resolve import ResolutionRecord, Resolver
+from .telemetry import TelemetryProjection, project_telemetry
 from .traverse import DeadEnd, Walk, Walker
 
 __version__ = "0.1.0"
@@ -138,6 +139,7 @@ __all__ = [
     "SnapshotError",
     "Task",
     "TaskState",
+    "TelemetryProjection",
     "TokenUsage",
     "Verdict",
     "Walk",
@@ -146,6 +148,7 @@ __all__ = [
     "documents",
     "make_audit_proposer",
     "make_worker",
+    "project_telemetry",
     "propose_audit",
     "report",
     "snapshot",
