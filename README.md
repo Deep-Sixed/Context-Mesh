@@ -6,12 +6,6 @@ Context Mesh is a typed context graph for long-running agents. It keeps not only
 *what* is connected, but *why* — where a claim came from, what a decision rested
 on, and what stops being true when an assumption fails.
 
-This repository is a working implementation, reverse-engineered from a screen
-capture of a dashboard posted publicly. It is an independent project with no
-affiliation to, or endorsement by, anyone involved in that capture. The
-dashboard is rebuilt too, and every number on it is computed by the engine
-rather than written into the page.
-
 ![The Context Mesh dashboard: build path, the live typed graph, hop budget, edge
 ledger, walk-vs-flat token cost, the traversal grid and the dead-end ledger](docs/img/dashboard.png)
 
@@ -29,7 +23,7 @@ Windows, `open dashboard/index.html` on macOS, or
 `xdg-open dashboard/index.html` on Linux.
 
 ```bash
-git clone https://github.com/charlessnydercareer/Context-Mesh
+git clone https://github.com/Deep-Sixed/Context-Mesh
 cd Context-Mesh
 
 python -m contextmesh demo            # build, walk, break an assumption, report
