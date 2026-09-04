@@ -139,6 +139,7 @@ class HTTPRequest:
     headers: Dict[str, str] = field(repr=False)
     body: bytes = field(repr=False)
     timeout: float = field(repr=False)
+    max_response_bytes: int = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -165,6 +166,7 @@ class LLMConfig:
     max_attempts: int = 3
     base_delay: float = 0.25
     max_tokens: int = 1024
+    max_response_bytes: int = 1_048_576
 
     def __post_init__(self) -> None:
         if not isinstance(self.provider, str) or not self.provider:
@@ -189,6 +191,12 @@ class LLMConfig:
             raise LLMConfigurationError("max_tokens must be a positive integer")
         if self.max_tokens < 1:
             raise LLMConfigurationError("max_tokens must be a positive integer")
+        if isinstance(self.max_response_bytes, bool) or not isinstance(
+            self.max_response_bytes, int
+        ):
+            raise LLMConfigurationError("max_response_bytes must be a positive integer")
+        if self.max_response_bytes < 1:
+            raise LLMConfigurationError("max_response_bytes must be a positive integer")
 
         if self.mode == "live":
             if self.provider not in LIVE_PROVIDERS:
@@ -256,6 +264,24 @@ class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _bounded_read(readable: Any, max_bytes: int) -> bytes:
+    """Read at most ``max_bytes`` and refuse whatever comes after.
+
+    ``.read()`` with no argument buffers the whole body regardless of how
+    large the provider's reply turns out to be, so a provider or an
+    intermediary between us and it can force an unbounded allocation just by
+    sending an unbounded response. Reading ``max_bytes + 1`` costs one extra
+    byte and tells us, without ever holding more than the limit plus one in
+    memory, whether the body would have exceeded it.
+    """
+    data = readable.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise LLMTransportError(
+            f"provider response exceeded the {max_bytes}-byte limit; refusing to buffer it"
+        )
+    return data
+
+
 class UrllibTransport:
     """Small HTTP transport whose failures expose no request headers or body."""
 
@@ -274,10 +300,10 @@ class UrllibTransport:
                 return HTTPResponse(
                     status=int(response.status),
                     headers={str(k): str(v) for k, v in response.headers.items()},
-                    body=response.read(),
+                    body=_bounded_read(response, request.max_response_bytes),
                 )
         except urllib.error.HTTPError as exc:
-            body = exc.read()
+            body = _bounded_read(exc, request.max_response_bytes)
             headers = {str(k): str(v) for k, v in exc.headers.items()} if exc.headers else {}
             return HTTPResponse(status=int(exc.code), headers=headers, body=body)
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
@@ -734,6 +760,7 @@ def _request_for(
         headers=headers,
         body=_json_bytes(body),
         timeout=float(config.timeout),
+        max_response_bytes=config.max_response_bytes,
     )
 
 

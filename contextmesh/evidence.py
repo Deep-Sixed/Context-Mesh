@@ -20,6 +20,14 @@ from .model import Node, NodeType, Provenance, slug
 INTAKE_VERSION = 1
 INTAKE_ATTR = "evidence_intake"
 
+#: Intake is the one boundary built for untrusted, high-volume input (see
+#: :func:`evidence_id_for`), so it is also the one place a caller-controlled
+#: payload can grow without bound if nothing here says otherwise.
+MAX_TEXT_BYTES = 65_536
+MAX_METADATA_BYTES = 65_536
+MAX_METADATA_DEPTH = 8
+MAX_COLLECTION_LENGTH = 1_000
+
 
 class EvidenceIntakeError(ValueError):
     """The observation cannot enter the graph under the PR #8A contract."""
@@ -36,13 +44,20 @@ class EvidenceReceipt:
     node: Node
 
 
-def _json_value(value: Any, path: str) -> Any:
+def _json_value(value: Any, path: str, *, depth: int = 0) -> Any:
     """Validate the strict JSON subset used by evidence metadata.
 
     Validation is recursive and deliberately does no coercion: tuples do not
     become lists, integer mapping keys do not become strings, and NaN/Infinity
-    do not become implementation-specific JSON constants.
+    do not become implementation-specific JSON constants. ``depth`` and each
+    collection's length are bounded here too, so a caller cannot spend
+    unbounded stack or memory building the value this function walks, before
+    ``validate_metadata`` gets to measure the whole thing.
     """
+    if depth > MAX_METADATA_DEPTH:
+        raise EvidenceIntakeError(
+            f"{path}: metadata nests deeper than {MAX_METADATA_DEPTH} levels"
+        )
     if value is None or isinstance(value, (bool, str)):
         return value
     if isinstance(value, int):
@@ -52,15 +67,28 @@ def _json_value(value: Any, path: str) -> Any:
             raise EvidenceIntakeError(f"{path}: {value!r} is not a finite JSON number")
         return value
     if isinstance(value, list):
-        return [_json_value(item, f"{path}[{index}]") for index, item in enumerate(value)]
+        if len(value) > MAX_COLLECTION_LENGTH:
+            raise EvidenceIntakeError(
+                f"{path}: list has {len(value)} items, over the "
+                f"{MAX_COLLECTION_LENGTH}-item limit"
+            )
+        return [
+            _json_value(item, f"{path}[{index}]", depth=depth + 1)
+            for index, item in enumerate(value)
+        ]
     if isinstance(value, dict):
+        if len(value) > MAX_COLLECTION_LENGTH:
+            raise EvidenceIntakeError(
+                f"{path}: object has {len(value)} keys, over the "
+                f"{MAX_COLLECTION_LENGTH}-key limit"
+            )
         copied: Dict[str, Any] = {}
         for key, item in value.items():
             if not isinstance(key, str):
                 raise EvidenceIntakeError(
                     f"{path}: object keys must be strings, got {key!r}"
                 )
-            copied[key] = _json_value(item, f"{path}.{key}")
+            copied[key] = _json_value(item, f"{path}.{key}", depth=depth + 1)
         return copied
     raise EvidenceIntakeError(
         f"{path}: {type(value).__name__} is not accepted evidence metadata"
@@ -76,18 +104,25 @@ def validate_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         )
     copied = _json_value(metadata, "metadata")
     assert isinstance(copied, dict)
-    # The recursive validator above is the type gate.  This round trip detaches
+    # The recursive validator above is the type gate. This round trip detaches
     # caller-owned lists/dicts so mutating the input after return cannot mutate
-    # the graph without a new evidence id or checkpoint.
-    return json.loads(
-        json.dumps(
-            copied,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        )
+    # the graph without a new evidence id or checkpoint, and it is also where
+    # the serialized size ceiling is measured — depth and per-collection
+    # length are cheap to check while walking, but "how many bytes will this
+    # be on disk" is only answerable once the whole thing is one string.
+    serialized = json.dumps(
+        copied,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
     )
+    size = len(serialized.encode("utf-8"))
+    if size > MAX_METADATA_BYTES:
+        raise EvidenceIntakeError(
+            f"metadata is {size} bytes, over the {MAX_METADATA_BYTES}-byte limit"
+        )
+    return json.loads(serialized)
 
 
 def canonical_payload(
@@ -240,6 +275,11 @@ class EvidenceIntake:
     ) -> EvidenceReceipt:
         if not isinstance(text, str) or not text.strip():
             raise EvidenceIntakeError("text must be a non-empty string")
+        text_size = len(text.encode("utf-8"))
+        if text_size > MAX_TEXT_BYTES:
+            raise EvidenceIntakeError(
+                f"text is {text_size} bytes, over the {MAX_TEXT_BYTES}-byte limit"
+            )
         if not isinstance(source_id, str) or not source_id.strip():
             raise EvidenceIntakeError("source_id must be a non-empty string")
         source = self.graph.get(source_id)

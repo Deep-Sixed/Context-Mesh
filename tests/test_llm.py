@@ -177,6 +177,8 @@ class ConfigurationTest(unittest.TestCase):
             ("max_attempts", 0),
             ("base_delay", -1),
             ("max_tokens", 0),
+            ("max_response_bytes", 0),
+            ("max_response_bytes", True),
         ):
             with self.subTest(field=field, value=value):
                 args = {field: value}
@@ -593,13 +595,14 @@ class RedirectRefusalTest(unittest.TestCase):
 
         return self.serve(Redirect)
 
-    def request_to(self, port):
+    def request_to(self, port, *, max_response_bytes=1_048_576):
         return HTTPRequest(
             method="POST",
             url=f"http://127.0.0.1:{port}/v1/responses",
             headers=dict(self.CREDENTIALS, **{"Content-Type": "application/json"}),
             body=b"{}",
             timeout=5.0,
+            max_response_bytes=max_response_bytes,
         )
 
     def credentials_that_escaped(self):
@@ -640,6 +643,41 @@ class RedirectRefusalTest(unittest.TestCase):
         response = UrllibTransport()(self.request_to(self.sink_port))
         self.assertEqual(response.status, 200)
         self.assertEqual(json.loads(response.body), {"ok": True})
+
+    def oversized_server(self, *, status=200):
+        payload = b"x" * 4096
+
+        class Oversized(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        return self.serve(Oversized)
+
+    def test_an_oversized_success_body_is_refused_without_buffering_it(self):
+        port = self.oversized_server(status=200)
+        request = self.request_to(port, max_response_bytes=1024)
+        with self.assertRaisesRegex(LLMTransportError, "1024-byte limit"):
+            UrllibTransport()(request)
+
+    def test_an_oversized_error_body_is_refused_the_same_way(self):
+        """A provider returning a huge *error* page is the same memory risk."""
+        port = self.oversized_server(status=500)
+        request = self.request_to(port, max_response_bytes=1024)
+        with self.assertRaisesRegex(LLMTransportError, "1024-byte limit"):
+            UrllibTransport()(request)
+
+    def test_a_body_at_exactly_the_limit_is_accepted(self):
+        port = self.oversized_server(status=200)
+        request = self.request_to(port, max_response_bytes=4096)
+        response = UrllibTransport()(request)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(len(response.body), 4096)
 
 
 if __name__ == "__main__":

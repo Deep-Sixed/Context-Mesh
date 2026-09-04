@@ -8,6 +8,10 @@ import unittest
 from pathlib import Path
 
 from contextmesh.evidence import (
+    MAX_COLLECTION_LENGTH,
+    MAX_METADATA_BYTES,
+    MAX_METADATA_DEPTH,
+    MAX_TEXT_BYTES,
     EvidenceConflictError,
     EvidenceIntake,
     EvidenceIntakeError,
@@ -108,6 +112,35 @@ class EvidenceIntakeTest(unittest.TestCase):
         for value in bad:
             with self.subTest(value=repr(value)), self.assertRaises(EvidenceIntakeError):
                 self.submit(metadata=value)
+
+    def test_oversized_text_is_refused_before_mutation(self):
+        before = self.graph.to_dict()
+        with self.assertRaisesRegex(EvidenceIntakeError, "byte limit"):
+            self.submit(text="x" * (MAX_TEXT_BYTES + 1))
+        self.assertEqual(self.graph.to_dict(), before)
+        # The boundary itself is accepted: this is a limit, not an off-by-one trap.
+        self.submit(text="x" * MAX_TEXT_BYTES, external_id="at-the-text-limit")
+
+    def test_oversized_metadata_is_refused_before_mutation(self):
+        before = self.graph.to_dict()
+        with self.assertRaisesRegex(EvidenceIntakeError, "byte limit"):
+            self.submit(metadata={"blob": "x" * MAX_METADATA_BYTES})
+        self.assertEqual(self.graph.to_dict(), before)
+
+    def test_metadata_nesting_depth_is_bounded(self):
+        value = "leaf"
+        for _ in range(MAX_METADATA_DEPTH + 2):
+            value = {"nested": value}
+        with self.assertRaisesRegex(EvidenceIntakeError, "nests deeper"):
+            self.submit(metadata=value)
+
+    def test_metadata_collection_length_is_bounded(self):
+        with self.assertRaisesRegex(EvidenceIntakeError, "item limit"):
+            self.submit(metadata={"items": list(range(MAX_COLLECTION_LENGTH + 1))})
+        with self.assertRaisesRegex(EvidenceIntakeError, "key limit"):
+            self.submit(
+                metadata={str(i): i for i in range(MAX_COLLECTION_LENGTH + 1)}
+            )
 
     def test_metadata_is_detached_from_caller_memory(self):
         metadata = {"packages": ["argon2-cffi"], "nested": {"severity": "high"}}
