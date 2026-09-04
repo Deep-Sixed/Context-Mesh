@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set
 
 from .model import (
     Assumption,
+    AssumptionStatus,
     Edge,
     EdgeType,
     Node,
@@ -495,11 +496,25 @@ class ContextGraph:
                     )
 
         for edge in graph.edges.values():
-            if edge.assumption_id is not None and edge.assumption_id not in graph.assumptions:
-                raise SnapshotError(
-                    f"edge {edge.id!r}: assumption_id names {edge.assumption_id!r}, "
-                    "which is not in the snapshot"
-                )
+            if edge.assumption_id is not None:
+                if edge.assumption_id not in graph.assumptions:
+                    raise SnapshotError(
+                        f"edge {edge.id!r}: assumption_id names {edge.assumption_id!r}, "
+                        "which is not in the snapshot"
+                    )
+                # Rejection invalidates a bound edge directly (GRAPH.md, "What
+                # edge-level assumption binding means"), so a snapshot where
+                # the bound assumption fell but the edge did not is one where
+                # that never happened -- two records disagreeing about
+                # whether this relationship still holds. Supersession is not
+                # this: a superseded assumption was replaced, not disproved,
+                # so a bound edge surviving that is not a contradiction.
+                bound = graph.assumptions[edge.assumption_id]
+                if bound.status is AssumptionStatus.REJECTED and edge.live:
+                    raise SnapshotError(
+                        f"edge {edge.id!r} is bound to rejected assumption "
+                        f"{edge.assumption_id!r} but restores as live"
+                    )
             for evidence_id in edge.evidence_ids:
                 if evidence_id not in graph.nodes:
                     raise SnapshotError(

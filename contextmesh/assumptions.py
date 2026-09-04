@@ -86,6 +86,13 @@ def apply_invalidation(
     assumption falls, and :func:`contextmesh.temporal.as_of_graph` calls it to
     derive the invalidation a past projection had — which has to be *derived*
     rather than copied forward, or the past inherits today's casualties.
+
+    An edge falls for either of two independent reasons: it is bound to this
+    assumption via `justifies` (``edge.assumption_id == assumption_id`` —
+    the relationship itself no longer holds), or both its endpoints are in
+    `radius` (rule 2 already reached them some other way). A bound edge's
+    endpoints do not fall *because* the edge is bound; only `radius`, which
+    `blast_radius` derives purely from rule 2's propagating edges, decides that.
     """
     graph.node(assumption_id).invalidated = True
     invalidated_edges: List[str] = []
@@ -146,8 +153,39 @@ class AssumptionLedger:
         return new
 
     def justifies(self, assumption_id: str, edge_id: str) -> None:
-        """Mark an existing edge as standing on an assumption."""
-        self.graph.edges[edge_id].assumption_id = assumption_id
+        """Bind an edge to an assumption: the relationship holds only while
+        the assumption stands (GRAPH.md, "What edge-level assumption binding
+        means"). Rejecting the assumption invalidates this edge directly; it
+        does not, by itself, invalidate ``edge.src`` or ``edge.dst`` — a node
+        that must fall with the assumption needs its own `depends_on`.
+
+        Refuses a dangling assumption id, a dangling or dead edge id, and
+        rebinding an edge already bound to a *different* assumption.
+        Binding the same (assumption, edge) pair again is a no-op.
+        """
+        graph = self.graph
+        if assumption_id not in graph.assumptions:
+            raise AssumptionError(f"no assumption {assumption_id!r} in this graph")
+        edge = graph.edges.get(edge_id)
+        if edge is None:
+            raise AssumptionError(f"no edge {edge_id!r} in this graph")
+        if not edge.live:
+            raise AssumptionError(f"edge {edge_id!r} is not live")
+        if edge.assumption_id == assumption_id:
+            return
+        if edge.assumption_id is not None:
+            raise AssumptionError(
+                f"edge {edge_id!r} is already bound to assumption "
+                f"{edge.assumption_id!r}; refusing to silently rebind it "
+                f"to {assumption_id!r}"
+            )
+        assumption = graph.assumptions[assumption_id]
+        if assumption.status is not AssumptionStatus.ACTIVE:
+            raise AssumptionError(
+                f"cannot bind edge {edge_id!r} to assumption {assumption_id!r}: "
+                f"status is {assumption.status.value}, not active"
+            )
+        edge.assumption_id = assumption_id
 
     def depends(self, node_id: str, assumption_id: str) -> None:
         """Wire a decision or claim to the assumption it rests on."""
@@ -160,6 +198,10 @@ class AssumptionLedger:
         Walks *backwards* along the propagating edge types from the assumption:
         a decision `depends_on` an assumption, a claim is `derived_from` that
         decision, an entity is `produces`d by it, and so on down the line.
+        Rule 2 is the only mechanism this follows: an edge bound to this
+        assumption via `justifies` does not seed its endpoints in here on its
+        own, however that edge is invalidated too, in `apply_invalidation`,
+        which does not depend on `blast_radius` to reach it.
 
         Direction comes from ``graph.ontology``, not the module-level
         ``BACKWARD``/``FORWARD``: ``ContextGraph`` accepts a custom
@@ -176,22 +218,6 @@ class AssumptionLedger:
 
         reached: Dict[str, List[str]] = {}
         frontier: List[Tuple[str, List[str]]] = [(assumption_id, [start_label])]
-
-        seeds: List[Tuple[str, List[str]]] = []
-        # Edges explicitly justified by the assumption drag their target in too.
-        for edge in graph.edges.values():
-            if edge.assumption_id == assumption_id and edge.live:
-                seeds.append(
-                    (
-                        edge.dst,
-                        [
-                            start_label,
-                            f"justifies {edge.type.value} edge",
-                            graph.node(edge.dst).label,
-                        ],
-                    )
-                )
-        frontier.extend(seeds)
 
         while frontier:
             node_id, chain = frontier.pop(0)

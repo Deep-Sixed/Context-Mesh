@@ -271,7 +271,9 @@ class Edge:
     src: str
     dst: str
     type: EdgeType
-    #: the assumption that justifies this edge existing at all, if any
+    #: the assumption this relationship is conditional on, if any -- the edge
+    #: holds only while it stands; see GRAPH.md, "What edge-level assumption
+    #: binding means". Set only through AssumptionLedger.justifies.
     assumption_id: Optional[str] = None
     evidence_ids: List[str] = field(default_factory=list)
     weight: float = 1.0
