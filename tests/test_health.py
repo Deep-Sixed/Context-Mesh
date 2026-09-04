@@ -54,6 +54,26 @@ class SignalTest(unittest.TestCase):
         self.assertIn("provenance_gap", signals)
         self.assertEqual(signals["provenance_gap"].severity, "error")
 
+    def test_a_source_the_provenance_points_at_but_is_dead_is_still_a_gap(self):
+        """Resolving to a node is not enough if that node is not live.
+
+        A claim whose ``provenance.source_id`` names a real ``source`` node
+        that has since been pruned or invalidated has no more of a path to a
+        source than one naming nothing at all — the whole point of ``live``
+        gating everything else this signal counts.
+        """
+        graph = ContextGraph()
+        source = graph.add_node(
+            NodeType.SOURCE, "Doc", attrs={"origin": "fixture", "retrieved_at": "fixture"}
+        )
+        source.invalidated = True
+        claim = graph.add_node(
+            NodeType.CLAIM, "Thing is fine", provenance=Provenance(source_id=source.id)
+        )
+        signals = {s.kind: s for s in check(graph)}
+        self.assertIn("provenance_gap", signals)
+        self.assertIn(claim.id, signals["provenance_gap"].items)
+
     def test_prose_that_matched_nothing_is_not_a_health_signal(self):
         resolver = Resolver()
         resolver.register("entity:a", "pgvector")

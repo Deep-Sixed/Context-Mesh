@@ -160,8 +160,17 @@ class AssumptionLedger:
         Walks *backwards* along the propagating edge types from the assumption:
         a decision `depends_on` an assumption, a claim is `derived_from` that
         decision, an entity is `produces`d by it, and so on down the line.
+
+        Direction comes from ``graph.ontology``, not the module-level
+        ``BACKWARD``/``FORWARD``: ``ContextGraph`` accepts a custom
+        ``Ontology`` (live, or restored through ``from_dict``), and a graph
+        built against one has to invalidate under that same one, not
+        whichever ontology happened to be the process-global default when
+        this module was imported.
         """
         graph = self.graph
+        backward = graph.ontology.backward
+        forward = graph.ontology.forward
         assumption = graph.assumptions[assumption_id]
         start_label = f"assumption({assumption.statement[:48]})"
 
@@ -191,7 +200,7 @@ class AssumptionLedger:
                     continue
                 reached[node_id] = chain
             # Whoever depends on this node, or derives from it, falls with it.
-            for edge in graph.in_edges(node_id, BACKWARD):
+            for edge in graph.in_edges(node_id, backward):
                 parent = graph.node(edge.src)
                 if parent.type is NodeType.ASSUMPTION:
                     continue
@@ -200,7 +209,7 @@ class AssumptionLedger:
                 )
             # Whatever this node produced falls with it too.
             if node_id != assumption_id:
-                for edge in graph.out_edges(node_id, FORWARD):
+                for edge in graph.out_edges(node_id, forward):
                     child = graph.node(edge.dst)
                     frontier.append(
                         (child.id, [*chain, f"-{edge.type.value}->", child.label])

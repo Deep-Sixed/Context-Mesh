@@ -92,10 +92,13 @@ def check(
             graph.node(e.dst).type is NodeType.SOURCE
             for e in graph.out_edges(node.id, (EdgeType.DERIVED_FROM, EdgeType.CITES))
         )
+        provenance_source = (
+            graph.get(node.provenance.source_id) if node.provenance is not None else None
+        )
         provenance_resolves = (
-            node.provenance is not None
-            and graph.get(node.provenance.source_id) is not None
-            and graph.node(node.provenance.source_id).type is NodeType.SOURCE
+            provenance_source is not None
+            and provenance_source.type is NodeType.SOURCE
+            and provenance_source.live
         )
         if not (has_source or provenance_resolves):
             gaps.append(node.id)

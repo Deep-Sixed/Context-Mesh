@@ -73,6 +73,51 @@ class InvalidationDirectionTest(unittest.TestCase):
         self.assertEqual(assumptions.FORWARD, ONTOLOGY.forward)
         self.assertEqual(assumptions.PROPAGATING, ONTOLOGY.propagating)
 
+    def test_blast_radius_follows_the_graphs_own_ontology_not_the_module_default(self):
+        """A graph built against a non-default Ontology invalidates by *its*
+        Invalidation column, not by the process-global ``ONTOLOGY`` that
+        ``assumptions.BACKWARD``/``FORWARD`` happen to equal today.
+
+        ``depends_on`` is declared ``backward`` in the real file; this loads a
+        variant where it is ``none`` and proves a decision standing on a
+        rejected assumption through ``depends_on`` is *not* pulled into the
+        blast radius when the graph's own ontology says that edge does not
+        propagate — which only holds if ``blast_radius`` reads
+        ``graph.ontology`` at traversal time rather than the module import.
+        """
+        from contextmesh.assumptions import AssumptionLedger
+
+        text = Path(ONTOLOGY_FILE).read_text(encoding="utf-8").replace(
+            "| `depends_on` | decision→assumption, decision→decision, "
+            "claim→assumption | backward |",
+            "| `depends_on` | decision→assumption, decision→decision, "
+            "claim→assumption | none |",
+            1,
+        )
+        self.assertNotEqual(text, Path(ONTOLOGY_FILE).read_text(encoding="utf-8"))
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "GRAPH.md"
+            path.write_text(text, encoding="utf-8")
+            custom = load(path)
+        self.assertEqual(custom.invalidation["depends_on"], "none")
+
+        graph = ContextGraph(ontology=custom)
+        ledger = AssumptionLedger(graph)
+        assumption = ledger.assume("Shard count grows linearly with corpus size")
+        source = graph.add_node(
+            NodeType.SOURCE, "Doc", attrs={"origin": "x", "retrieved_at": "x"}
+        )
+        decision = graph.add_node(
+            NodeType.DECISION,
+            "Rebuild the index",
+            attrs={"rationale": "x"},
+            provenance=Provenance(source_id=source.id),
+        )
+        graph.add_edge(decision.id, EdgeType.DEPENDS_ON, assumption.id)
+
+        radius = ledger.blast_radius(assumption.id)
+        self.assertNotIn(decision.id, radius)
+
 
 class MustCarryTest(unittest.TestCase):
     """GRAPH.md's Must carry column, parsed and enforced at the write boundary."""
@@ -111,6 +156,18 @@ class MustCarryTest(unittest.TestCase):
         )
         self.assertNotIn("provenance", claim.attrs)
         self.assertIsNotNone(claim.provenance)
+
+    def test_a_node_field_cannot_be_satisfied_by_shadowing_it_in_attrs(self):
+        """GRAPH.md: ``provenance`` is a field, not an attribute.
+
+        ``attrs={"provenance": None}`` must not give a caller a second,
+        easier route to satisfying Must carry while the real ``Node.provenance``
+        field stays unset — that would mean two answers to "does this claim
+        have provenance", one of them a plain dict entry nothing else reads.
+        """
+        graph = ContextGraph()
+        with self.assertRaisesRegex(OntologyError, "provenance"):
+            graph.add_node(NodeType.CLAIM, "A claim", attrs={"provenance": None})
 
     def test_presence_is_enough_even_if_the_value_is_not_well_formed(self):
         """GRAPH.md: `retrieved_at="at plan time"` satisfies presence, not dates."""
