@@ -12,13 +12,13 @@ This is not documentation of the code; it is the schema the code loads. See
 their legal pairs, and the rules below. Where an implementation and this file
 disagree about any of those, this file is right and the implementation is a bug.
 
-**What is mechanically enforced.** `ontology.py` parses the `Type` column of the
-node table and the `Edge` and `Legal pairs` columns of the edge table; every
-write is checked against them, and `tests/test_ontology.py` asserts that the
-`NodeType` and `EdgeType` enums equal what this file declares. `Symbol`, `Means`
-and `Must carry` are not parsed. The rules below are prose and are enforced, or
-not, one at a time — the *Declared, not yet realized* section names the ones
-that currently are not.
+**What is mechanically enforced.** `ontology.py` parses the `Type` and `Symbol`
+columns of the node table, the `Must carry` column of the node table, and the
+`Edge`, `Legal pairs` and `Invalidation` columns of the edge table; every write
+is checked against them, and `tests/test_ontology.py` asserts that the
+`NodeType` and `EdgeType` enums equal what this file declares. `Means` is prose
+and is not parsed. The rules below are enforced, or not, one at a time — the
+*Declared, not yet realized* section names the ones that currently are not.
 
 **What `Must carry` means.** It is a *minimum*, not an exhaustive list: a node
 may carry more. It is satisfied by a node `attrs` key **or** by a `Node` field of
@@ -26,8 +26,11 @@ that name — `provenance` is a field, not an attribute. It requires the value t
 be **present**, not to be well-formed: `contextmesh/execute.py` mints sources
 with `retrieved_at="at plan time"`, which satisfies the presence requirement
 defined here, and the temporal layer separately classifies such a source as
-`UNDATED` rather than guessing a date. Nothing enforces this column today; see
-*Open items*.
+`UNDATED` rather than guessing a date. `ContextGraph.add_node` enforces this at
+the write boundary — presence only, nothing more — and refuses a node missing a
+required name with `OntologyError`. Every path that constructs a node,
+including restoring a persisted snapshot, goes through `add_node`, so this is
+one check rather than one per caller.
 
 **Code is evidence, not authority.** A behaviour may be written into this file
 when the implementation *structurally guarantees* it — when no caller can make
@@ -50,18 +53,26 @@ normative by having been written first; it requires a decision recorded here.
 
 An edge is legal only if the pair `(source type, target type)` appears in its row.
 
-| Edge | Legal pairs | Means |
-|---|---|---|
-| `mentions` | source→entity, claim→entity | The text refers to this resolved entity. |
-| `derived_from` | claim→source, decision→claim, entity→source | This exists because that exists. |
-| `cites` | decision→source, claim→claim | Explicit reference made by the author. |
-| `contradicts` | claim→claim, evidence→claim, evidence→assumption | Both cannot hold. |
-| `supports` | evidence→claim, claim→decision, evidence→decision | Raises confidence in the target. |
-| `depends_on` | decision→assumption, decision→decision, claim→assumption | Target's failure invalidates the source. |
-| `produces` | decision→entity, decision→source | The decision brought the target into being. |
-| `supersedes` | decision→decision, assumption→assumption, claim→claim | Replaces, without deleting. |
-| `justified_by` | decision→evidence, claim→evidence, assumption→evidence | The reason this was allowed to stand. |
-| `resolves_to` | entity→entity | An alias node folding into its canonical id. |
+`Invalidation` is rule 2's propagation direction, machine-readable: `backward`
+means the edge is walked from target to source when an assumption falls (the
+thing that depends falls when its ground falls), `forward` means source to
+target (an artefact falls with the decision that made it), and `none` means
+the edge never propagates a fall. `contextmesh/assumptions.py` reads this
+column through `ontology.py` rather than restating it, so the two cannot
+disagree.
+
+| Edge | Legal pairs | Invalidation | Means |
+|---|---|---|---|
+| `mentions` | source→entity, claim→entity | none | The text refers to this resolved entity. |
+| `derived_from` | claim→source, decision→claim, entity→source | backward | This exists because that exists. |
+| `cites` | decision→source, claim→claim | none | Explicit reference made by the author. |
+| `contradicts` | claim→claim, evidence→claim, evidence→assumption | none | Both cannot hold. |
+| `supports` | evidence→claim, claim→decision, evidence→decision | none | Raises confidence in the target. |
+| `depends_on` | decision→assumption, decision→decision, claim→assumption | backward | Target's failure invalidates the source. |
+| `produces` | decision→entity, decision→source | forward | The decision brought the target into being. |
+| `supersedes` | decision→decision, assumption→assumption, claim→claim | none | Replaces, without deleting. |
+| `justified_by` | decision→evidence, claim→evidence, assumption→evidence | none | The reason this was allowed to stand. |
+| `resolves_to` | entity→entity | none | An alias node folding into its canonical id. |
 
 ## Rules
 
@@ -111,20 +122,24 @@ resolved by pointing at current behaviour.
    decision node: the node carries `Node.build`, while `at_build` lives on
    `DecisionRecord`, which is not part of the graph snapshot. The false token is
    removed; naming the intended field is open.
-2. **`Symbol` is unverified.** `ontology.py` derives the symbol by lowercasing
-   `Type` and never reads the column, so the two could diverge silently. Either
-   make the parser read `Symbol`, or drop the column.
-3. **Rule 2's propagation set is restated in code.** `BACKWARD` and `FORWARD` in
-   `contextmesh/assumptions.py` express the same fact as rule 2 with no
-   mechanical link to it. Making that checkable needs a machine-readable form
-   here, since prose cannot be compared by set equality.
-4. **`AssumptionLedger.justifies` propagates further than its wording.** Its
+2. **`AssumptionLedger.justifies` propagates further than its wording.** Its
    docstring marks an *edge* as standing on an assumption; rejection reaches
    through the edge to invalidate `edge.dst`. Nothing depends on that today.
    Until it is decided, the current behaviour is unspecified and must not be
    relied on.
-5. **`Must carry` has no enforcement path.** Its strength is now defined above;
-   whether to enforce it, and where, is open.
+
+Resolved since the list above was first written, kept here as a record rather
+than deleted, since a reader following an old reference should land somewhere
+that says what happened to it:
+
+- **`Symbol` was unverified.** `ontology.py` now reads the column and refuses
+  to load if it disagrees with `Type`; see *What is mechanically enforced*.
+- **Rule 2's propagation set was restated in code.** The edge table's
+  `Invalidation` column is now that machine-readable form, and
+  `contextmesh/assumptions.py` reads it through `ontology.py` instead of
+  restating it.
+- **`Must carry` had no enforcement path.** `ContextGraph.add_node` now
+  enforces it; see *What `Must carry` means*.
 
 Out of scope for this file today: how entity identity should be asserted,
 recorded or retracted. `resolves_to` exists as a declaration only, and the

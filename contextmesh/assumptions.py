@@ -10,7 +10,7 @@ not a useful answer without "and here is what we deliberately kept".
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
 
 from .graph import ContextGraph
 from .model import (
@@ -20,6 +20,7 @@ from .model import (
     NodeType,
     slug,
 )
+from .ontology import ONTOLOGY
 
 # Failure travels along these edges and no others (GRAPH.md rule 2), and the
 # direction matters:
@@ -30,9 +31,13 @@ from .model import (
 #
 # Nothing else propagates. `mentions`, `cites`, `supports` and `supersedes`
 # survive an invalidation, which is what makes it selective rather than a purge.
-BACKWARD: Tuple[EdgeType, ...] = (EdgeType.DEPENDS_ON, EdgeType.DERIVED_FROM)
-FORWARD: Tuple[EdgeType, ...] = (EdgeType.PRODUCES,)
-PROPAGATING: Tuple[EdgeType, ...] = BACKWARD + FORWARD
+#
+# The direction itself is not restated here: `ontology.py` parses it from
+# GRAPH.md's edge-table `Invalidation` column, and this module reads it from
+# there, so it cannot hold a copy that disagrees with the file.
+BACKWARD: FrozenSet[str] = ONTOLOGY.backward
+FORWARD: FrozenSet[str] = ONTOLOGY.forward
+PROPAGATING: FrozenSet[str] = ONTOLOGY.propagating
 
 
 class AssumptionError(Exception):

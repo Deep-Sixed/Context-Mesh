@@ -176,8 +176,16 @@ class OrderingTest(unittest.TestCase):
     def fixture(bravo_first=False):
         graph = ContextGraph()
         graph.build = 1
-        source = graph.add_node(NodeType.SOURCE, "Capacity note")
-        entity = graph.add_node(NodeType.ENTITY, "Index Builder")
+        source = graph.add_node(
+            NodeType.SOURCE,
+            "Capacity note",
+            attrs={"origin": "fixture", "retrieved_at": "fixture"},
+        )
+        entity = graph.add_node(
+            NodeType.ENTITY,
+            "Index Builder",
+            attrs={"canonical": "Index Builder", "aliases": []},
+        )
         alpha = graph.add_node(
             NodeType.CLAIM, "Index Builder alpha outcome recorded",
             provenance=Provenance(source_id=source.id, span=(0, 4)),
@@ -244,16 +252,28 @@ class IntegrityTest(unittest.TestCase):
     def setUp(self):
         graph = ContextGraph()
         graph.build = 3
-        source = graph.add_node(NodeType.SOURCE, "Postmortem")
-        entity = graph.add_node(NodeType.ENTITY, "Rebuild")
+        source = graph.add_node(
+            NodeType.SOURCE,
+            "Postmortem",
+            attrs={"origin": "fixture", "retrieved_at": "fixture"},
+        )
+        entity = graph.add_node(
+            NodeType.ENTITY,
+            "Rebuild",
+            attrs={"canonical": "Rebuild", "aliases": []},
+        )
         claim = graph.add_node(NodeType.CLAIM, "Rebuild exhausted memory",
                                provenance=Provenance(source_id=source.id))
         graph.add_edge(claim.id, EdgeType.MENTIONS, entity.id)
         graph.add_edge(claim.id, EdgeType.DERIVED_FROM, source.id)
         ledger = AssumptionLedger(graph)
         assumption = ledger.assume("Shards stay under four gigabytes")
-        decision = graph.add_node(NodeType.DECISION, "Rebuild in partitions",
-                                  attrs={"rationale": "bounded memory"})
+        decision = graph.add_node(
+            NodeType.DECISION,
+            "Rebuild in partitions",
+            attrs={"rationale": "bounded memory"},
+            provenance=Provenance(source_id=source.id),
+        )
         graph.add_edge(decision.id, EdgeType.DEPENDS_ON, assumption.id)
         graph.add_edge(decision.id, EdgeType.PRODUCES, entity.id)
         self.graph = graph
@@ -685,7 +705,10 @@ class IntegrityTest(unittest.TestCase):
         p = self.payload()
         node = next(n for n in p["nodes"] if n["id"] == self.assumption_id)
         node["attrs"] = {}
-        self.refuses(p)
+        # Wiping attrs entirely removes `status`/`version` themselves, not just
+        # their agreement with the record, so Must carry refuses it first —
+        # a stricter, earlier rejection than the mirror-mismatch check below.
+        self.refuses(p, OntologyError)
 
     # ── non-JSON values ──────────────────────────────────────────────────
     def test_saving_a_nan_is_refused_rather_than_written(self):

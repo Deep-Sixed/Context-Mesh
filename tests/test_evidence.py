@@ -55,6 +55,7 @@ class EvidenceIntakeTest(unittest.TestCase):
             "Use Argon2id",
             id="decision:argon",
             attrs={"rationale": "fixture", "at_build": 0},
+            provenance=Provenance(source_id=self.source.id),
         )
 
     def submit(self, **overrides):
@@ -238,7 +239,12 @@ class EvidenceIntakeTest(unittest.TestCase):
             external_id="CVE-2026-9999",
             metadata=metadata,
         )
-        self.graph.add_node(NodeType.CLAIM, "collision", id=evidence_id_for(canonical))
+        self.graph.add_node(
+            NodeType.CLAIM,
+            "collision",
+            id=evidence_id_for(canonical),
+            provenance=Provenance(source_id=self.source.id),
+        )
         with self.assertRaises(EvidenceConflictError):
             self.submit()
 
@@ -345,7 +351,10 @@ class EvidenceIdentityTest(unittest.TestCase):
     def setUp(self):
         self.graph = ContextGraph()
         self.source = self.graph.add_node(
-            NodeType.SOURCE, "NVD feed", id="source:nvd"
+            NodeType.SOURCE,
+            "NVD feed",
+            id="source:nvd",
+            attrs={"origin": "nvd", "retrieved_at": "fixture"},
         )
 
     def canonical(self, text, external_id=None, metadata=None):

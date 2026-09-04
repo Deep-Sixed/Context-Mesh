@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from collections import defaultdict
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set
@@ -16,6 +17,35 @@ from .model import (
     slug,
 )
 from .ontology import ONTOLOGY, Ontology, OntologyError
+
+#: Every field a ``Node`` can carry. GRAPH.md's "Must carry" is satisfied by
+#: either one of these fields (present means not ``None``) or an ``attrs``
+#: key of the same name; see ``_check_must_carry``.
+_NODE_FIELD_NAMES = frozenset(f.name for f in dataclasses.fields(Node))
+
+
+def _check_must_carry(node: Node, ontology: Ontology) -> None:
+    """Fail closed if ``node`` is missing a name its type's row requires.
+
+    Presence only, per GRAPH.md's "What `Must carry` means": a required name
+    is satisfied by an ``attrs`` key regardless of its value, or by a ``Node``
+    field of the same name that is not ``None`` — ``provenance`` is the field
+    case, everything else so far is an ``attrs`` key. Nothing here checks
+    whether the value is well-formed, only whether it is there.
+    """
+    required = ontology.must_carry.get(node.type.value, frozenset())
+    missing = [
+        name
+        for name in required
+        if name not in node.attrs
+        and not (name in _NODE_FIELD_NAMES and getattr(node, name) is not None)
+    ]
+    if missing:
+        raise OntologyError(
+            f"{node.type.value} node {node.id!r} is missing "
+            f"{', '.join(sorted(missing))}; GRAPH.md's Must carry for "
+            f"{node.type.value} is {sorted(required)}"
+        )
 
 #: The durable snapshot format. Separate from ``mesh.json``, which is the
 #: dashboard's projection: a view may be shaped for whatever reads it, a state
@@ -92,6 +122,7 @@ class ContextGraph:
             embedding=embedding,
             build=self.build,
         )
+        _check_must_carry(node, self.ontology)
         self.nodes[node_id] = node
         return node
 

@@ -78,7 +78,9 @@ class DeadEndTest(unittest.TestCase):
     def test_seed_with_no_typed_edge_says_so(self):
         graph = ContextGraph()
         resolver = Resolver()
-        entity = graph.add_node(NodeType.ENTITY, "Kryptonite")
+        entity = graph.add_node(
+            NodeType.ENTITY, "Kryptonite", attrs={"canonical": "Kryptonite", "aliases": []}
+        )
         resolver.register(entity.id, "Kryptonite")
         walk = Walker(graph, resolver).ask("What do we know about Kryptonite?")
         self.assertIs(walk.dead_end, DeadEnd.NO_TYPED_EDGE)
@@ -87,8 +89,12 @@ class DeadEndTest(unittest.TestCase):
     def test_reaching_only_an_irrelevant_claim_is_wrong_node_type(self):
         graph = ContextGraph()
         resolver = Resolver()
-        entity = graph.add_node(NodeType.ENTITY, "Kryptonite")
-        source = graph.add_node(NodeType.SOURCE, "Almanac")
+        entity = graph.add_node(
+            NodeType.ENTITY, "Kryptonite", attrs={"canonical": "Kryptonite", "aliases": []}
+        )
+        source = graph.add_node(
+            NodeType.SOURCE, "Almanac", attrs={"origin": "fixture", "retrieved_at": "fixture"}
+        )
         claim = graph.add_node(
             NodeType.CLAIM,
             "Zebras graze on open savannah during the wet season",

@@ -1,10 +1,12 @@
 """GRAPH.md is the schema, so the schema is what these tests check."""
 
+import tempfile
 import unittest
+from pathlib import Path
 
 from contextmesh.graph import ContextGraph
-from contextmesh.model import EdgeType, NodeType
-from contextmesh.ontology import ONTOLOGY, OntologyError, load
+from contextmesh.model import EdgeType, NodeType, Provenance
+from contextmesh.ontology import ONTOLOGY, ONTOLOGY_FILE, OntologyError, load
 
 
 class OntologyFileTest(unittest.TestCase):
@@ -29,13 +31,174 @@ class OntologyFileTest(unittest.TestCase):
     def test_reload_is_stable(self):
         self.assertEqual(load().signatures, ONTOLOGY.signatures)
 
+    def test_symbol_column_is_what_populates_node_types(self):
+        """Every parsed node type is the Symbol column, not Type lowercased.
+
+        For the real file these currently agree, so this only proves the
+        parser reads the right column; ``MalformedFileTest`` below proves it
+        actually checks the two against each other.
+        """
+        self.assertEqual(ONTOLOGY.node_types, {"entity", "claim", "source",
+                                                 "decision", "assumption", "evidence"})
+
+
+class InvalidationDirectionTest(unittest.TestCase):
+    """GRAPH.md rule 2, now machine-readable as the edge table's own column."""
+
+    def test_matches_rule_2_exactly(self):
+        self.assertEqual(ONTOLOGY.backward, frozenset({"depends_on", "derived_from"}))
+        self.assertEqual(ONTOLOGY.forward, frozenset({"produces"}))
+        self.assertEqual(
+            ONTOLOGY.propagating, frozenset({"depends_on", "derived_from", "produces"})
+        )
+
+    def test_every_other_edge_type_is_declared_none(self):
+        non_propagating = ONTOLOGY.edge_types - ONTOLOGY.propagating
+        self.assertEqual(
+            non_propagating,
+            {"mentions", "cites", "contradicts", "supports", "supersedes",
+             "justified_by", "resolves_to"},
+        )
+        for edge_type in non_propagating:
+            self.assertEqual(ONTOLOGY.invalidation[edge_type], "none")
+
+    def test_every_edge_type_has_a_direction(self):
+        self.assertEqual(set(ONTOLOGY.invalidation), ONTOLOGY.edge_types)
+
+    def test_assumptions_module_reads_the_parsed_ontology_not_a_copy(self):
+        """The drift this closes: BACKWARD/FORWARD used to be restated by hand."""
+        from contextmesh import assumptions
+
+        self.assertEqual(assumptions.BACKWARD, ONTOLOGY.backward)
+        self.assertEqual(assumptions.FORWARD, ONTOLOGY.forward)
+        self.assertEqual(assumptions.PROPAGATING, ONTOLOGY.propagating)
+
+
+class MustCarryTest(unittest.TestCase):
+    """GRAPH.md's Must carry column, parsed and enforced at the write boundary."""
+
+    def test_parses_every_node_types_must_carry_set(self):
+        self.assertEqual(
+            ONTOLOGY.must_carry,
+            {
+                "entity": frozenset({"canonical", "aliases"}),
+                "claim": frozenset({"provenance"}),
+                "source": frozenset({"origin", "retrieved_at"}),
+                "decision": frozenset({"rationale", "provenance"}),
+                "assumption": frozenset({"status", "version"}),
+                "evidence": frozenset({"kind"}),
+            },
+        )
+
+    def test_a_node_missing_a_must_carry_attr_is_refused(self):
+        graph = ContextGraph()
+        with self.assertRaisesRegex(OntologyError, "missing"):
+            graph.add_node(NodeType.SOURCE, "Undocumented")
+
+    def test_a_node_missing_only_one_of_two_must_carry_names_is_still_refused(self):
+        graph = ContextGraph()
+        with self.assertRaisesRegex(OntologyError, "retrieved_at"):
+            graph.add_node(NodeType.SOURCE, "Half documented", attrs={"origin": "x"})
+
+    def test_must_carry_is_satisfied_by_a_node_field_not_only_by_attrs(self):
+        """``provenance`` is Must carry for claim, and it is a ``Node`` field."""
+        graph = ContextGraph()
+        source = graph.add_node(
+            NodeType.SOURCE, "Doc", attrs={"origin": "x", "retrieved_at": "x"}
+        )
+        claim = graph.add_node(
+            NodeType.CLAIM, "A claim", provenance=Provenance(source_id=source.id)
+        )
+        self.assertNotIn("provenance", claim.attrs)
+        self.assertIsNotNone(claim.provenance)
+
+    def test_presence_is_enough_even_if_the_value_is_not_well_formed(self):
+        """GRAPH.md: `retrieved_at="at plan time"` satisfies presence, not dates."""
+        graph = ContextGraph()
+        node = graph.add_node(
+            NodeType.SOURCE,
+            "Runner-minted",
+            attrs={"origin": "runner", "retrieved_at": "at plan time"},
+        )
+        self.assertEqual(node.attrs["retrieved_at"], "at plan time")
+
+    def test_a_snapshot_missing_a_must_carry_field_fails_closed_on_load(self):
+        """Every node-construction path is add_node, restoring one included."""
+        graph = ContextGraph()
+        graph.add_node(
+            NodeType.SOURCE, "Doc", attrs={"origin": "x", "retrieved_at": "x"}
+        )
+        payload = graph.to_dict()
+        del payload["nodes"][0]["attrs"]["retrieved_at"]
+        with self.assertRaises(OntologyError):
+            ContextGraph.from_dict(payload)
+
+
+class MalformedFileTest(unittest.TestCase):
+    """A hand-edited GRAPH.md that breaks its own contract fails to load."""
+
+    def _load(self, text):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "GRAPH.md"
+            path.write_text(text, encoding="utf-8")
+            return load(path)
+
+    def _real_text(self):
+        return Path(ONTOLOGY_FILE).read_text(encoding="utf-8")
+
+    def test_symbol_disagreeing_with_type_fails_closed(self):
+        text = self._real_text().replace(
+            "| Entity | `entity` |", "| Entity | `entityx` |", 1
+        )
+        self.assertNotEqual(text, self._real_text())
+        with self.assertRaisesRegex(OntologyError, "Symbol"):
+            self._load(text)
+
+    def test_an_empty_symbol_cell_fails_closed(self):
+        text = self._real_text().replace("| Entity | `entity` |", "| Entity |  |", 1)
+        self.assertNotEqual(text, self._real_text())
+        with self.assertRaisesRegex(OntologyError, "Symbol"):
+            self._load(text)
+
+    def test_an_invalid_invalidation_value_fails_closed(self):
+        text = self._real_text().replace(
+            "| `mentions` | source→entity, claim→entity | none |",
+            "| `mentions` | source→entity, claim→entity | sideways |",
+            1,
+        )
+        self.assertNotEqual(text, self._real_text())
+        with self.assertRaisesRegex(OntologyError, "Invalidation"):
+            self._load(text)
+
+    def test_an_empty_invalidation_cell_fails_closed(self):
+        text = self._real_text().replace(
+            "| `mentions` | source→entity, claim→entity | none |",
+            "| `mentions` | source→entity, claim→entity |  |",
+            1,
+        )
+        self.assertNotEqual(text, self._real_text())
+        with self.assertRaisesRegex(OntologyError, "Invalidation"):
+            self._load(text)
+
 
 class TypecheckTest(unittest.TestCase):
     def setUp(self):
         self.graph = ContextGraph()
-        self.source = self.graph.add_node(NodeType.SOURCE, "RFC 014")
-        self.entity = self.graph.add_node(NodeType.ENTITY, "pgvector")
-        self.claim = self.graph.add_node(NodeType.CLAIM, "pgvector stores embeddings")
+        self.source = self.graph.add_node(
+            NodeType.SOURCE,
+            "RFC 014",
+            attrs={"origin": "fixture", "retrieved_at": "fixture"},
+        )
+        self.entity = self.graph.add_node(
+            NodeType.ENTITY,
+            "pgvector",
+            attrs={"canonical": "pgvector", "aliases": []},
+        )
+        self.claim = self.graph.add_node(
+            NodeType.CLAIM,
+            "pgvector stores embeddings",
+            provenance=Provenance(source_id=self.source.id),
+        )
 
     def test_legal_edge_is_accepted(self):
         edge = self.graph.add_edge(self.claim.id, EdgeType.MENTIONS, self.entity.id)
