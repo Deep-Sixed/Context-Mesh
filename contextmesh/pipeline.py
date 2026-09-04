@@ -15,6 +15,21 @@ from .embed import embed
 from .graph import ContextGraph
 from .model import EdgeType, NodeType, Provenance, slug
 from .resolve import Resolver
+from .traverse import Walker
+
+#: Node types the second half of PRUNE never drops, walked or not. `source`
+#: was already exempt from the build-time half; `assumption` and `evidence`
+#: join it here because GRAPH.md's rules give nothing walk telemetry the
+#: authority to override -- an assumption nothing has questioned yet is not
+#: thereby irrelevant, and evidence is what rule 7 requires an audit be able
+#: to find.
+_PRESERVED_FROM_WALK_PRUNE = (NodeType.SOURCE, NodeType.ASSUMPTION, NodeType.EVIDENCE)
+
+#: Fewer distinct walks than this in the observation window and "nothing
+#: touched it" is not a fact about the corpus yet -- it is one question that
+#: happened to ask about something else. Two is the smallest count that is
+#: not "one query."
+MIN_OBSERVATION_WALKS = 2
 
 STAGES: Tuple[Tuple[str, str], ...] = (
     ("CHUNK", "spans in"),
@@ -354,17 +369,49 @@ class Pipeline:
                 return node.id
         return record.canonical_id
 
-    def prune_unwalked_nodes(self, *, min_walks: int = 1) -> int:
+    def prune_unwalked_nodes(
+        self,
+        walker: Walker,
+        *,
+        min_walks: int = 1,
+        min_observation_walks: int = MIN_OBSERVATION_WALKS,
+    ) -> int:
         """The second half of PRUNE: drop what survived the build but nothing walked.
 
-        Called after a traversal round, which is the only time the graph knows
-        what was actually used.
+        ``walker`` is the observation window: the caller declares the run
+        boundary by handing over the ``Walker`` that produced the telemetry,
+        rather than this method inferring one from graph state it cannot see.
+        Below ``min_observation_walks`` walks in that window this is a no-op --
+        GRAPH.md rule 5 requires the window to have closed before "unwalked"
+        means anything, since one query dead-ending is not evidence a node is
+        irrelevant, only that this particular question did not need it.
+
+        ``Node.walks`` -- incremented once per node a walk actually visits, in
+        ``Walker.walk`` -- is the only signal a node's own eligibility is
+        judged on. Degree is also read, inherited unchanged from the
+        build-time half this method has always shared it with; nothing about
+        a node's label, age, or type enters the decision beyond the type
+        exemptions in ``_PRESERVED_FROM_WALK_PRUNE``. A node already not live
+        -- pruned by an earlier call, or invalidated by a rejected assumption
+        -- is skipped rather than re-decided, so this pass never creates a
+        second, redundant state change on top of one that already happened.
+
+        Deterministic and idempotent: the same graph and the same walk
+        history produce the same dropped set every time, and calling this
+        again with no new walks in between changes nothing.
         """
         if not self.prune_unwalked:
             return 0
+        if walker.graph is not self.graph:
+            raise ValueError(
+                "walker was not run against this pipeline's graph; its "
+                "telemetry does not describe what this graph's nodes saw"
+            )
+        if len(walker.walks) < min_observation_walks:
+            return 0
         dropped = 0
         for node in self.graph.nodes.values():
-            if node.type is NodeType.SOURCE or node.pruned:
+            if node.type in _PRESERVED_FROM_WALK_PRUNE or not node.live:
                 continue
             if node.walks < min_walks and self.graph.degree(node.id) <= 1:
                 node.pruned = True
