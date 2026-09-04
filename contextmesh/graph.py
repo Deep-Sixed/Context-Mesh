@@ -105,10 +105,29 @@ class ContextGraph:
         provenance: Optional[Provenance] = None,
         embedding: Optional[Sequence[float]] = None,
     ) -> Node:
+        """Add or re-observe a node. Raises OntologyError if the pair is not
+        legal, or if the id collides with a different node.
+
+        ``slug`` truncates its digest, so an id is not proof of identity by
+        itself: two different (type, label) pairs can derive the same id.
+        Finding an existing node under ``node_id`` is only ever treated as a
+        repeat observation of *the same thing* when its type and label agree
+        with this call -- attrs (mutable metadata a repeat observation may
+        legitimately extend) are never part of that comparison. A type or
+        label mismatch under a shared id is a collision, not an update, and
+        is refused rather than silently substituted -- see GRAPH.md's "What
+        a node/edge id collision means".
+        """
         self.ontology.check_node(type.value)
         node_id = id or slug(label, type.value)
         existing = self.nodes.get(node_id)
         if existing is not None:
+            if existing.type is not type or existing.label != label:
+                raise OntologyError(
+                    f"node id {node_id!r} is already {existing.type.value} "
+                    f"{existing.label!r}; refusing to treat {type.value} "
+                    f"{label!r} as the same node"
+                )
             if attrs:
                 existing.attrs.update(attrs)
             if provenance is not None and existing.provenance is None:
@@ -171,6 +190,14 @@ class ContextGraph:
         accept states ``justifies`` would refuse to *create* live -- an
         already-invalidated edge bound to a rejected assumption, say -- and
         validates them with its own snapshot-consistency checks instead.
+
+        ``slug`` truncates its digest, so a colliding ``edge_id`` is possible
+        for two distinct ``(src, type, dst)`` triples. ``key`` -- the actual
+        triple, not the derived id -- is what decides whether this is a
+        repeat observation of the same relationship; a fresh ``edge_id`` that
+        already names a *different* triple is a collision and is refused
+        before anything is written, not merged into the existing edge. See
+        GRAPH.md's "What a node/edge id collision means".
         """
         if src not in self.nodes:
             raise OntologyError(f"unknown source node {src!r}")
@@ -191,6 +218,13 @@ class ContextGraph:
                 )
             return edge
         edge_id = slug(f"{src}|{type.value}|{dst}", "edge")
+        if edge_id in self.edges:
+            collision = self.edges[edge_id]
+            raise OntologyError(
+                f"edge id {edge_id!r} is already "
+                f"{collision.src!r}-[{collision.type.value}]->{collision.dst!r}; "
+                f"refusing to treat {src!r}-[{type.value}]->{dst!r} as the same edge"
+            )
         edge = Edge(
             id=edge_id,
             src=src,
