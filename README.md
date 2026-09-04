@@ -653,9 +653,12 @@ two disagree — and enforcing that surfaced a real bug, since two paths bumped
 `version` on the record alone and left the mirror stale. `graph.sync_assumption`
 is now the one place that writes it.
 
-What persistence does **not** yet cover: the execution state in `Runner`.
-Resuming a selective re-execution still needs the task registry and the run
-ledger's history. That is the next milestone.
+The execution state in `Runner` is not part of this format — `contextmesh.graph`
+v1 stays closed to it — but it is not unpersisted either. It has its own
+versioned format, `contextmesh.execution` v1, and a run ledger alongside it;
+`Runner.snapshot()` / `Runner.load_json()` round-trip a plan against a live
+graph, refusing to restore a task that says DONE while its decision has since
+been invalidated. See **Sessions** below for how the two combine.
 
 ### Sessions — a graph *and* the resolver that reads it
 
@@ -840,7 +843,7 @@ from the walk list and so absent until the new process has walked. That is a
 cold start, not a lost capability, and `SurfaceEquivalenceTest` asserts it is
 the *only* one.
 
-## MCP — read-only, experimental
+## MCP — controlled writes, narrow authority
 
 ```bash
 pip install 'contextmesh[mcp]'
@@ -849,10 +852,12 @@ contextmesh-mcp --session ./session  # a graph that outlives it
 ```
 
 An MCP server over the graph, so an agent can query it as memory instead of
-being handed chunks. Seven tools — `mesh_ask`, `mesh_get_node`, `mesh_health`,
-`mesh_lineage`, `mesh_blast_radius`, `mesh_explain_as_of`,
-`mesh_reconstruct_decision` — plus `contextmesh://schema`, `health`,
-`session`, `assumptions`, and templates for `node/{id}` and `assumption/{id}`.
+being handed chunks. Seven read tools — `mesh_ask`, `mesh_get_node`,
+`mesh_health`, `mesh_lineage`, `mesh_blast_radius`, `mesh_explain_as_of`,
+`mesh_reconstruct_decision` — plus four controlled structural writes —
+`mesh_submit_evidence`, `mesh_recheck`, `mesh_repair`, `mesh_resume` — and
+`contextmesh://schema`, `health`, `session`, `assumptions`, and templates for
+`node/{id}` and `assumption/{id}`.
 
 The last two answer from the graph *as it stood* rather than as it is. They
 are wrappers and nothing else: every temporal rule lives in
@@ -868,28 +873,40 @@ so a rule cannot start living in two places.
 }
 ```
 
-**v0.1 is deliberately read-only — and one part of that is permanent.**
+**Writes exist now, and they are deliberately narrow — one boundary stays
+permanent regardless.** *No rejection by client fiat* was never a phase to
+grow out of: under GRAPH.md rule 7 an assumption falls only to evidence
+contradicting it, produced by an auditor that looked at the world. None of the
+four write tools lets a caller name an assumption and have it rejected
+directly — `mesh_submit_evidence` stores a raw observation and expresses no
+verdict; `mesh_recheck` asks the registered auditors to interpret current
+state and the client supplies none; `mesh_repair` can select only
+deployment-owned `TaskRegistry` keys already registered — no callable, module
+path or import string crosses MCP; `mesh_resume` delegates to the native
+selective scheduler, rerunning only pending or stale work. Submitting evidence
+and letting Context Mesh decide is the different thing a rejection tool would
+not have been.
 
-Those are two different statements and it is worth keeping them apart. *No
-writes at all* is a property of this version; a later one may accept evidence,
-trigger a recheck, or drive a repair. *No rejection by client fiat* is not a
-phase: under GRAPH.md rule 7 an assumption falls only to evidence contradicting
-it, produced by an auditor that looked at the world. A tool letting a caller
-name an assumption and have it rejected would turn that rule into a convention,
-so it will not be added — what a future version could offer is submitting
-evidence and letting Context Mesh decide, which is a different thing.
+Each write commits through `writes.commit_mutation`: the mutation runs against
+a lossless in-memory clone of the session first, and only that clone is made
+live once its manifest has committed — so a failed write never leaves the
+served session half-mutated, and a controlled write refuses an ephemeral
+`--demo` session outright, since there is nothing durable to commit it into.
 
-`mesh_blast_radius` sits exactly on that line. It answers *what would fall if
-this assumption were false* — the closure, the reason chain for each node, and
-the preserved complement — and rejects nothing. No tool here adds a node, adds
-an edge, rejects, repairs or executes.
+`mesh_blast_radius` still sits exactly on the rejection line as a pure dry
+run. It answers *what would fall if this assumption were false* — the
+closure, the reason chain for each node, and the preserved complement — and
+changes nothing.
 
-**The read boundary is not "the graph is unchanged".** Asking a question moves
-walk telemetry — `node.walks`, `edge.traversals` — and PRUNE later drops what
-nothing walked, so a walk is a write by design. The invariant tested instead is
-that no read changes graph structure, ontology state, assumptions, supersession
-or invalidation, while telemetry is free to move. `tests/test_mcp.py` asserts
-both halves separately.
+**The read boundary is not "the graph is unchanged".** Asking a question through
+one of the seven read tools moves walk telemetry — `node.walks`,
+`edge.traversals` — and PRUNE later drops what nothing walked, so a walk is a
+write by design. The invariant tested instead is that no *read* changes graph
+structure, ontology state, assumptions, supersession or invalidation, while
+telemetry is free to move; that is a narrower guarantee than the four
+structural write tools make, which commit exactly the mutation their name
+describes and nothing else. `tests/test_mcp.py` asserts both halves
+separately.
 
 **It can now serve a saved session**, and it makes you say which:
 
@@ -916,9 +933,14 @@ is and whether anything a client reads outlives the server.
 ```
 
 What a client does to a served session now survives it — see **Checkpoints**
-above. What is still missing before this is agent memory: nothing writes
-*structure or belief* into a session from the client side. Those change only
-through the engine, and execution state does not persist at all.
+above, and that now includes execution state: a session's execution plan and
+run ledger persist in their own versioned format, `contextmesh.execution` v1,
+alongside the graph and resolver. What is still narrow is *how* a client can
+change belief: `mesh_submit_evidence` is the one write that adds a node, and
+it is deliberately confined to a raw evidence observation backed by a source —
+nothing crosses MCP that names an edge, an assumption verdict, or a rejection
+target directly. Structure and belief still change only through the engine
+interpreting what was submitted, never through a client-supplied verdict.
 
 The core stays untouched by all of this: `contextmesh` remains Python 3.9+ with
 zero dependencies, the MCP SDK arrives only through the `[mcp]` extra, and
@@ -947,9 +969,14 @@ contextmesh/
   health.py                  the signals that make a graph quietly useless
   metrics.py                 the dashboard payload
   corpus.py  demo.py  cli.py the worked example
-contextmesh_mcp/             read-only MCP server (optional extra, 3.10+)
-  session.py                 durable sessions: graph + resolver, on disk
-  tools.py  resources.py     plain Python over the engine; no SDK import
+contextmesh_mcp/             MCP server: seven read tools, four controlled
+                             structural writes (optional extra, 3.10+)
+  session.py                 durable sessions: graph + resolver + execution
+                             plan + run ledger, on disk
+  tools.py  resources.py     read tools, plain Python over the engine; no
+                             SDK import
+  writes.py                  controlled structural writes; commits through a
+                             lossless session clone, no SDK import
   __main__.py                write or inspect a session without the SDK
   server.py                  the only file that needs the SDK
 dashboard/                   the rebuilt dashboard
