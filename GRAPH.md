@@ -46,7 +46,9 @@ second one. `AssumptionLedger.justifies` enforces the binding side of this at
 the write boundary: the assumption must exist and be active, the edge must
 exist and be live, binding the same pair again is a no-op, and binding an
 edge already bound to a *different* assumption is refused rather than
-silently replaced.
+silently replaced. `ContextGraph.add_edge` takes no `assumption_id`, so it
+is not a second, unguarded way to bind one; only snapshot restoration sets
+the field directly, and it validates what it restores on its own terms.
 
 **Code is evidence, not authority.** A behaviour may be written into this file
 when the implementation *structurally guarantees* it — when no caller can make

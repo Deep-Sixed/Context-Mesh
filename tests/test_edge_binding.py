@@ -221,6 +221,39 @@ class JustifiesContractTest(unittest.TestCase):
             self.ledger.justifies(self.assumption.id, self.edge.id)
         self.assertIsNone(self.edge.assumption_id)
 
+    def test_add_edge_does_not_accept_an_assumption_id(self):
+        """ContextGraph.add_edge must not be a second, unguarded binding
+        path: it takes no assumption_id at all, so a caller cannot create a
+        bound edge, or attach a binding to an existing one, without going
+        through justifies()'s validation.
+        """
+        other_claim = _claim(self.graph, "A different claim", self.source, id="claim:other")
+        other_decision = _decision(
+            self.graph, "A different decision", self.source, id="decision:other"
+        )
+        with self.assertRaises(TypeError):
+            self.graph.add_edge(
+                other_claim.id,
+                EdgeType.SUPPORTS,
+                other_decision.id,
+                assumption_id=self.assumption.id,
+            )
+
+    def test_re_adding_an_existing_edge_cannot_attach_a_binding_either(self):
+        """The duplicate-relationship merge path in add_edge only ever grows
+        weight/evidence; passing assumption_id to re-add an already-existing
+        edge (the specific bypass this review found: an id silently attached
+        to an unbound duplicate) must fail exactly like a fresh add does.
+        """
+        with self.assertRaises(TypeError):
+            self.graph.add_edge(
+                self.claim.id,
+                EdgeType.SUPPORTS,
+                self.decision.id,  # same (src, type, dst) as self.edge -> merge path
+                assumption_id=self.assumption.id,
+            )
+        self.assertIsNone(self.edge.assumption_id)
+
 
 class SnapshotConsistencyTest(unittest.TestCase):
     def _graph_with_binding(self):
@@ -260,6 +293,20 @@ class SnapshotConsistencyTest(unittest.TestCase):
 
         restored = ContextGraph.from_dict(graph.to_dict())
         self.assertTrue(restored.edges[edge.id].live)
+        self.assertEqual(restored.edges[edge.id].assumption_id, assumption.id)
+
+    def test_a_genuinely_rejected_and_invalidated_binding_round_trips_unchanged(self):
+        """The valid counterpart to the corrupted case above: a properly
+        rejected assumption whose bound edge was actually invalidated by
+        reject() restores exactly as it was, binding and all -- restoration
+        must not clear assumption_id just because the assumption fell.
+        """
+        graph, ledger, edge, assumption = self._graph_with_binding()
+        ledger.reject(assumption.id, evidence_id=_evidence(graph).id)
+        self.assertTrue(graph.edges[edge.id].invalidated)
+
+        restored = ContextGraph.from_dict(graph.to_dict())
+        self.assertTrue(restored.edges[edge.id].invalidated)
         self.assertEqual(restored.edges[edge.id].assumption_id, assumption.id)
 
 
