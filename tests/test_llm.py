@@ -400,7 +400,11 @@ class AuditAuthorityTest(unittest.TestCase):
         )
         assert self.task.assumption_id is not None
         self.assumption = self.runner.graph.assumptions[self.task.assumption_id]
-        self.source = self.runner.graph.add_node(NodeType.SOURCE, "External observation source")
+        self.source = self.runner.graph.add_node(
+            NodeType.SOURCE,
+            "External observation source",
+            attrs={"origin": "fixture", "retrieved_at": "fixture"},
+        )
         self.evidence = submit_evidence(
             self.runner.graph,
             text="The observed condition no longer holds",

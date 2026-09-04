@@ -79,6 +79,11 @@ def check(
         )
 
     # 3. Provenance gaps — a claim or decision with no path to a source.
+    # `provenance` is Must carry for both types (GRAPH.md), so the field
+    # itself is always present on anything add_node let through; the gap this
+    # now catches is a `provenance.source_id` that does not resolve to a live
+    # `source` node, which Must carry (presence, not well-formedness) does
+    # not check.
     gaps: List[str] = []
     for node in graph.nodes.values():
         if not node.live or node.type not in (NodeType.CLAIM, NodeType.DECISION):
@@ -87,7 +92,15 @@ def check(
             graph.node(e.dst).type is NodeType.SOURCE
             for e in graph.out_edges(node.id, (EdgeType.DERIVED_FROM, EdgeType.CITES))
         )
-        if not (has_source or node.provenance):
+        provenance_source = (
+            graph.get(node.provenance.source_id) if node.provenance is not None else None
+        )
+        provenance_resolves = (
+            provenance_source is not None
+            and provenance_source.type is NodeType.SOURCE
+            and provenance_source.live
+        )
+        if not (has_source or provenance_resolves):
             gaps.append(node.id)
     if gaps:
         signals.append(

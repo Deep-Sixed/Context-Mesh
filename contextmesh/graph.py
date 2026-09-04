@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from collections import defaultdict
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set
@@ -16,6 +17,37 @@ from .model import (
     slug,
 )
 from .ontology import ONTOLOGY, Ontology, OntologyError
+
+#: Every field a ``Node`` can carry. A Must-carry name that matches one of
+#: these is checked as that field (present means not ``None``); every other
+#: name is checked as an ``attrs`` key instead. See ``_check_must_carry``.
+_NODE_FIELD_NAMES = frozenset(f.name for f in dataclasses.fields(Node))
+
+
+def _check_must_carry(node: Node, ontology: Ontology) -> None:
+    """Fail closed if ``node`` is missing a name its type's row requires.
+
+    Presence only, per GRAPH.md's "What `Must carry` means": a required name
+    is satisfied by a ``Node`` field of that name that is not ``None``, or —
+    for a name that is not a field at all — an ``attrs`` key. GRAPH.md says
+    ``provenance`` is a field, not an attribute, so a name that names a real
+    field is checked only as that field: an ``attrs`` entry of the same name
+    (``attrs={"provenance": None}`` while ``node.provenance`` is still
+    ``None``) does not get a second, easier route to satisfying it. Nothing
+    here checks whether the value is well-formed, only whether it is there.
+    """
+    required = ontology.must_carry.get(node.type.value, frozenset())
+    missing = [
+        name
+        for name in required
+        if (getattr(node, name) is None if name in _NODE_FIELD_NAMES else name not in node.attrs)
+    ]
+    if missing:
+        raise OntologyError(
+            f"{node.type.value} node {node.id!r} is missing "
+            f"{', '.join(sorted(missing))}; GRAPH.md's Must carry for "
+            f"{node.type.value} is {sorted(required)}"
+        )
 
 #: The durable snapshot format. Separate from ``mesh.json``, which is the
 #: dashboard's projection: a view may be shaped for whatever reads it, a state
@@ -92,6 +124,7 @@ class ContextGraph:
             embedding=embedding,
             build=self.build,
         )
+        _check_must_carry(node, self.ontology)
         self.nodes[node_id] = node
         return node
 

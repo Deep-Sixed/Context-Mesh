@@ -643,7 +643,10 @@ class ReferenceClosureTest(unittest.TestCase):
 
         graph = ContextGraph()
         impostor = graph.add_node(
-            NodeType.ENTITY, "impostor", id=slug("execution plan: auth", "source")
+            NodeType.ENTITY,
+            "impostor",
+            id=slug("execution plan: auth", "source"),
+            attrs={"canonical": "impostor", "aliases": []},
         )
         self.assertIs(impostor.type, NodeType.ENTITY)
 

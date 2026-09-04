@@ -43,7 +43,16 @@ AUGUST_12 = "2026-08-12"
 
 def _source(graph, key, when, label):
     return graph.add_node(
-        NodeType.SOURCE, label, id=f"source:{key}", attrs={"retrieved_at": when}
+        NodeType.SOURCE,
+        label,
+        id=f"source:{key}",
+        attrs={"origin": "fixture", "retrieved_at": when},
+    )
+
+
+def _entity(graph, label, *, id=None):
+    return graph.add_node(
+        NodeType.ENTITY, label, id=id, attrs={"canonical": label, "aliases": []}
     )
 
 
@@ -73,7 +82,7 @@ def calendar():
     # ── 21 June: the decision, standing on both ──────────────────────────
     graph.build = 3
     review = _source(graph, "review-june", JUNE_21, "Review thread, June")
-    rebuild = graph.add_node(NodeType.ENTITY, "Partitioned Rebuild")
+    rebuild = _entity(graph, "Partitioned Rebuild")
     decision = decisions.decide(
         "Rebuild the index in partitions",
         "Per-shard peak memory is 2.1GB, inside the 4GB build ceiling.",
@@ -89,6 +98,7 @@ def calendar():
     contradiction = graph.add_node(
         NodeType.EVIDENCE,
         "One tenant held 31% of chunks in a single shard, past the 4GB ceiling",
+        attrs={"kind": "postmortem"},
         provenance=Provenance(source_id=postmortem.id, recorded_at_build=4),
     )
     # Evidence is dated through its provenance, not through an edge: GRAPH.md
@@ -114,21 +124,21 @@ def calendar():
         NodeType.SOURCE,
         "Plan output, partition rebuild",
         id="source:minted",
-        attrs={"retrieved_at": "at plan time"},
+        attrs={"origin": "runner", "retrieved_at": "at plan time"},
     )
     graph.add_edge(decision.id, EdgeType.PRODUCES, minted.id)
 
     # An entity the June document names but only the August document dates.
     # Its edge runs from inside the June projection to outside it, which is the
     # one direction an endpoint check has to catch.
-    tenant_mix = graph.add_node(NodeType.ENTITY, "Tenant mix")
+    tenant_mix = _entity(graph, "Tenant mix")
     graph.add_edge(review.id, EdgeType.MENTIONS, tenant_mix.id)
 
     # An entity both June and August name. Entities are hubs, and this one is
     # here to prove the walk-back does not use them as bridges: follow
     # ``mentions`` out of a hub and the next hop is every document that ever
     # named it, which is how August arrives underneath a June decision.
-    shard = graph.add_node(NodeType.ENTITY, "Shard")
+    shard = _entity(graph, "Shard")
     graph.add_edge(shard.id, EdgeType.DERIVED_FROM, bench.id)
     graph.add_edge(review.id, EdgeType.MENTIONS, shard.id)
 
@@ -198,7 +208,11 @@ class ParsingDates(unittest.TestCase):
 
     def test_an_unparseable_source_date_is_absent_not_fatal(self):
         graph = ContextGraph()
-        node = graph.add_node(NodeType.SOURCE, "Undated note", attrs={"retrieved_at": "soon"})
+        node = graph.add_node(
+            NodeType.SOURCE,
+            "Undated note",
+            attrs={"origin": "fixture", "retrieved_at": "soon"},
+        )
         self.assertIsNone(source_date(node))
 
 
@@ -669,6 +683,7 @@ class Rule7TemporalHorizonTest(unittest.TestCase):
         contradiction = graph.add_node(
             NodeType.EVIDENCE,
             "Skew disproof",
+            attrs={"kind": "disproof"},
             provenance=Provenance(source_id=src_july.id, recorded_at_build=99),
         )
         ledger.reject(assumption.id, evidence_id=contradiction.id)

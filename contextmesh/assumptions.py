@@ -10,7 +10,7 @@ not a useful answer without "and here is what we deliberately kept".
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, FrozenSet, Iterable, List, Optional, Set, Tuple
 
 from .graph import ContextGraph
 from .model import (
@@ -20,6 +20,7 @@ from .model import (
     NodeType,
     slug,
 )
+from .ontology import ONTOLOGY
 
 # Failure travels along these edges and no others (GRAPH.md rule 2), and the
 # direction matters:
@@ -30,9 +31,13 @@ from .model import (
 #
 # Nothing else propagates. `mentions`, `cites`, `supports` and `supersedes`
 # survive an invalidation, which is what makes it selective rather than a purge.
-BACKWARD: Tuple[EdgeType, ...] = (EdgeType.DEPENDS_ON, EdgeType.DERIVED_FROM)
-FORWARD: Tuple[EdgeType, ...] = (EdgeType.PRODUCES,)
-PROPAGATING: Tuple[EdgeType, ...] = BACKWARD + FORWARD
+#
+# The direction itself is not restated here: `ontology.py` parses it from
+# GRAPH.md's edge-table `Invalidation` column, and this module reads it from
+# there, so it cannot hold a copy that disagrees with the file.
+BACKWARD: FrozenSet[str] = ONTOLOGY.backward
+FORWARD: FrozenSet[str] = ONTOLOGY.forward
+PROPAGATING: FrozenSet[str] = ONTOLOGY.propagating
 
 
 class AssumptionError(Exception):
@@ -155,8 +160,17 @@ class AssumptionLedger:
         Walks *backwards* along the propagating edge types from the assumption:
         a decision `depends_on` an assumption, a claim is `derived_from` that
         decision, an entity is `produces`d by it, and so on down the line.
+
+        Direction comes from ``graph.ontology``, not the module-level
+        ``BACKWARD``/``FORWARD``: ``ContextGraph`` accepts a custom
+        ``Ontology`` (live, or restored through ``from_dict``), and a graph
+        built against one has to invalidate under that same one, not
+        whichever ontology happened to be the process-global default when
+        this module was imported.
         """
         graph = self.graph
+        backward = graph.ontology.backward
+        forward = graph.ontology.forward
         assumption = graph.assumptions[assumption_id]
         start_label = f"assumption({assumption.statement[:48]})"
 
@@ -186,7 +200,7 @@ class AssumptionLedger:
                     continue
                 reached[node_id] = chain
             # Whoever depends on this node, or derives from it, falls with it.
-            for edge in graph.in_edges(node_id, BACKWARD):
+            for edge in graph.in_edges(node_id, backward):
                 parent = graph.node(edge.src)
                 if parent.type is NodeType.ASSUMPTION:
                     continue
@@ -195,7 +209,7 @@ class AssumptionLedger:
                 )
             # Whatever this node produced falls with it too.
             if node_id != assumption_id:
-                for edge in graph.out_edges(node_id, FORWARD):
+                for edge in graph.out_edges(node_id, forward):
                     child = graph.node(edge.dst)
                     frontier.append(
                         (child.id, [*chain, f"-{edge.type.value}->", child.label])

@@ -63,6 +63,7 @@ def saved_auth_session(root: Path) -> Session:
         NodeType.SOURCE,
         "Vendor advisory feed",
         id="source:vendor-advisory",
+        attrs={"origin": "vendor", "retrieved_at": "fixture"},
     )
     runner = Runner("auth", graph=base.graph, registry=deployment())
     runner.task(

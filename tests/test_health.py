@@ -8,7 +8,7 @@ from contextmesh.demo import run
 from contextmesh.graph import ContextGraph
 from contextmesh.health import check, report
 from contextmesh.metrics import LEDGER_EDGES
-from contextmesh.model import EdgeType, NodeType
+from contextmesh.model import EdgeType, NodeType, Provenance
 from contextmesh.pipeline import Pipeline
 from contextmesh.resolve import Resolver
 from contextmesh.traverse import DeadEnd, Walker
@@ -23,19 +23,56 @@ class SignalTest(unittest.TestCase):
 
     def test_orphan_is_reported(self):
         graph = ContextGraph()
-        graph.add_node(NodeType.ENTITY, "Nobody links to me")
+        graph.add_node(
+            NodeType.ENTITY,
+            "Nobody links to me",
+            attrs={"canonical": "Nobody links to me", "aliases": []},
+        )
         kinds = {s.kind for s in check(graph)}
         self.assertIn("orphans", kinds)
 
-    def test_claim_without_provenance_is_an_error(self):
+    def test_claim_without_a_resolving_provenance_is_an_error(self):
+        # `provenance` is Must carry for a claim, so `add_node` refuses one
+        # with none at all — the gap health can still catch is a provenance
+        # whose `source_id` does not resolve to a live source.
         graph = ContextGraph()
-        graph.add_node(NodeType.SOURCE, "Doc")
-        entity = graph.add_node(NodeType.ENTITY, "Thing")
-        claim = graph.add_node(NodeType.CLAIM, "Thing is fine")
+        graph.add_node(
+            NodeType.SOURCE,
+            "Doc",
+            attrs={"origin": "fixture", "retrieved_at": "fixture"},
+        )
+        entity = graph.add_node(
+            NodeType.ENTITY, "Thing", attrs={"canonical": "Thing", "aliases": []}
+        )
+        claim = graph.add_node(
+            NodeType.CLAIM,
+            "Thing is fine",
+            provenance=Provenance(source_id="source:does-not-exist"),
+        )
         graph.add_edge(claim.id, EdgeType.MENTIONS, entity.id)
         signals = {s.kind: s for s in check(graph)}
         self.assertIn("provenance_gap", signals)
         self.assertEqual(signals["provenance_gap"].severity, "error")
+
+    def test_a_source_the_provenance_points_at_but_is_dead_is_still_a_gap(self):
+        """Resolving to a node is not enough if that node is not live.
+
+        A claim whose ``provenance.source_id`` names a real ``source`` node
+        that has since been pruned or invalidated has no more of a path to a
+        source than one naming nothing at all — the whole point of ``live``
+        gating everything else this signal counts.
+        """
+        graph = ContextGraph()
+        source = graph.add_node(
+            NodeType.SOURCE, "Doc", attrs={"origin": "fixture", "retrieved_at": "fixture"}
+        )
+        source.invalidated = True
+        claim = graph.add_node(
+            NodeType.CLAIM, "Thing is fine", provenance=Provenance(source_id=source.id)
+        )
+        signals = {s.kind: s for s in check(graph)}
+        self.assertIn("provenance_gap", signals)
+        self.assertIn(claim.id, signals["provenance_gap"].items)
 
     def test_prose_that_matched_nothing_is_not_a_health_signal(self):
         resolver = Resolver()
@@ -64,7 +101,9 @@ class SignalTest(unittest.TestCase):
 
     def test_report_summarises_worst_severity(self):
         graph = ContextGraph()
-        graph.add_node(NodeType.ENTITY, "Orphan")
+        graph.add_node(
+            NodeType.ENTITY, "Orphan", attrs={"canonical": "Orphan", "aliases": []}
+        )
         summary = report(graph)
         self.assertEqual(summary["status"], "warn")
         self.assertEqual(summary["nodes_live"], 1)

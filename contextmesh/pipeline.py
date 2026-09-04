@@ -232,12 +232,16 @@ class Pipeline:
         )
 
         for entity_id, label in self.resolver.canonical.items():
-            node = graph.add_node(NodeType.ENTITY, label, id=entity_id)
-            node.attrs.setdefault("aliases", [])
-            for form in collapsed.get(entity_id, []):
-                if form != label and form not in node.attrs["aliases"]:
-                    node.attrs["aliases"].append(form)
-            node.attrs["canonical"] = label
+            # `canonical` and `aliases` are Must carry for Entity, so both go
+            # in at creation rather than being patched onto the node after —
+            # `add_node` now refuses a node that doesn't have them yet.
+            aliases = [form for form in collapsed.get(entity_id, []) if form != label]
+            graph.add_node(
+                NodeType.ENTITY,
+                label,
+                id=entity_id,
+                attrs={"canonical": label, "aliases": aliases},
+            )
 
         # 04 LINK — typed edges only.
         # A document that declares an entity is itself a mention of it.

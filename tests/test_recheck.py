@@ -16,6 +16,7 @@ class EvidenceBoundRecheckTest(unittest.TestCase):
             NodeType.SOURCE,
             "Vendor advisory feed",
             id="source:vendor-advisory",
+            attrs={"origin": "vendor", "retrieved_at": "fixture"},
         )
         registry = TaskRegistry()
         registry.register_worker("auth.hash.argon2.v1", lambda ctx: {"impl": "argon2"})

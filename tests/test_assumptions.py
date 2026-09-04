@@ -15,8 +15,16 @@ def scenario():
     ledger = AssumptionLedger(graph)
     decisions = DecisionLog(graph)
 
-    source = graph.add_node(NodeType.SOURCE, "Capacity model")
-    other_source = graph.add_node(NodeType.SOURCE, "Reranker evaluation")
+    source = graph.add_node(
+        NodeType.SOURCE,
+        "Capacity model",
+        attrs={"origin": "fixture", "retrieved_at": "fixture"},
+    )
+    other_source = graph.add_node(
+        NodeType.SOURCE,
+        "Reranker evaluation",
+        attrs={"origin": "fixture", "retrieved_at": "fixture"},
+    )
     claim = graph.add_node(
         NodeType.CLAIM,
         "Shards stay under four gigabytes during rebuild",
@@ -30,7 +38,11 @@ def scenario():
     )
     graph.add_edge(unrelated_claim.id, EdgeType.DERIVED_FROM, other_source.id)
 
-    artefact = graph.add_node(NodeType.ENTITY, "Partitioned Rebuild")
+    artefact = graph.add_node(
+        NodeType.ENTITY,
+        "Partitioned Rebuild",
+        attrs={"canonical": "Partitioned Rebuild", "aliases": []},
+    )
     assumption = ledger.assume("Shard count grows linearly with corpus size")
 
     dependent = decisions.decide(
@@ -96,7 +108,9 @@ class RejectionTest(unittest.TestCase):
             self.unrelated_claim,
         ) = scenario()
         self.evidence = self.graph.add_node(
-            NodeType.EVIDENCE, "One tenant held 31% of chunks in a single shard"
+            NodeType.EVIDENCE,
+            "One tenant held 31% of chunks in a single shard",
+            attrs={"kind": "disproof"},
         )
         self.report = self.ledger.reject(
             self.assumption.id,
@@ -198,7 +212,9 @@ class Rule7PreconditionTest(unittest.TestCase):
     def setUp(self):
         self.graph, self.ledger, _, self.assumption, self.dependent, *_ = scenario()
         self.evidence = self.graph.add_node(
-            NodeType.EVIDENCE, "One tenant held 31% of chunks in a single shard"
+            NodeType.EVIDENCE,
+            "One tenant held 31% of chunks in a single shard",
+            attrs={"kind": "disproof"},
         )
 
     def test_reject_requires_non_empty_evidence_id(self):
@@ -237,7 +253,9 @@ class Rule7PreconditionTest(unittest.TestCase):
     def test_reject_refuses_already_rejected_assumption(self):
         self.ledger.reject(self.assumption.id, evidence_id=self.evidence.id)
         second_evidence = self.graph.add_node(
-            NodeType.EVIDENCE, "Second contradictory evidence node"
+            NodeType.EVIDENCE,
+            "Second contradictory evidence node",
+            attrs={"kind": "disproof"},
         )
         with self.assertRaises(AssumptionError):
             self.ledger.reject(self.assumption.id, evidence_id=second_evidence.id)
@@ -263,7 +281,9 @@ class Rule7AtomicCommitTest(unittest.TestCase):
     def setUp(self):
         self.graph, self.ledger, _, self.assumption, self.dependent, *_ = scenario()
         self.evidence = self.graph.add_node(
-            NodeType.EVIDENCE, "One tenant held 31% of chunks in a single shard"
+            NodeType.EVIDENCE,
+            "One tenant held 31% of chunks in a single shard",
+            attrs={"kind": "disproof"},
         )
 
     def test_successful_rejection_atomically_mints_contradiction_edge_and_rejects(self):
