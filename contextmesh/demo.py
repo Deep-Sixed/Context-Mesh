@@ -104,6 +104,11 @@ class DemoResult:
     ledger: AssumptionLedger
     invalidation: InvalidationReport
     rounds: int
+    #: Nodes the second half of PRUNE dropped, if `run` was asked to invoke
+    #: it. Zero -- not merely absent -- when it was not: the dashboard's
+    #: export path never passes `prune_after_walk`, so this stays 0 and the
+    #: exported payload, which does not read this field, is unaffected.
+    pruned_unwalked: int = 0
 
     def payload(self) -> Dict[str, Any]:
         return snapshot(
@@ -142,8 +147,17 @@ def _entity_id(graph: ContextGraph, label: str) -> Optional[str]:
     return None
 
 
-def run(*, rounds: int = 40, reject: bool = True) -> DemoResult:
-    """Build, decide, walk, and (optionally) break the sharding assumption."""
+def run(
+    *, rounds: int = 40, reject: bool = True, prune_after_walk: bool = False
+) -> DemoResult:
+    """Build, decide, walk, and (optionally) break the sharding assumption.
+
+    `prune_after_walk` defaults off: the export path relies on this demo's
+    output being stable, so the second half of PRUNE (GRAPH.md rule 5) only
+    runs when a caller opts in. Set it to see walk-driven PRUNE actually
+    exercised against the corpus, once the full question stream has closed
+    the observation window.
+    """
     graph = ContextGraph()
     resolver = Resolver()
     pipeline = Pipeline(graph, resolver)
@@ -254,6 +268,10 @@ def run(*, rounds: int = 40, reject: bool = True) -> DemoResult:
     for question in stream[split:]:
         walker.walk(question)
 
+    pruned_unwalked = 0
+    if prune_after_walk:
+        pruned_unwalked = pipeline.prune_unwalked_nodes(walker)
+
     return DemoResult(
         graph=graph,
         resolver=resolver,
@@ -262,5 +280,6 @@ def run(*, rounds: int = 40, reject: bool = True) -> DemoResult:
         decisions=decisions,
         ledger=ledger,
         invalidation=invalidation,
+        pruned_unwalked=pruned_unwalked,
         rounds=rounds,
     )

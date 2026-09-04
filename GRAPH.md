@@ -50,6 +50,28 @@ silently replaced. `ContextGraph.add_edge` takes no `assumption_id`, so it
 is not a second, unguarded way to bind one; only snapshot restoration sets
 the field directly, and it validates what it restores on its own terms.
 
+**What walk-driven PRUNE means.** Rule 5's second half drops a node only once
+an observation window has closed: `Pipeline.prune_unwalked_nodes` takes the
+`Walker` that produced the telemetry, and is a no-op below
+`MIN_OBSERVATION_WALKS` walks in that window, so one question failing to reach
+a node is never mistaken for the corpus having judged it irrelevant.
+`Node.walks` — incremented once per node an actual walk visits, in
+`Walker.walk` — is the only signal a node's own eligibility is judged on;
+degree, inherited unchanged from the build-time half this pass has always
+shared it with, is the one other factor, and nothing about a node's label,
+age, or type enters the decision beyond `source`, `assumption`, and
+`evidence` nodes being preserved outright — an assumption nothing has
+questioned yet is not thereby irrelevant, and evidence is what rule 7
+requires an audit be able to find. A node this pass drops cannot be revived
+by a later walk: `Walker.seed` will not seed a pruned node and
+`out_edges`/`in_edges` will not traverse into one, so its `walks` count is
+frozen at whatever it was the moment it fell. A node already not live for a
+different reason — invalidated by a rejected assumption — is left alone
+rather than separately marked pruned, so this pass never creates a second
+state change on top of one that already happened. The demo's export path
+(`contextmesh/demo.py`) never opts in, so this pass changes nothing about the
+dashboard unless a caller explicitly asks for it.
+
 **Code is evidence, not authority.** A behaviour may be written into this file
 when the implementation *structurally guarantees* it — when no caller can make
 it false without changing the implementation's own contract. A behaviour that is
@@ -105,9 +127,9 @@ disagree.
 4. Every `claim` and `decision` carries provenance to a `source`. A node without
    a path to a source is an orphan and is reported by graph health.
 5. A node is walkable only after `PRUNE`. `PRUNE` has two halves: the build-time
-   pass drops what nothing *linked* (degree zero), and a second pass drops what
-   nothing *walked*. Only the first runs today — see *Declared, not yet
-   realized*.
+   pass drops what nothing *linked* (degree zero), and a second pass,
+   `Pipeline.prune_unwalked_nodes`, drops what an observation window of walks
+   left untouched — see *What walk-driven PRUNE means*.
 6. Re-running invalidated work never revives a `decision` — it appends a new one
    that `supersedes` it, so rule 3 holds through re-execution. An `entity` *is*
    revived when the decision that produces it runs again, because the artefact
@@ -127,7 +149,6 @@ None of them may be relied on until it appears above this line.
 | Declared | State | Missing |
 |---|---|---|
 | `resolves_to` | In the edge table; in `EdgeType`; weighted `0.3` by the walker | No realized lifecycle today: no production writer creates it, and no node-level justification, contradiction, supersession, support, dependency or citation path is legal for `entity` endpoints. |
-| Walk-driven `PRUNE` (rule 5, second half) | `Pipeline.prune_unwalked_nodes`, correct semantics, enabled by default | No caller. Consequence: prose elsewhere describing walk telemetry as feeding `PRUNE` describes a consumer that does not run. |
 
 ## Open items
 
@@ -159,6 +180,10 @@ that says what happened to it:
   say so with `depends_on`, the same as every other node-to-node case.
 - **`Must carry` had no enforcement path.** `ContextGraph.add_node` now
   enforces it; see *What `Must carry` means*.
+- **Walk-driven `PRUNE` had no caller.** `Pipeline.prune_unwalked_nodes` now
+  takes the `Walker` that produced the telemetry and runs for real, gated on
+  an observation window rather than firing on the first walk that happened
+  not to reach a node; see rule 5 and *What walk-driven PRUNE means*.
 
 Out of scope for this file today: how entity identity should be asserted,
 recorded or retracted. `resolves_to` exists as a declaration only, and the
