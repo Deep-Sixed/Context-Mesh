@@ -20,6 +20,14 @@ from .model import Node, NodeType, Provenance, slug
 INTAKE_VERSION = 1
 INTAKE_ATTR = "evidence_intake"
 
+#: Intake is the one boundary built for untrusted, high-volume input (see
+#: :func:`evidence_id_for`), so it is also the one place a caller-controlled
+#: payload can grow without bound if nothing here says otherwise.
+MAX_TEXT_BYTES = 65_536
+MAX_METADATA_BYTES = 65_536
+MAX_METADATA_DEPTH = 8
+MAX_COLLECTION_LENGTH = 1_000
+
 
 class EvidenceIntakeError(ValueError):
     """The observation cannot enter the graph under the PR #8A contract."""
@@ -36,14 +44,45 @@ class EvidenceReceipt:
     node: Node
 
 
-def _json_value(value: Any, path: str) -> Any:
+def _check_string_bytes(value: str, limit: int, label: str) -> None:
+    """Refuse an oversized string without ever allocating a buffer its size.
+
+    UTF-8 never encodes a code point in fewer than one byte, so a string
+    whose *character* count alone already exceeds ``limit`` is refused by
+    ``len(value)`` — an O(1) check on a Python ``str`` — without calling
+    ``.encode()`` on it at all. Only a string short enough to possibly be
+    within budget (at most ``limit`` characters) reaches the ``.encode()``
+    call, which is then bounded by that same ``limit``. Either way, this
+    function never holds more than ``limit`` bytes of encoded output in
+    memory on account of one caller-supplied string, however large that
+    string claims to be.
+    """
+    if len(value) > limit:
+        raise EvidenceIntakeError(f"{label} is over the {limit}-byte limit")
+    size = len(value.encode("utf-8"))
+    if size > limit:
+        raise EvidenceIntakeError(f"{label} is {size} bytes, over the {limit}-byte limit")
+
+
+def _json_value(value: Any, path: str, *, depth: int = 0) -> Any:
     """Validate the strict JSON subset used by evidence metadata.
 
     Validation is recursive and deliberately does no coercion: tuples do not
     become lists, integer mapping keys do not become strings, and NaN/Infinity
-    do not become implementation-specific JSON constants.
+    do not become implementation-specific JSON constants. ``depth``, each
+    collection's length, and now each individual string's own size are all
+    bounded here, so a single oversized value is refused as soon as it is
+    reached rather than after ``validate_metadata`` has serialized the whole
+    structure around it.
     """
-    if value is None or isinstance(value, (bool, str)):
+    if depth > MAX_METADATA_DEPTH:
+        raise EvidenceIntakeError(
+            f"{path}: metadata nests deeper than {MAX_METADATA_DEPTH} levels"
+        )
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        _check_string_bytes(value, MAX_METADATA_BYTES, f"{path}: string")
         return value
     if isinstance(value, int):
         return value
@@ -52,15 +91,31 @@ def _json_value(value: Any, path: str) -> Any:
             raise EvidenceIntakeError(f"{path}: {value!r} is not a finite JSON number")
         return value
     if isinstance(value, list):
-        return [_json_value(item, f"{path}[{index}]") for index, item in enumerate(value)]
+        if len(value) > MAX_COLLECTION_LENGTH:
+            raise EvidenceIntakeError(
+                f"{path}: list has {len(value)} items, over the "
+                f"{MAX_COLLECTION_LENGTH}-item limit"
+            )
+        return [
+            _json_value(item, f"{path}[{index}]", depth=depth + 1)
+            for index, item in enumerate(value)
+        ]
     if isinstance(value, dict):
+        if len(value) > MAX_COLLECTION_LENGTH:
+            raise EvidenceIntakeError(
+                f"{path}: object has {len(value)} keys, over the "
+                f"{MAX_COLLECTION_LENGTH}-key limit"
+            )
         copied: Dict[str, Any] = {}
         for key, item in value.items():
             if not isinstance(key, str):
                 raise EvidenceIntakeError(
                     f"{path}: object keys must be strings, got {key!r}"
                 )
-            copied[key] = _json_value(item, f"{path}.{key}")
+            _check_string_bytes(
+                key, MAX_METADATA_BYTES, f"{path}: object key {key[:80]!r}"
+            )
+            copied[key] = _json_value(item, f"{path}.{key}", depth=depth + 1)
         return copied
     raise EvidenceIntakeError(
         f"{path}: {type(value).__name__} is not accepted evidence metadata"
@@ -76,18 +131,35 @@ def validate_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         )
     copied = _json_value(metadata, "metadata")
     assert isinstance(copied, dict)
-    # The recursive validator above is the type gate.  This round trip detaches
-    # caller-owned lists/dicts so mutating the input after return cannot mutate
-    # the graph without a new evidence id or checkpoint.
-    return json.loads(
-        json.dumps(
-            copied,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=False,
-            allow_nan=False,
-        )
+    # _json_value already bounds every individual string, and every
+    # collection's length and nesting depth — but a payload built entirely
+    # from values within those per-value bounds can still add up to more
+    # than the metadata-wide ceiling once serialized together. json.dumps
+    # would materialize that whole serialization just to measure it, so
+    # this walks the same encoder's own output chunks instead and aborts
+    # the moment the running total is over budget, joining what it already
+    # has rather than ever building — or holding — the complete oversized
+    # string.
+    encoder = json.JSONEncoder(
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
     )
+    chunks = []
+    size = 0
+    for chunk in encoder.iterencode(copied):
+        size += len(chunk.encode("utf-8"))
+        if size > MAX_METADATA_BYTES:
+            raise EvidenceIntakeError(
+                f"metadata is over the {MAX_METADATA_BYTES}-byte limit"
+            )
+        chunks.append(chunk)
+    # Proven within budget: assembling it now is bounded by MAX_METADATA_BYTES
+    # itself, and this round trip is also what detaches caller-owned
+    # lists/dicts, so mutating the input after return cannot mutate the graph
+    # without a new evidence id or checkpoint.
+    return json.loads("".join(chunks))
 
 
 def canonical_payload(
@@ -240,6 +312,7 @@ class EvidenceIntake:
     ) -> EvidenceReceipt:
         if not isinstance(text, str) or not text.strip():
             raise EvidenceIntakeError("text must be a non-empty string")
+        _check_string_bytes(text, MAX_TEXT_BYTES, "text")
         if not isinstance(source_id, str) or not source_id.strip():
             raise EvidenceIntakeError("source_id must be a non-empty string")
         source = self.graph.get(source_id)

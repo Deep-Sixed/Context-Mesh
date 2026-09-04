@@ -2,18 +2,24 @@
 
 import hashlib
 import inspect
+import json
 import math
 import tempfile
 import unittest
 from pathlib import Path
 
 from contextmesh.evidence import (
+    MAX_COLLECTION_LENGTH,
+    MAX_METADATA_BYTES,
+    MAX_METADATA_DEPTH,
+    MAX_TEXT_BYTES,
     EvidenceConflictError,
     EvidenceIntake,
     EvidenceIntakeError,
     canonical_payload,
     evidence_id_for,
     submit_evidence,
+    validate_metadata,
 )
 from contextmesh.graph import ContextGraph
 from contextmesh.model import (
@@ -108,6 +114,85 @@ class EvidenceIntakeTest(unittest.TestCase):
         for value in bad:
             with self.subTest(value=repr(value)), self.assertRaises(EvidenceIntakeError):
                 self.submit(metadata=value)
+
+    def test_oversized_text_is_refused_before_mutation(self):
+        before = self.graph.to_dict()
+        with self.assertRaisesRegex(EvidenceIntakeError, "byte limit"):
+            self.submit(text="x" * (MAX_TEXT_BYTES + 1))
+        self.assertEqual(self.graph.to_dict(), before)
+        # The boundary itself is accepted: this is a limit, not an off-by-one trap.
+        self.submit(text="x" * MAX_TEXT_BYTES, external_id="at-the-text-limit")
+
+    def test_oversized_metadata_is_refused_before_mutation(self):
+        before = self.graph.to_dict()
+        with self.assertRaisesRegex(EvidenceIntakeError, "byte limit"):
+            self.submit(metadata={"blob": "x" * MAX_METADATA_BYTES})
+        self.assertEqual(self.graph.to_dict(), before)
+
+    def test_metadata_is_refused_exactly_one_byte_over_the_serialized_limit(self):
+        """Pin the boundary on the *combined* serialized size, not one field.
+
+        ``{"pad": "<N x's>"}`` serializes (sorted keys, no spaces) to a fixed
+        amount of JSON punctuation plus N bytes of payload; padding N so the
+        whole thing lands on exactly MAX_METADATA_BYTES proves the ceiling is
+        enforced on what validate_metadata actually measures — the canonical
+        serialization — not on any single field in isolation.
+        """
+        overhead = len(
+            json.dumps(
+                {"pad": ""},
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode("utf-8")
+        )
+        at_limit = "x" * (MAX_METADATA_BYTES - overhead)
+        accepted = validate_metadata({"pad": at_limit})
+        self.assertEqual(accepted, {"pad": at_limit})
+
+        over_limit = at_limit + "x"
+        with self.assertRaisesRegex(EvidenceIntakeError, "byte limit"):
+            validate_metadata({"pad": over_limit})
+
+    def test_a_single_oversized_string_is_rejected_without_serializing_everything(self):
+        """Regression for the defect this limit was added to close.
+
+        Measuring size by ``json.dumps()``-then-``len()`` would have to build
+        the whole serialized string before rejecting it — so a metadata value
+        that is one enormous string would force exactly the allocation the
+        byte ceiling exists to prevent. This string is ~32x the limit: small
+        enough to keep the test fast, large enough that a full-materialize
+        implementation would visibly be doing multi-megabyte work to reject
+        it rather than rejecting on the string's own length.
+        """
+        before = self.graph.to_dict()
+        huge = "x" * (MAX_METADATA_BYTES * 32)
+        with self.assertRaisesRegex(EvidenceIntakeError, "byte limit"):
+            self.submit(metadata={"blob": huge})
+        self.assertEqual(self.graph.to_dict(), before)
+
+    def test_an_oversized_metadata_key_is_rejected_the_same_way(self):
+        before = self.graph.to_dict()
+        huge_key = "k" * (MAX_METADATA_BYTES + 1)
+        with self.assertRaisesRegex(EvidenceIntakeError, "byte limit"):
+            self.submit(metadata={huge_key: "value"})
+        self.assertEqual(self.graph.to_dict(), before)
+
+    def test_metadata_nesting_depth_is_bounded(self):
+        value = "leaf"
+        for _ in range(MAX_METADATA_DEPTH + 2):
+            value = {"nested": value}
+        with self.assertRaisesRegex(EvidenceIntakeError, "nests deeper"):
+            self.submit(metadata=value)
+
+    def test_metadata_collection_length_is_bounded(self):
+        with self.assertRaisesRegex(EvidenceIntakeError, "item limit"):
+            self.submit(metadata={"items": list(range(MAX_COLLECTION_LENGTH + 1))})
+        with self.assertRaisesRegex(EvidenceIntakeError, "key limit"):
+            self.submit(
+                metadata={str(i): i for i in range(MAX_COLLECTION_LENGTH + 1)}
+            )
 
     def test_metadata_is_detached_from_caller_memory(self):
         metadata = {"packages": ["argon2-cffi"], "nested": {"severity": "high"}}
