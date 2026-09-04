@@ -271,7 +271,13 @@ class Edge:
     src: str
     dst: str
     type: EdgeType
-    #: the assumption that justifies this edge existing at all, if any
+    #: the assumption this relationship is conditional on, if any -- the edge
+    #: holds only while it stands; see GRAPH.md, "What edge-level assumption
+    #: binding means". A live edge is bound only through
+    #: AssumptionLedger.justifies -- ContextGraph.add_edge takes no
+    #: assumption_id, so it is not a second binding path. Snapshot
+    #: restoration (ContextGraph.from_dict) sets this field directly, since
+    #: it validates the restored snapshot's consistency on its own terms.
     assumption_id: Optional[str] = None
     evidence_ids: List[str] = field(default_factory=list)
     weight: float = 1.0

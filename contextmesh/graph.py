@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set
 
 from .model import (
     Assumption,
+    AssumptionStatus,
     Edge,
     EdgeType,
     Node,
@@ -156,11 +157,21 @@ class ContextGraph:
         type: EdgeType,
         dst: str,
         *,
-        assumption_id: Optional[str] = None,
         evidence_ids: Optional[Iterable[str]] = None,
         weight: float = 1.0,
     ) -> Edge:
-        """Add a typed edge. Raises OntologyError if the pair is not legal."""
+        """Add a typed edge. Raises OntologyError if the pair is not legal.
+
+        This is not a binding path: it never takes an ``assumption_id``. A
+        live edge is bound through :meth:`AssumptionLedger.justifies`, which
+        enforces the write boundary (assumption exists and is active, edge
+        exists and is live, no silent rebinding) that this method has no way
+        to. ``ContextGraph.from_dict`` sets ``edge.assumption_id`` directly
+        after calling this, for the same reason: restoring a snapshot has to
+        accept states ``justifies`` would refuse to *create* live -- an
+        already-invalidated edge bound to a rejected assumption, say -- and
+        validates them with its own snapshot-consistency checks instead.
+        """
         if src not in self.nodes:
             raise OntologyError(f"unknown source node {src!r}")
         if dst not in self.nodes:
@@ -174,8 +185,6 @@ class ContextGraph:
         if key in self._edge_key:
             edge = self.edges[self._edge_key[key]]
             edge.weight += weight
-            if assumption_id and not edge.assumption_id:
-                edge.assumption_id = assumption_id
             if evidence_ids:
                 edge.evidence_ids.extend(
                     e for e in evidence_ids if e not in edge.evidence_ids
@@ -187,7 +196,6 @@ class ContextGraph:
             src=src,
             dst=dst,
             type=type,
-            assumption_id=assumption_id,
             evidence_ids=list(evidence_ids or []),
             weight=weight,
             build=self.build,
@@ -438,7 +446,6 @@ class ContextGraph:
                 stored.src,
                 stored.type,
                 stored.dst,
-                assumption_id=stored.assumption_id,
                 evidence_ids=stored.evidence_ids,
                 weight=stored.weight,
             )
@@ -452,6 +459,12 @@ class ContextGraph:
                     f"edge id {stored.id!r} does not match the id this build "
                     f"derives for the same relationship ({edge.id!r})"
                 )
+            # Set directly rather than through add_edge/justifies: restoring a
+            # snapshot has to accept states the live write boundary would
+            # refuse to create (an already-invalidated edge bound to a
+            # rejected assumption), and the loop below validates the result
+            # instead of re-deriving it through the live guard rails.
+            edge.assumption_id = stored.assumption_id
             edge.build = stored.build
             edge.traversals = stored.traversals
             edge.invalidated = stored.invalidated
@@ -495,11 +508,25 @@ class ContextGraph:
                     )
 
         for edge in graph.edges.values():
-            if edge.assumption_id is not None and edge.assumption_id not in graph.assumptions:
-                raise SnapshotError(
-                    f"edge {edge.id!r}: assumption_id names {edge.assumption_id!r}, "
-                    "which is not in the snapshot"
-                )
+            if edge.assumption_id is not None:
+                if edge.assumption_id not in graph.assumptions:
+                    raise SnapshotError(
+                        f"edge {edge.id!r}: assumption_id names {edge.assumption_id!r}, "
+                        "which is not in the snapshot"
+                    )
+                # Rejection invalidates a bound edge directly (GRAPH.md, "What
+                # edge-level assumption binding means"), so a snapshot where
+                # the bound assumption fell but the edge did not is one where
+                # that never happened -- two records disagreeing about
+                # whether this relationship still holds. Supersession is not
+                # this: a superseded assumption was replaced, not disproved,
+                # so a bound edge surviving that is not a contradiction.
+                bound = graph.assumptions[edge.assumption_id]
+                if bound.status is AssumptionStatus.REJECTED and edge.live:
+                    raise SnapshotError(
+                        f"edge {edge.id!r} is bound to rejected assumption "
+                        f"{edge.assumption_id!r} but restores as live"
+                    )
             for evidence_id in edge.evidence_ids:
                 if evidence_id not in graph.nodes:
                     raise SnapshotError(

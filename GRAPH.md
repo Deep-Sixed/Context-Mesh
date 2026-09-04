@@ -32,6 +32,24 @@ required name with `OntologyError`. Every path that constructs a node,
 including restoring a persisted snapshot, goes through `add_node`, so this is
 one check rather than one per caller.
 
+**What edge-level assumption binding means.** `Edge.assumption_id` makes one
+relationship conditional on one assumption: the edge holds only while that
+assumption stands. Rejecting the assumption invalidates the bound edge
+directly — `apply_invalidation` marks it regardless of what else falls — but
+binding an edge is not a second way to reach a node. `src` and `dst` fall only
+if rule 2's propagation reaches them along an edge of a propagating type; a
+bound `mentions` or `supports` edge, say, does not pull its endpoints down
+just because it was bound. A node that itself needs to fall when an
+assumption falls has to say so explicitly with `depends_on` — rule 2 is the
+one mechanism for node-to-node invalidation, and edge binding does not open a
+second one. `AssumptionLedger.justifies` enforces the binding side of this at
+the write boundary: the assumption must exist and be active, the edge must
+exist and be live, binding the same pair again is a no-op, and binding an
+edge already bound to a *different* assumption is refused rather than
+silently replaced. `ContextGraph.add_edge` takes no `assumption_id`, so it
+is not a second, unguarded way to bind one; only snapshot restoration sets
+the field directly, and it validates what it restores on its own terms.
+
 **Code is evidence, not authority.** A behaviour may be written into this file
 when the implementation *structurally guarantees* it — when no caller can make
 it false without changing the implementation's own contract. A behaviour that is
@@ -108,8 +126,7 @@ None of them may be relied on until it appears above this line.
 
 | Declared | State | Missing |
 |---|---|---|
-| `resolves_to` | In the edge table; in `EdgeType`; weighted `0.3` by the walker | No realized lifecycle today: no production writer creates it, and no node-level justification, contradiction, supersession, support, dependency or citation path is legal for `entity` endpoints. Edge-level assumption binding exists separately, but it too has no production writer and its semantics remain open. |
-| Edge-level assumption binding | `Edge.assumption_id`; `AssumptionLedger.justifies`; serialized, and validated on load | No writer. The keyword is never supplied by library code; a full demo build carries 404 edges, none bound. |
+| `resolves_to` | In the edge table; in `EdgeType`; weighted `0.3` by the walker | No realized lifecycle today: no production writer creates it, and no node-level justification, contradiction, supersession, support, dependency or citation path is legal for `entity` endpoints. |
 | Walk-driven `PRUNE` (rule 5, second half) | `Pipeline.prune_unwalked_nodes`, correct semantics, enabled by default | No caller. Consequence: prose elsewhere describing walk telemetry as feeding `PRUNE` describes a consumer that does not run. |
 
 ## Open items
@@ -122,11 +139,6 @@ resolved by pointing at current behaviour.
    decision node: the node carries `Node.build`, while `at_build` lives on
    `DecisionRecord`, which is not part of the graph snapshot. The false token is
    removed; naming the intended field is open.
-2. **`AssumptionLedger.justifies` propagates further than its wording.** Its
-   docstring marks an *edge* as standing on an assumption; rejection reaches
-   through the edge to invalidate `edge.dst`. Nothing depends on that today.
-   Until it is decided, the current behaviour is unspecified and must not be
-   relied on.
 
 Resolved since the list above was first written, kept here as a record rather
 than deleted, since a reader following an old reference should land somewhere
@@ -138,6 +150,13 @@ that says what happened to it:
   `Invalidation` column is now that machine-readable form, and
   `contextmesh/assumptions.py` reads it through `ontology.py` instead of
   restating it.
+- **`AssumptionLedger.justifies` propagated further than its wording.** Its
+  docstring marked an *edge* as standing on an assumption, but rejection
+  reached through the edge to invalidate `edge.dst` too — a second,
+  undeclared invalidation path alongside rule 2. Binding an edge no longer
+  seeds its endpoints into the blast radius; see *What edge-level assumption
+  binding means*. A node that needs to fall with the assumption still has to
+  say so with `depends_on`, the same as every other node-to-node case.
 - **`Must carry` had no enforcement path.** `ContextGraph.add_node` now
   enforces it; see *What `Must carry` means*.
 
