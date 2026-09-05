@@ -20,7 +20,7 @@ from .model import (
     NodeType,
     slug,
 )
-from .ontology import ONTOLOGY
+from .ontology import ONTOLOGY, OntologyError
 
 # Failure travels along these edges and no others (GRAPH.md rule 2), and the
 # direction matters:
@@ -120,6 +120,32 @@ class AssumptionLedger:
         created_by: str = "agent",
         evidence_ids: Iterable[str] = (),
     ) -> Assumption:
+        """Ground new work in a statement, or reuse the assumption this
+        statement already names.
+
+        Same statement, called again, is a true no-op: it returns the
+        existing record exactly as it stands -- active, rejected, or
+        superseded -- without touching its lifecycle. Re-asking is not a
+        second way to reset an assumption back to active; only
+        :meth:`supersede` puts new ground under a *different* statement.
+        A different statement that happens to derive the same id (slug's
+        digest is truncated, GRAPH.md rule 8) is a collision, not a reuse,
+        and is refused the same way ``add_assumption`` refuses one.
+
+        The write is atomic: if any justifying evidence id is invalid, the
+        assumption this call would have created is rolled back rather than
+        left standing without the justification the caller asked for.
+        """
+        existing = self.graph.assumptions.get(slug(statement, "assumption"))
+        if existing is not None:
+            if existing.statement != statement:
+                raise OntologyError(
+                    f"assumption id {existing.id!r} is already "
+                    f"{existing.statement!r}; refusing to treat {statement!r} "
+                    "as the same assumption"
+                )
+            return existing
+
         assumption = Assumption(
             id=slug(statement, "assumption"),
             statement=statement,
@@ -128,8 +154,17 @@ class AssumptionLedger:
             evidence_ids=list(evidence_ids),
         )
         self.graph.add_assumption(assumption)
-        for ev in assumption.evidence_ids:
-            self.graph.add_edge(assumption.id, EdgeType.JUSTIFIED_BY, ev)
+        created_edges: List[str] = []
+        try:
+            for ev in assumption.evidence_ids:
+                edge = self.graph.add_edge(assumption.id, EdgeType.JUSTIFIED_BY, ev)
+                created_edges.append(edge.id)
+        except Exception:
+            for edge_id in created_edges:
+                self.graph._discard_edge(edge_id)
+            del self.graph.assumptions[assumption.id]
+            self.graph._discard_node(assumption.id)
+            raise
         self._record("assumed", assumption.id, statement)
         return assumption
 
@@ -324,12 +359,7 @@ class AssumptionLedger:
                 pass
             assumption.evidence_ids = list(original_evidence_ids)
             if created_edge_id is not None:
-                graph.edges.pop(created_edge_id, None)
-                graph._edge_key.pop(key, None)
-                if created_edge_id in graph._out.get(evidence_id, []):
-                    graph._out[evidence_id].remove(created_edge_id)
-                if created_edge_id in graph._in.get(assumption_id, []):
-                    graph._in[assumption_id].remove(created_edge_id)
+                graph._discard_edge(created_edge_id)
             raise
 
         invalidated_edges = apply_invalidation(graph, assumption_id, radius)

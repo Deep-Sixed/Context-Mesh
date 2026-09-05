@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, NoReturn, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, NoReturn, Optional, Sequence, Tuple
 
 
 class NodeType(str, Enum):
@@ -155,6 +156,79 @@ def slug(text: str, prefix: str = "") -> str:
     digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:6]
     stem = f"{body}-{digest}" if body else digest
     return f"{prefix}:{stem}" if prefix else stem
+
+
+#: The slug prefix `DecisionLog._mint_fresh_id` mints every auto id under.
+#: Reserved: no explicit `decide(id=...)` call may name an id in this
+#: namespace (`decide` refuses it before writing anything), which is what
+#: makes membership in it a permanent, structural fact about an id rather
+#: than something that has to be re-derived and can drift.
+DECISION_AUTO_MINT_PREFIX = "decision:auto"
+
+
+def is_auto_minted_decision_id(candidate_id: str) -> bool:
+    """Whether `candidate_id` lies in the auto-minted decision namespace.
+
+    A plain prefix check, not a search: an earlier version of this
+    recognized an auto-minted id by re-deriving `slug(f"{title}|{n}",
+    "decision")` for `n` up to some bound, but any finite bound has to be
+    tied to something that changes as the graph grows (its node count) to
+    stay sound against arbitrarily large `n` -- and a bound that changes
+    with the graph is not stable: an explicit id one write legitimately
+    accepted (checked against a smaller graph) could fail this same check
+    later (checked against a larger one, e.g. after that very write, or
+    after a snapshot round-trip), with no tampering involved. Minting every
+    auto id into a namespace no explicit id may ever use makes membership a
+    fact about the id string alone, true forever once decided, with no
+    graph state involved in checking it.
+    """
+    return candidate_id.startswith(DECISION_AUTO_MINT_PREFIX + ":")
+
+
+def decision_fingerprint(
+    *,
+    title: str,
+    rationale: str,
+    source_id: Optional[str],
+    cites: Iterable[str],
+    derived_from: Iterable[str],
+    depends_on: Iterable[str],
+    produces: Iterable[str],
+    supersedes: Optional[str],
+) -> str:
+    """A fingerprint of a decision's immutable graph-visible content.
+
+    Defined purely over the *outcome* a `decide()` call produces -- title,
+    rationale, the provenance source, and the target-id sets of the edge
+    types it creates -- never over the raw call arguments a caller happened
+    to pass. That makes it computable identically two ways: from a live
+    call's arguments before anything is written, and from an existing
+    node's actual provenance/edges after a snapshot restores it -- which is
+    what lets a stored fingerprint be cross-checked against reality instead
+    of trusted outright. Order never carries meaning (citing the same
+    claims in a different order is the same decision), so every collection
+    is deduplicated and sorted before hashing.
+
+    `source_id` is its own field, kept out of `cites`: a decision's
+    provenance is a distinct fact from what it additionally cites, and a
+    fingerprint that folded both into one `cites` set could not tell a
+    decision whose primary source and an additional cite were swapped
+    (same combined set, different provenance) from one whose content
+    genuinely never changed.
+    """
+    canonical = {
+        "title": title,
+        "rationale": rationale,
+        "source_id": source_id,
+        "cites": sorted(set(cites)),
+        "derived_from": sorted(set(derived_from)),
+        "depends_on": sorted(set(depends_on)),
+        "produces": sorted(set(produces)),
+        "supersedes": supersedes,
+    }
+    return hashlib.sha256(
+        json.dumps(canonical, sort_keys=True).encode("utf-8")
+    ).hexdigest()
 
 
 @dataclass

@@ -999,21 +999,21 @@
         "walks": 1058
       },
       {
-        "id": "decision:index-with-hnsw-rather-than-ivfflat-0d3f16",
+        "id": "decision:auto:index-with-hnsw-rather-than-ivfflat-1-fc20c8",
         "t": "decision",
         "label": "Index with HNSW rather than IVFFlat",
         "deg": 4,
         "walks": 1058
       },
       {
-        "id": "decision:rerank-only-the-top-fifty-candidates-ce0e7c",
+        "id": "decision:auto:rerank-only-the-top-fifty-candidates-1-a503ed",
         "t": "decision",
         "label": "Rerank only the top fifty candidates",
         "deg": 5,
         "walks": 1018
       },
       {
-        "id": "decision:adopt-context-mesh-for-provenance-55fb51",
+        "id": "decision:auto:adopt-context-mesh-for-provenance-1-1dd135",
         "t": "decision",
         "label": "Adopt Context Mesh for provenance",
         "deg": 11,
@@ -5084,7 +5084,7 @@
           "claim:the-hnsw-index-reached-recall-of-zero-po-a7307f"
         ],
         "resolved": true,
-        "answer_id": "decision:index-with-hnsw-rather-than-ivfflat-0d3f16",
+        "answer_id": "decision:auto:index-with-hnsw-rather-than-ivfflat-1-fc20c8",
         "score": 0.6053,
         "dead_end": null,
         "detail": "",
@@ -5337,14 +5337,14 @@
         "items": [
           "entity:partitioned-rebuild-37c872",
           "assumption:shard-count-grows-linearly-with-corpus-s-6ae226",
-          "decision:rebuild-the-index-in-partitions-163e6d"
+          "decision:auto:rebuild-the-index-in-partitions-1-7ffe47"
         ]
       }
     ]
   },
   "decisions": [
     {
-      "decision_id": "decision:index-with-hnsw-rather-than-ivfflat-0d3f16",
+      "decision_id": "decision:auto:index-with-hnsw-rather-than-ivfflat-1-fc20c8",
       "title": "Index with HNSW rather than IVFFlat",
       "rationale": "HNSW gave 0.91 recall@10 against 0.82 for IVFFlat, and 41ms p95 query latency leaves room inside the 200ms budget.",
       "at_build": 1,
@@ -5356,11 +5356,11 @@
       "cites": []
     },
     {
-      "decision_id": "decision:rebuild-the-index-in-partitions-163e6d",
+      "decision_id": "decision:auto:rebuild-the-index-in-partitions-1-7ffe47",
       "title": "Rebuild the index in partitions",
       "rationale": "A single-node rebuild died at 16GB once the corpus reached 26M chunks. Per-shard peak memory is 2.1GB, at the cost of 31 minutes total build.",
       "at_build": 1,
-      "supersedes": "decision:index-with-hnsw-rather-than-ivfflat-0d3f16",
+      "supersedes": "decision:auto:index-with-hnsw-rather-than-ivfflat-1-fc20c8",
       "assumptions": [
         "assumption:shard-count-grows-linearly-with-corpus-s-6ae226"
       ],
@@ -5374,7 +5374,7 @@
       ]
     },
     {
-      "decision_id": "decision:rerank-only-the-top-fifty-candidates-ce0e7c",
+      "decision_id": "decision:auto:rerank-only-the-top-fifty-candidates-1-a503ed",
       "title": "Rerank only the top fifty candidates",
       "rationale": "Full reranking pushed p95 past the 200ms budget; capping the candidate set keeps precision@5 at 0.79 inside budget.",
       "at_build": 1,
@@ -5387,7 +5387,7 @@
       "cites": []
     },
     {
-      "decision_id": "decision:adopt-context-mesh-for-provenance-55fb51",
+      "decision_id": "decision:auto:adopt-context-mesh-for-provenance-1-1dd135",
       "title": "Adopt Context Mesh for provenance",
       "rationale": "Flat top-k could not say why two chunks belonged together. A typed edge records agreement, not coincidence, and cuts context per answer 30x.",
       "at_build": 1,
@@ -5497,7 +5497,7 @@
     "statement": "Shard count grows linearly with corpus size",
     "blast_radius": 2,
     "invalidated": {
-      "decision:rebuild-the-index-in-partitions-163e6d": [
+      "decision:auto:rebuild-the-index-in-partitions-1-7ffe47": [
         "assumption(Shard count grows linearly with corpus size)",
         "<-depends_on-",
         "Rebuild the index in partitions"
@@ -5511,7 +5511,7 @@
       ]
     },
     "invalidated_edges": [
-      "edge:decision-rebuild-the-index-in-partitions-e07227"
+      "edge:decision-auto-rebuild-the-index-in-parti-8e9250"
     ],
     "preserved_count": 136,
     "preserved": [
@@ -5586,9 +5586,9 @@
       "claim:two-chunks-agreeing-by-coincidence-looke-de9f83",
       "claim:unaffected-shards-continued-serving-duri-37a6b8",
       "claim:vectors-produced-by-the-v3-encoder-are-n-fd434f",
-      "decision:adopt-context-mesh-for-provenance-55fb51",
-      "decision:index-with-hnsw-rather-than-ivfflat-0d3f16",
-      "decision:rerank-only-the-top-fifty-candidates-ce0e7c",
+      "decision:auto:adopt-context-mesh-for-provenance-1-1dd135",
+      "decision:auto:index-with-hnsw-rather-than-ivfflat-1-fc20c8",
+      "decision:auto:rerank-only-the-top-fifty-candidates-1-a503ed",
       "entity:agent-runtime-9fc9b9",
       "entity:assumption-577633",
       "entity:audit-question-8421da",

@@ -6,6 +6,7 @@ endpoints do not, unless rule 2 reaches them some other way.
 import unittest
 
 from contextmesh.assumptions import AssumptionError, AssumptionLedger
+from contextmesh.decisions import DecisionLog
 from contextmesh.graph import ContextGraph, SnapshotError
 from contextmesh.model import EdgeType, NodeType, Provenance
 
@@ -29,13 +30,7 @@ def _claim(graph, label, source, *, id=None):
 
 
 def _decision(graph, label, source, *, id=None):
-    return graph.add_node(
-        NodeType.DECISION,
-        label,
-        id=id,
-        attrs={"rationale": "fixture"},
-        provenance=Provenance(source_id=source.id),
-    )
+    return DecisionLog(graph).decide(label, "fixture", source_id=source.id, id=id)
 
 
 def _evidence(graph, label="Contradiction", *, kind="disproof", id=None):

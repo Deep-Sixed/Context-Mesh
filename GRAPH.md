@@ -95,6 +95,102 @@ collision *detection*, not a stronger id scheme: `slug`'s truncation is
 unchanged, and a caller that keeps minting distinct content into the same
 id space will eventually have a write refused rather than silently lose one.
 
+**What a decision's identity is.** A `decision` node is an immutable event,
+never a content address: two calls to `DecisionLog.decide` with byte-identical
+`title` and `rationale` are two decisions, not one being re-observed, because
+"we chose this again" and "we never stopped choosing this" are different
+facts and only the first is `supersedes`'s job to record. A call made without
+an explicit `id` therefore always mints a fresh id, discriminated against
+*graph* state rather than `DecisionLog`'s own history — the smallest sequence
+number whose derived id is not already a node in this graph — so a repeated
+title still cannot collide with its own predecessor after a fresh
+`DecisionLog` is constructed over the same graph, which is exactly what a
+restored `Runner` does when no `decisions=` is given. An in-memory
+discriminator that instead counted this object's own records would forget
+every decision minted before it existed and hand out an id that object had
+never seen but the graph had — an id collision one caller reuses, not two
+callers agreeing.
+
+An explicit `id` means something narrower: not "this is the decision this
+content names" but "this exact call may have already happened — tell me if
+it did." The decision node itself carries this call's evidence, in two attrs
+that ride along with `rationale`: `decision_identity` (`"auto"` or
+`"explicit"`) and `decision_payload_digest`, a fingerprint of the node's
+graph-visible content — `title`, `rationale`, the provenance `source_id`
+kept as its own field, and the deduplicated, order-independent target sets
+of the edges `decide` creates beyond that source (citation, support,
+dependency, production, supersession). Keeping `source_id` separate from
+the additional-citation set matters: reconstructing both as one combined
+set from a node's out-edges cannot tell "the edge that is the provenance
+source" from "the edge that is an additional cite to the same target", so
+a primary source and an additional cite could otherwise be swapped without
+the fingerprint noticing — a different agreed payload producing the same
+digest. This is graph state, not a `DecisionLog`-local table, so it
+survives a snapshot round-trip and a fresh `DecisionLog` the same way the
+id-freshness check does.
+
+An explicit `id` naming an existing node is an idempotent retry only when
+that node is a decision minted with an explicit id of its own — naming an
+auto-minted decision, or any non-decision node, is refused, because it is
+not this call's event to retry. That check does not stop at reading the
+`decision_identity` attr, either: every auto-minted id lands in a reserved
+namespace (the `decision:auto:` slug prefix) that no explicit id may ever
+use, and `decide` refuses up front to hand out a brand-new explicit id that
+collides with it — so membership in that namespace is a permanent fact
+about an id string, settled the moment it is minted, never re-derived and
+never dependent on anything else in the graph. A decision whose id lands in
+that namespace is never accepted as an explicit retry target, even when its
+`decision_identity` attr is tampered to say `"explicit"`. This is what
+closes the gap a digest check alone cannot: an auto-minted decision's
+stored digest is already correct for its real content, so flipping only its
+mode label leaves nothing for a digest comparison to disagree with. It is
+also why the namespace test cannot be a search bounded by the graph's
+current size — an early version of this tried exactly that (recomputing
+`slug(f"{title}|{n}", "decision")` for `n` up to the node count), and a
+bound that changes as the graph grows is not stable: an explicit id one
+write legitimately accepted could fail the identical check moments later,
+once that very write (or a snapshot round-trip of it) changed the bound,
+with no tampering involved. A plain prefix has no such bound to drift.
+Once identity agrees, the retry check compares
+the incoming call against the fingerprint of the *existing node's actual
+provenance and edges*, not against whatever its attrs claim. The same `id`
+with content that produces the same fingerprint is a true no-op that
+returns the existing node untouched, and the same `id` with any different
+content is refused with `OntologyError` before a single node or edge is
+written — the id is not free to start meaning something else partway
+through a run, or after a restart. This is an idempotency key, not a
+stronger identity scheme: it only protects a caller who reuses one id on
+purpose, the same way `add_node`'s type/label check only protects against
+`slug`'s truncation, and the two checks answer different questions (one
+caller-declared, one derived) that can both apply to the same write.
+
+A decision's immutability does not stop at `DecisionLog`, and neither does
+the trust boundary around its identity metadata. `add_node` refuses to mint
+a brand-new decision node at all — only `DecisionLog.decide` and the
+snapshot-restoration path in `from_dict` may create one — so `attrs` like
+`decision_identity` and `decision_payload_digest` can never be handed to a
+node that did not genuinely come from `decide`; a caller with only the
+public API cannot forge a decision that a later retry would mistake for a
+prior event. `add_node` also refuses a second call for an *existing*
+decision id even when type and label match, unlike a claim or entity, which
+legitimately merge new attrs on a repeat observation — a decision has no
+such second sighting, so reaching that collision means some other caller is
+trying to rewrite a decision's rationale through the generic merge path, and
+that is refused rather than silently allowed to succeed. And because a
+snapshot is untrusted input regardless of what created it, `from_dict`
+independently recomputes every `"explicit"` decision's fingerprint from its
+restored provenance/edges and refuses to load a file where the stored digest
+disagrees with reality, and separately refuses to load one where an
+`"explicit"`-labeled decision's id could have been auto-minted for its own
+title — a hand-edited snapshot cannot claim a decision holds content its
+actual edges do not support, nor turn a real auto-minted event into an
+explicit one by editing a single attr.
+
+`decide` is atomic under either path: a decision and its edges (citation,
+support, dependency, production, supersession) either all land or none do,
+rolled back the same way `AssumptionLedger.assume` rolls back a
+partially-justified assumption.
+
 **Code is evidence, not authority.** A behaviour may be written into this file
 when the implementation *structurally guarantees* it — when no caller can make
 it false without changing the implementation's own contract. A behaviour that is
@@ -163,6 +259,10 @@ disagree.
 8. A node or edge id names one semantic identity. A derived id that would
    collide with a different node or edge is refused, never silently merged
    into it — see *What a node/edge id collision means*.
+9. A `decision` is never content-addressed. Two decisions with the same
+   title and rationale are two events, not one; an explicit `id` on
+   `decide` is an idempotency key for one call, not a way to name a
+   decision by its content — see *What a decision's identity is*.
 
 ## Declared, not yet realized
 
