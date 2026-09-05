@@ -851,6 +851,27 @@ contextmesh-mcp --demo               # a graph rebuilt for this process
 contextmesh-mcp --session ./session  # a graph that outlives it
 ```
 
+A session that contains a durable execution plan also contains worker and
+auditor *keys*, never callables. The deployment that serves that session must
+therefore bring the `TaskRegistry` that gives those keys meaning. The plain
+console command deliberately has no way to invent or import implementations
+from checkpoint text; embed the launcher and pass the deployment-owned registry:
+
+```python
+from contextmesh.execute import TaskRegistry
+from contextmesh_mcp.server import main as mcp_main
+
+registry = TaskRegistry()
+registry.register_worker("auth.hash.bcrypt.v1", bcrypt_worker)
+registry.register_auditor("auth.hash.audit.v1", advisory_auditor)
+raise SystemExit(mcp_main(["--session", "./session"], registry=registry))
+```
+
+If the session has execution state and no registry is supplied, or a required
+key is absent, startup fails closed before the MCP transport starts. Registry
+selection is deployment configuration; no MCP request, checkpoint field, module
+path, or import string can choose executable code.
+
 An MCP server over the graph, so an agent can query it as memory instead of
 being handed chunks. Seven read tools — `mesh_ask`, `mesh_get_node`,
 `mesh_health`, `mesh_lineage`, `mesh_blast_radius`, `mesh_explain_as_of`,
