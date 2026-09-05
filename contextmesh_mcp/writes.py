@@ -9,6 +9,8 @@ made live after its manifest has committed.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -122,6 +124,63 @@ def _runner(session: Session) -> Runner:
     return runner
 
 
+def _durable_digest(session: Session, generation: int) -> str:
+    """Fingerprint exactly the durable state a generation is meant to publish.
+
+    Generation numbers establish ordering, not authorship. Recovery after an
+    exception therefore needs a second fact: the live generation must contain
+    the state this transaction staged. The digest covers the manifest and every
+    companion payload without adding a new field to the on-disk session schema.
+    """
+    manifest = json.dumps(
+        session.manifest(generation),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    parts = [
+        ("manifest", manifest),
+        ("graph", session.graph.to_json()),
+        ("resolver", session.resolver.to_json()),
+    ]
+    if session.runner is not None:
+        parts.extend(
+            [
+                ("execution", session.runner.to_json()),
+                ("ledger", session.runner.ledger.to_json()),
+            ]
+        )
+
+    digest = hashlib.sha256()
+    for name, payload in parts:
+        encoded = payload.encode("utf-8")
+        digest.update(name.encode("ascii"))
+        digest.update(b"\0")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _live_commit_is_staged(
+    staged: Session, expected_generation: int
+) -> bool:
+    """Prove that the live commit is this transaction before adopting it."""
+    assert staged.path is not None
+    registry = staged.runner.registry if staged.runner is not None else None
+    try:
+        committed = Session.load(staged.path, registry=registry)
+        if committed.generation != expected_generation:
+            return False
+        return _durable_digest(committed, expected_generation) == _durable_digest(
+            staged, expected_generation
+        )
+    except Exception:
+        # Recovery is the fail-closed path. If the live directory cannot be
+        # proved equivalent, the original checkpoint exception remains fatal.
+        return False
+
+
 def commit_mutation(
     session: Session,
     checkpointer: Optional[Checkpointer],
@@ -135,6 +194,7 @@ def commit_mutation(
         return WriteResult(payload=payload, session=session, changed=False)
 
     before_generation = session.generation
+    expected_generation = before_generation + 1
     try:
         staged.checkpoint()
     except SessionLockedError as exc:
@@ -146,15 +206,13 @@ def commit_mutation(
         # authoritative and needs no rollback at all.
         raise ControlledWriteError(str(exc)) from None
     except Exception as exc:
-        # ``session.json`` is the commit point. A best-effort cleanup failure
-        # after its swap must not make us resurrect the previous in-memory
-        # generation. If the directory moved exactly one generation, adopt the
-        # clone; otherwise the mutation never became committed.
-        assert staged.path is not None
-        live = Session._live_generation(staged.path)
-        if live != before_generation + 1:
+        # ``session.json`` is the commit point, but generation arithmetic alone
+        # cannot tell which writer published it. Another writer can advance the
+        # directory by exactly one while this checkpoint is failing. Recover
+        # only when the actual committed state fingerprints as the staged state.
+        if not _live_commit_is_staged(staged, expected_generation):
             raise ControlledWriteError(f"session checkpoint failed: {exc}") from exc
-        staged.generation = live
+        staged.generation = expected_generation
 
     cp.session = staged
     cp.pending = 0
