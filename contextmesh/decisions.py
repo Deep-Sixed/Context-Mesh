@@ -7,12 +7,29 @@ change our mind" is answerable by walking, not by reading a changelog.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional
 
 from .graph import ContextGraph
 from .model import EdgeType, Node, NodeType, Provenance, slug
 from .ontology import OntologyError
+
+
+def _payload_digest(payload: Dict[str, Any]) -> str:
+    """A stable fingerprint of a decision's immutable content, durable
+    enough to survive a snapshot round-trip: unlike an in-memory dict keyed
+    by id, this is meant to be stored *on the node* so a fresh `DecisionLog`
+    over a restored graph can still tell an idempotent retry from a
+    collision."""
+    canonical = {
+        key: (list(value) if isinstance(value, tuple) else value)
+        for key, value in payload.items()
+    }
+    return hashlib.sha256(
+        json.dumps(canonical, sort_keys=True).encode("utf-8")
+    ).hexdigest()
 
 
 @dataclass
@@ -45,10 +62,25 @@ class DecisionLog:
     def __init__(self, graph: ContextGraph) -> None:
         self.graph = graph
         self.records: List[DecisionRecord] = []
-        # Keyed by an explicit `id=` a caller has already used once, so a
-        # retry with that id can be told apart from a genuine collision --
-        # see `decide`'s docstring.
-        self._payloads: Dict[str, Dict[str, Any]] = {}
+
+    def _mint_fresh_id(self, title: str) -> str:
+        """The next auto id for `title`, guaranteed unused in the graph.
+
+        Deliberately reads `self.graph.nodes`, not `self.records`: the
+        latter is this `DecisionLog` object's own history and resets to
+        empty for a fresh instance over the same graph (a restored Runner
+        with no `decisions=` given constructs exactly this). Counting from
+        durable graph state instead means the discriminator picks up where
+        a *previous* `DecisionLog` over this graph left off, so "always a
+        fresh id" holds across that reconstruction too, not just within one
+        object's lifetime.
+        """
+        n = 1
+        while True:
+            candidate = slug(f"{title}|{n}", "decision")
+            if candidate not in self.graph.nodes:
+                return candidate
+            n += 1
 
     def decide(
         self,
@@ -67,7 +99,10 @@ class DecisionLog:
         never-reused decision, even if the content is byte-identical to a
         prior one -- a decision is an immutable event, not content-addressed,
         so "the same title again" is a second decision, not an update. Use
-        `supersedes` to link it to the one it replaces.
+        `supersedes` to link it to the one it replaces. The id this mints is
+        guaranteed unused in the graph, not merely unused in this
+        `DecisionLog` object's own history, so it stays fresh across a new
+        `DecisionLog` constructed over the same (possibly restored) graph.
 
         An explicit `id` is purely an idempotency key, not a content
         address: calling again with the same `id` and the exact same
@@ -76,6 +111,12 @@ class DecisionLog:
         existing node untouched; calling again with the same `id` and any
         different payload is refused with `OntologyError` before anything is
         written, rather than silently rewriting what that id already means.
+        This check is backed by identity metadata stored on the decision
+        node itself, not by an in-memory table local to this object, so it
+        survives a snapshot round-trip and a fresh `DecisionLog`. An
+        explicit `id` that names a decision minted *without* one (or any
+        non-decision node) is refused the same way: it is not this call's
+        event to retry.
 
         The write is atomic: if any referenced id is invalid partway through
         (a bad source, claim, assumption, entity, or supersedes target), the
@@ -96,27 +137,42 @@ class DecisionLog:
             "produces": produces,
             "supersedes": supersedes,
         }
+        digest = _payload_digest(payload)
 
         if id is not None:
-            existing_payload = self._payloads.get(id)
-            if existing_payload is not None:
-                if existing_payload != payload:
+            existing = self.graph.get(id)
+            if existing is not None:
+                if (
+                    existing.type is not NodeType.DECISION
+                    or existing.attrs.get("decision_identity") != "explicit"
+                ):
+                    raise OntologyError(
+                        f"decision id {id!r} already names a decision this "
+                        "call did not mint (or a non-decision node); "
+                        "refusing to treat this as an idempotent retry"
+                    )
+                if existing.attrs.get("decision_payload_digest") != digest:
                     raise OntologyError(
                         f"decision id {id!r} is already recorded with "
                         "different content; refusing to treat this call as "
                         "the same decision"
                     )
-                return self.graph.node(id)
+                return existing
+            node_id = id
+            identity_mode = "explicit"
+        else:
+            node_id = self._mint_fresh_id(title)
+            identity_mode = "auto"
 
-        node_id = id if id is not None else slug(
-            f"{title}|{len(self.records) + 1}", "decision"
-        )
-        node_already_existed = node_id in self.graph.nodes
         node = self.graph.add_node(
             NodeType.DECISION,
             title,
             id=node_id,
-            attrs={"rationale": rationale},
+            attrs={
+                "rationale": rationale,
+                "decision_identity": identity_mode,
+                "decision_payload_digest": digest,
+            },
             provenance=Provenance(
                 source_id=source_id,
                 extractor="decision-log",
@@ -149,10 +205,13 @@ class DecisionLog:
                 _tracked_edge(node.id, EdgeType.SUPERSEDES, supersedes)
                 self.graph.node(supersedes).attrs["superseded_by"] = node.id
         except Exception:
+            # `node` was always freshly created just above -- both branches
+            # above either returned early on an existing id or resolved one
+            # verified absent from the graph -- so it is always safe to
+            # discard here.
             for edge_id in created_edge_ids:
                 self.graph._discard_edge(edge_id)
-            if not node_already_existed:
-                self.graph._discard_node(node.id)
+            self.graph._discard_node(node.id)
             raise
 
         self.records.append(
@@ -167,8 +226,6 @@ class DecisionLog:
                 cites=list(cites),
             )
         )
-        if id is not None:
-            self._payloads[id] = payload
         return node
 
     def history_of(self, decision_id: str) -> List[DecisionRecord]:

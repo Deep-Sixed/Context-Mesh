@@ -128,6 +128,24 @@ class ContextGraph:
                     f"{existing.label!r}; refusing to treat {type.value} "
                     f"{label!r} as the same node"
                 )
+            if type is NodeType.DECISION:
+                # A decision has no repeat-observation sense (GRAPH.md rule
+                # 9): unlike a claim or entity, there is no legitimate second
+                # sighting of the same event to merge new attrs from. Every
+                # decision id add_node is asked to create here is fresh by
+                # construction -- DecisionLog.decide() resolves an id that
+                # already exists (auto-minted or an explicit idempotency-key
+                # retry) itself, before ever reaching this call. Reaching
+                # this branch for a decision means some other caller is
+                # trying to rewrite an existing decision's rationale through
+                # the generic merge path, which would silently violate
+                # immutability -- refused instead.
+                raise OntologyError(
+                    f"decision id {node_id!r} already exists; a decision is "
+                    "an immutable event and is never merged by a repeat "
+                    "add_node call -- see DecisionLog.decide's idempotency-"
+                    "key semantics"
+                )
             if attrs:
                 existing.attrs.update(attrs)
             if provenance is not None and existing.provenance is None:

@@ -283,5 +283,154 @@ class PreexistingEdgesSurviveRollbackTest(unittest.TestCase):
         self.assertIs(graph.assumptions[assumption.id], assumption)
 
 
+class DurableAcrossAFreshDecisionLogTest(unittest.TestCase):
+    """A DecisionLog's own `records`/in-memory bookkeeping resets to empty
+    when a new instance is built over the same graph -- exactly what a
+    restored Runner does when no `decisions=` is supplied. Identity has to
+    be enforced from graph state, not that instance-local history, or a
+    reconstruction silently loses both "always fresh" and the idempotency
+    contract."""
+
+    def test_same_title_after_new_decisionlog_still_gets_a_fresh_id(self):
+        graph, source = _graph_with_source()
+        first = DecisionLog(graph).decide(
+            "Use PostgreSQL", "It fits our access patterns.", source_id=source.id
+        )
+        second = DecisionLog(graph).decide(
+            "Use PostgreSQL", "It fits our access patterns.", source_id=source.id
+        )
+        self.assertNotEqual(first.id, second.id)
+        self.assertEqual(graph.type_counts(live_only=False)["decision"], 2)
+        # And the label/rationale of the first decision was never touched.
+        self.assertEqual(graph.node(first.id).attrs["rationale"],
+                          "It fits our access patterns.")
+
+    def test_explicit_id_exact_retry_after_new_decisionlog_is_a_true_no_op(self):
+        graph, source = _graph_with_source()
+        DecisionLog(graph).decide(
+            "Rebuild the index",
+            "Bounded memory beats build time.",
+            source_id=source.id,
+            id="decision:step-1",
+        )
+        node_count = len(graph.nodes)
+        edge_count = len(graph.edges)
+
+        again = DecisionLog(graph).decide(
+            "Rebuild the index",
+            "Bounded memory beats build time.",
+            source_id=source.id,
+            id="decision:step-1",
+        )
+
+        self.assertEqual(again.id, "decision:step-1")
+        self.assertEqual(len(graph.nodes), node_count)
+        self.assertEqual(len(graph.edges), edge_count)
+
+    def test_explicit_id_different_payload_after_new_decisionlog_fails_closed(self):
+        graph, source = _graph_with_source()
+        DecisionLog(graph).decide(
+            "Rebuild the index",
+            "Bounded memory beats build time.",
+            source_id=source.id,
+            id="decision:step-1",
+        )
+        node_count = len(graph.nodes)
+        edge_count = len(graph.edges)
+
+        with self.assertRaises(OntologyError):
+            DecisionLog(graph).decide(
+                "Rebuild the index",
+                "A different rationale entirely.",
+                source_id=source.id,
+                id="decision:step-1",
+            )
+
+        self.assertEqual(len(graph.nodes), node_count)
+        self.assertEqual(len(graph.edges), edge_count)
+        self.assertEqual(
+            graph.node("decision:step-1").attrs["rationale"],
+            "Bounded memory beats build time.",
+        )
+
+    def test_explicit_id_equal_to_an_auto_minted_decision_is_refused(self):
+        graph, source = _graph_with_source()
+        decisions = DecisionLog(graph)
+        auto = decisions.decide(
+            "Use PostgreSQL", "It fits our access patterns.", source_id=source.id
+        )
+
+        with self.assertRaises(OntologyError):
+            decisions.decide(
+                "Use PostgreSQL",
+                "A completely different rationale.",
+                source_id=source.id,
+                id=auto.id,
+            )
+
+        self.assertEqual(
+            graph.node(auto.id).attrs["rationale"], "It fits our access patterns."
+        )
+        self.assertEqual(graph.type_counts(live_only=False)["decision"], 1)
+
+    def test_explicit_id_round_trips_through_a_snapshot(self):
+        """The idempotency-key metadata lives in node attrs, so it has to
+        survive to_dict/from_dict, not just object reconstruction."""
+        graph, source = _graph_with_source()
+        DecisionLog(graph).decide(
+            "Rebuild the index",
+            "Bounded memory beats build time.",
+            source_id=source.id,
+            id="decision:step-1",
+        )
+        restored = ContextGraph.from_dict(graph.to_dict())
+
+        # Exact retry over the restored graph is a no-op.
+        again = DecisionLog(restored).decide(
+            "Rebuild the index",
+            "Bounded memory beats build time.",
+            source_id=source.id,
+            id="decision:step-1",
+        )
+        self.assertEqual(again.id, "decision:step-1")
+        self.assertEqual(len(restored.nodes), len(graph.nodes))
+
+        # A mismatched retry over the restored graph still fails closed.
+        with self.assertRaises(OntologyError):
+            DecisionLog(restored).decide(
+                "Rebuild the index",
+                "Something else.",
+                source_id=source.id,
+                id="decision:step-1",
+            )
+
+
+class DecisionNodeIsNeverMergedThroughAddNodeTest(unittest.TestCase):
+    """GRAPH.md rule 9: a decision has no repeat-observation sense, unlike a
+    claim or entity. `add_node` must refuse a second call for an existing
+    decision id even when type and label match, closing the path a direct
+    (non-DecisionLog) caller could otherwise use to rewrite a decision's
+    rationale in place."""
+
+    def test_add_node_refuses_to_merge_an_existing_decision(self):
+        graph, source = _graph_with_source()
+        decision = DecisionLog(graph).decide(
+            "Use PostgreSQL", "It fits our access patterns.", source_id=source.id
+        )
+
+        with self.assertRaises(OntologyError):
+            graph.add_node(
+                NodeType.DECISION,
+                "Use PostgreSQL",
+                id=decision.id,
+                attrs={"rationale": "A silently rewritten rationale."},
+            )
+
+        self.assertEqual(
+            graph.node(decision.id).attrs["rationale"],
+            "It fits our access patterns.",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

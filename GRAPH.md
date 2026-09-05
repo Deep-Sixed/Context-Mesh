@@ -100,25 +100,53 @@ never a content address: two calls to `DecisionLog.decide` with byte-identical
 `title` and `rationale` are two decisions, not one being re-observed, because
 "we chose this again" and "we never stopped choosing this" are different
 facts and only the first is `supersedes`'s job to record. A call made without
-an explicit `id` therefore always mints a fresh id, discriminated by how many
-decisions this log has already recorded, so a repeated title can never
-collide with its own predecessor. An explicit `id` means something narrower:
-not "this is the decision this content names" but "this exact call may have
-already happened — tell me if it did." `DecisionLog` remembers the full
+an explicit `id` therefore always mints a fresh id, discriminated against
+*graph* state rather than `DecisionLog`'s own history — the smallest sequence
+number whose derived id is not already a node in this graph — so a repeated
+title still cannot collide with its own predecessor after a fresh
+`DecisionLog` is constructed over the same graph, which is exactly what a
+restored `Runner` does when no `decisions=` is given. An in-memory
+discriminator that instead counted this object's own records would forget
+every decision minted before it existed and hand out an id that object had
+never seen but the graph had — an id collision one caller reuses, not two
+callers agreeing.
+
+An explicit `id` means something narrower: not "this is the decision this
+content names" but "this exact call may have already happened — tell me if
+it did." The decision node itself carries this call's evidence, in two attrs
+that ride along with `rationale`: `decision_identity` (`"auto"` or
+`"explicit"`) and `decision_payload_digest`, a digest of the full immutable
 payload (`title`, `rationale`, `source_id`, `supported_by`, `cites`,
-`assumptions`, `produces`, `supersedes`) an `id` was first used with; the
-same `id` with that exact payload again is a true no-op that returns the
-existing node untouched, and the same `id` with any different payload is
-refused with `OntologyError` before a single node or edge is written — the
-id is not free to start meaning something else partway through a run. This
-is an idempotency key, not a stronger identity scheme: it only protects a
-caller who reuses one id on purpose, the same way `add_node`'s type/label
-check only protects against `slug`'s truncation, and the two checks answer
-different questions (one caller-declared, one derived) that can both apply
-to the same write. `decide` is atomic under either path: a decision and its
-edges (citation, support, dependency, production, supersession) either all
-land or none do, rolled back the same way `AssumptionLedger.assume` rolls
-back a partially-justified assumption.
+`assumptions`, `produces`, `supersedes`). This is graph state, not a
+`DecisionLog`-local table, so it survives a snapshot round-trip and a fresh
+`DecisionLog` the same way the id-freshness check does. An explicit `id`
+naming an existing node is an idempotent retry only when that node is a
+decision minted with an explicit id of its own — naming an auto-minted
+decision, or any non-decision node, is refused, because it is not this
+call's event to retry. Once that much agrees, the same `id` with the exact
+same payload digest is a true no-op that returns the existing node
+untouched, and the same `id` with any different digest is refused with
+`OntologyError` before a single node or edge is written — the id is not
+free to start meaning something else partway through a run, or after a
+restart. This is an idempotency key, not a stronger identity scheme: it
+only protects a caller who reuses one id on purpose, the same way
+`add_node`'s type/label check only protects against `slug`'s truncation,
+and the two checks answer different questions (one caller-declared, one
+derived) that can both apply to the same write.
+
+A decision's immutability does not stop at `DecisionLog`: `add_node` itself
+refuses a second call for an existing decision id even when type and label
+match, unlike a claim or entity, which legitimately merge new attrs on a
+repeat observation. A decision has no such second sighting — every id
+`decide` ever asks `add_node` to create is one it has already established is
+fresh — so reaching that collision as a decision means some other caller is
+trying to rewrite a decision's rationale through the generic merge path, and
+that is refused rather than silently allowed to succeed.
+
+`decide` is atomic under either path: a decision and its edges (citation,
+support, dependency, production, supersession) either all land or none do,
+rolled back the same way `AssumptionLedger.assume` rolls back a
+partially-justified assumption.
 
 **Code is evidence, not authority.** A behaviour may be written into this file
 when the implementation *structurally guarantees* it — when no caller can make
