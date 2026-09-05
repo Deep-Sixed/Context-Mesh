@@ -24,7 +24,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .execute import AuditContext, RunContext
 from .model import NodeType
@@ -40,6 +40,19 @@ class LLMConfigurationError(LLMError):
 
 class LLMTransportError(LLMError):
     """No HTTP response was obtained from the configured provider."""
+
+
+class LLMRequestTooLargeError(LLMError):
+    """The assembled request body exceeds this client's own outbound limit.
+
+    Raised before the request is ever sent: nothing here truncates a prompt
+    to fit, because a worker's ``inputs`` or an audit's ``available_evidence``
+    are graph content a caller reasons about, and silently dropping some of
+    it would change what the model is actually asked without telling anyone.
+    The one honest response to an oversized request is to refuse it and say
+    so, the same way :func:`_bounded_read` refuses an oversized response
+    rather than truncating what a provider sends back.
+    """
 
 
 class LLMProviderError(LLMError):
@@ -167,6 +180,7 @@ class LLMConfig:
     base_delay: float = 0.25
     max_tokens: int = 1024
     max_response_bytes: int = 1_048_576
+    max_request_bytes: int = 1_048_576
 
     def __post_init__(self) -> None:
         if not isinstance(self.provider, str) or not self.provider:
@@ -197,6 +211,12 @@ class LLMConfig:
             raise LLMConfigurationError("max_response_bytes must be a positive integer")
         if self.max_response_bytes < 1:
             raise LLMConfigurationError("max_response_bytes must be a positive integer")
+        if isinstance(self.max_request_bytes, bool) or not isinstance(
+            self.max_request_bytes, int
+        ):
+            raise LLMConfigurationError("max_request_bytes must be a positive integer")
+        if self.max_request_bytes < 1:
+            raise LLMConfigurationError("max_request_bytes must be a positive integer")
 
         if self.mode == "live":
             if self.provider not in LIVE_PROVIDERS:
@@ -346,6 +366,114 @@ def _json_bytes(value: Any) -> bytes:
         ).encode("utf-8")
     except (TypeError, ValueError) as exc:
         raise LLMConfigurationError("request contains a value JSON cannot represent") from exc
+
+
+@dataclass
+class _JsonArray:
+    """An internal lazy array, so auditing need not copy all evidence first."""
+
+    items: Iterable[Any]
+
+
+def _bounded_json_bytes(value: Any, limit: int, *, sort_keys: bool = False) -> bytes:
+    """Encode compact UTF-8 JSON with storage bounded by the byte budget.
+
+    JSONEncoder.iterencode alone is insufficient: it encodes a whole string
+    into a single chunk. Strings here are escaped in small pieces, containers
+    are visited incrementally, and the output never grows beyond ``limit``.
+    """
+    output = bytearray()
+    active = set()
+
+    def too_large() -> None:
+        raise LLMRequestTooLargeError(f"request exceeds the {limit}-byte limit")
+
+    def emit(chunk: bytes) -> None:
+        if len(chunk) > limit - len(output):
+            too_large()
+        output.extend(chunk)
+
+    def string(text: str) -> None:
+        # Every code point needs at least one byte, plus the quotes. Check
+        # before slicing, escaping, or encoding a possibly enormous value.
+        if len(text) + 2 > limit - len(output):
+            too_large()
+        emit(b'"')
+        for start in range(0, len(text), 1024):
+            chunk = json.dumps(text[start:start + 1024], ensure_ascii=False)[1:-1]
+            emit(chunk.encode("utf-8"))
+        emit(b'"')
+
+    def scalar(item: Any) -> str:
+        if isinstance(item, int) and not isinstance(item, bool):
+            # 2**4 > 10: this conservative lower bound avoids converting an
+            # enormous integer to decimal just to discover it cannot fit.
+            if item.bit_length() // 4 > limit - len(output):
+                too_large()
+        return json.dumps(item, ensure_ascii=False, allow_nan=False)
+
+    def encode(item: Any) -> None:
+        if isinstance(item, str):
+            string(item)
+        elif item is None or isinstance(item, (bool, int, float)):
+            emit(scalar(item).encode("utf-8"))
+        elif isinstance(item, (dict, list, tuple, _JsonArray)):
+            identity = id(item)
+            if identity in active:
+                raise ValueError("circular reference")
+            active.add(identity)
+            try:
+                # Each member requires at least one byte. In particular this
+                # bounds the temporary key list needed for deterministic sort.
+                if not isinstance(item, _JsonArray) and len(item) > limit - len(output):
+                    too_large()
+                if isinstance(item, dict):
+                    emit(b"{")
+                    keys = sorted(item) if sort_keys else item
+                    for index, key in enumerate(keys):
+                        if index:
+                            emit(b",")
+                        if not isinstance(key, str):
+                            if key is not None and not isinstance(key, (bool, int, float)):
+                                raise TypeError("unsupported JSON key")
+                            key_text = scalar(key)
+                        else:
+                            key_text = key
+                        string(key_text)
+                        emit(b":")
+                        encode(item[key])
+                    emit(b"}")
+                else:
+                    emit(b"[")
+                    items = item.items if isinstance(item, _JsonArray) else item
+                    for index, member in enumerate(items):
+                        if index:
+                            emit(b",")
+                        encode(member)
+                    emit(b"]")
+            finally:
+                active.remove(identity)
+        else:
+            raise TypeError("unsupported JSON value")
+
+    try:
+        encode(value)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise LLMConfigurationError("request contains a value JSON cannot represent") from exc
+    return bytes(output)
+
+
+def _bounded_prompt(prefix: str, payload: Any, limit: int) -> str:
+    if len(prefix) > limit:
+        raise LLMRequestTooLargeError(f"request exceeds the {limit}-byte limit")
+    prefix_bytes = prefix.encode("utf-8")
+    if len(prefix_bytes) > limit:
+        raise LLMRequestTooLargeError(f"request exceeds the {limit}-byte limit")
+    try:
+        body = _bounded_json_bytes(payload, limit - len(prefix_bytes), sort_keys=True)
+    except LLMRequestTooLargeError:
+        raise LLMRequestTooLargeError(f"request exceeds the {limit}-byte limit") from None
+    return prefix + body.decode("utf-8")
 
 
 def _type_list(schema: Mapping[str, Any], path: str) -> List[str]:
@@ -758,7 +886,7 @@ def _request_for(
         method="POST",
         url=_ENDPOINTS[provider],
         headers=headers,
-        body=_json_bytes(body),
+        body=_bounded_json_bytes(body, config.max_request_bytes),
         timeout=float(config.timeout),
         max_response_bytes=config.max_response_bytes,
     )
@@ -826,10 +954,13 @@ class LLMClient:
         schema_name: str = "contextmesh_output",
         system: Optional[str] = None,
     ) -> LLMResult:
-        if not isinstance(prompt, str) or not prompt.strip():
+        if not isinstance(prompt, str) or not prompt or prompt.isspace():
             raise LLMConfigurationError("prompt must be a non-empty string")
-        if system is not None and (not isinstance(system, str) or not system.strip()):
+        if system is not None and (not isinstance(system, str) or not system or system.isspace()):
             raise LLMConfigurationError("system must be a non-empty string or null")
+        # Before schema validation (which serializes enum values), bound all
+        # caller-controlled input. Provider envelope overhead is checked below.
+        _bounded_json_bytes([prompt, schema, system, schema_name], self.config.max_request_bytes)
         validate_schema_definition(schema)
         schema_name = _schema_name(schema_name)
 
@@ -927,40 +1058,34 @@ def validate_audit_proposal(context: AuditContext, proposal: AuditProposal) -> A
     return proposal
 
 
-def _audit_prompt(context: AuditContext, instruction: str) -> str:
-    evidence = []
-    for node in context.graph.nodes.values():
-        if node.type is not NodeType.EVIDENCE or node.invalidated:
-            continue
-        evidence.append(
-            {
+def _audit_prompt(context: AuditContext, instruction: str, limit: int) -> str:
+    def evidence() -> Iterable[Dict[str, Any]]:
+        for node in context.graph.nodes.values():
+            if node.type is not NodeType.EVIDENCE or node.invalidated:
+                continue
+            yield {
                 "id": node.id,
                 "label": node.label,
                 "attrs": node.attrs,
                 "source_id": node.provenance.source_id if node.provenance else None,
             }
-        )
     payload = {
         "task": context.task.name,
         "assumption": {"id": context.assumption.id, "statement": context.assumption.statement},
         "output": context.output,
-        "available_evidence": evidence,
+        "available_evidence": _JsonArray(evidence()),
     }
-    return instruction + "\n\nAudit input:\n" + json.dumps(
-        payload,
-        sort_keys=True,
-        ensure_ascii=False,
-        allow_nan=False,
-        separators=(",", ":"),
-    )
+    if len(instruction) > limit:
+        raise LLMRequestTooLargeError(f"request exceeds the {limit}-byte limit")
+    return _bounded_prompt(instruction + "\n\nAudit input:\n", payload, limit)
 
 
 def propose_audit(client: LLMClient, context: AuditContext, *, instruction: str) -> AuditProposal:
     """Ask an LLM to interpret one audit without granting mutation authority."""
-    if not isinstance(instruction, str) or not instruction.strip():
+    if not isinstance(instruction, str) or not instruction or instruction.isspace():
         raise LLMConfigurationError("audit instruction must be a non-empty string")
     result = client.complete(
-        _audit_prompt(context, instruction),
+        _audit_prompt(context, instruction, client.config.max_request_bytes),
         AUDIT_PROPOSAL_SCHEMA,
         schema_name="contextmesh_audit_proposal",
         system=(
@@ -997,8 +1122,11 @@ def make_worker(
     schema_name: str = "contextmesh_worker_output",
 ) -> Callable[[RunContext], Dict[str, Any]]:
     """Build a Runner worker whose durable output carries provider provenance."""
-    if not isinstance(instruction, str) or not instruction.strip():
+    if not isinstance(instruction, str) or not instruction or instruction.isspace():
         raise LLMConfigurationError("worker instruction must be a non-empty string")
+    _bounded_json_bytes(
+        [instruction, output_schema, schema_name], client.config.max_request_bytes
+    )
     validate_schema_definition(output_schema)
     if "object" not in _type_list(output_schema, "$schema"):
         raise LLMConfigurationError("worker output schema must permit an object")
@@ -1019,13 +1147,7 @@ def make_worker(
             },
             "inputs": context.inputs,
         }
-        prompt = "Task input:\n" + json.dumps(
-            payload,
-            sort_keys=True,
-            ensure_ascii=False,
-            allow_nan=False,
-            separators=(",", ":"),
-        )
+        prompt = _bounded_prompt("Task input:\n", payload, client.config.max_request_bytes)
         result = client.complete(
             prompt,
             output_schema,
@@ -1050,6 +1172,7 @@ __all__ = [
     "LLMError",
     "LLMProviderError",
     "LLMProvenance",
+    "LLMRequestTooLargeError",
     "LLMResponseError",
     "LLMResult",
     "LLMSchemaError",

@@ -27,6 +27,12 @@ MAX_TEXT_BYTES = 65_536
 MAX_METADATA_BYTES = 65_536
 MAX_METADATA_DEPTH = 8
 MAX_COLLECTION_LENGTH = 1_000
+#: An external_id is a foreign system's identifier (a CVE number, a ticket
+#: key), not prose -- unlike ``text``, nothing about its purpose needs
+#: kilobytes. Bounded far below MAX_TEXT_BYTES so an oversized one is refused
+#: as what it actually is: not a long identifier, but unbounded input handed
+#: to the one field here that had no limit at all.
+MAX_EXTERNAL_ID_BYTES = 512
 
 
 class EvidenceIntakeError(ValueError):
@@ -329,6 +335,7 @@ class EvidenceIntake:
                 )
             if not external_id.isprintable():
                 raise EvidenceIntakeError("external_id contains a control character")
+            _check_string_bytes(external_id, MAX_EXTERNAL_ID_BYTES, "external_id")
 
         clean_metadata = validate_metadata(metadata)
         canonical = canonical_payload(

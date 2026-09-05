@@ -11,6 +11,7 @@ from pathlib import Path
 from contextmesh.decisions import DecisionLog
 from contextmesh.evidence import (
     MAX_COLLECTION_LENGTH,
+    MAX_EXTERNAL_ID_BYTES,
     MAX_METADATA_BYTES,
     MAX_METADATA_DEPTH,
     MAX_TEXT_BYTES,
@@ -126,6 +127,17 @@ class EvidenceIntakeTest(unittest.TestCase):
         with self.assertRaisesRegex(EvidenceIntakeError, "byte limit"):
             self.submit(metadata={"blob": "x" * MAX_METADATA_BYTES})
         self.assertEqual(self.graph.to_dict(), before)
+
+    def test_oversized_external_id_is_refused_before_mutation(self):
+        """Unlike text and metadata, external_id had no size limit at all --
+        a foreign system's identifier, not prose, so nothing bounded a
+        caller from handing this the one unbounded field left in intake."""
+        before = self.graph.to_dict()
+        with self.assertRaisesRegex(EvidenceIntakeError, "byte limit"):
+            self.submit(external_id="x" * (MAX_EXTERNAL_ID_BYTES + 1))
+        self.assertEqual(self.graph.to_dict(), before)
+        # The boundary itself is accepted: this is a limit, not an off-by-one trap.
+        self.submit(text="at the external_id limit", external_id="x" * MAX_EXTERNAL_ID_BYTES)
 
     def test_metadata_is_refused_exactly_one_byte_over_the_serialized_limit(self):
         """Pin the boundary on the *combined* serialized size, not one field.
