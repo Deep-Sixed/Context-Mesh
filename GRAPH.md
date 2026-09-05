@@ -72,6 +72,29 @@ state change on top of one that already happened. The demo's export path
 (`contextmesh/demo.py`) never opts in, so this pass changes nothing about the
 dashboard unless a caller explicitly asks for it.
 
+**What a node/edge id collision means.** `slug` (`contextmesh/model.py`) truncates
+its digest to keep ids short, so it is not injective: two different node
+labels, or two different `(src, type, dst)` edge triples, can derive the same
+id. `add_node` and `add_edge` are also the merge path for a genuine repeat
+observation — the same claim text extracted from a second document, the same
+`mentions` edge asserted twice — so a shared id has to be told apart from a
+coincidence before it is treated as one. For a node, "the same thing" means
+the existing node's `type` and `label` agree with the incoming call; `attrs`
+is never part of that comparison, since a repeat observation may legitimately
+carry new metadata the first one did not. For an edge, "the same thing" means
+the existing edge's `(src, type, dst)` triple — not merely its id — matches.
+A collision found either way is refused with `OntologyError` before anything
+is written: no node's `label`/`type` is silently overwritten, no edge's
+`(src, type, dst)` is silently repointed, and none of the internal indexes
+(`edges`, `_edge_key`, `_out`, `_in`) are touched. `from_dict` inherits this
+for free, since every node and edge it restores goes through `add_node` and
+`add_edge` the same as a live write — but a snapshot's own `nodes`/`edges`
+lists are also checked for two rows sharing a literal id before either method
+ever runs, since `to_dict` can never produce that either. This is
+collision *detection*, not a stronger id scheme: `slug`'s truncation is
+unchanged, and a caller that keeps minting distinct content into the same
+id space will eventually have a write refused rather than silently lose one.
+
 **Code is evidence, not authority.** A behaviour may be written into this file
 when the implementation *structurally guarantees* it — when no caller can make
 it false without changing the implementation's own contract. A behaviour that is
@@ -137,6 +160,9 @@ disagree.
 7. An `assumption` is only ever rejected by `evidence` that `contradicts` it. A
    caller may not mark one false directly, because "why did this fall over" has
    to have an answer inside the graph.
+8. A node or edge id names one semantic identity. A derived id that would
+   collide with a different node or edge is refused, never silently merged
+   into it — see *What a node/edge id collision means*.
 
 ## Declared, not yet realized
 

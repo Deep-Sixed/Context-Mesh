@@ -48,6 +48,7 @@ from .assumptions import AssumptionLedger, InvalidationReport
 from .decisions import DecisionLog
 from .graph import ContextGraph
 from .model import Assumption, AssumptionStatus, EdgeType, NodeType, slug
+from .ontology import OntologyError
 
 
 class ExecutionError(Exception):
@@ -2023,8 +2024,24 @@ class Runner:
 
     # ── internals ────────────────────────────────────────────────────────
     def _assume(self, statement: str) -> Assumption:
+        """Reuse the assumption this statement already names, or mint one.
+
+        ``slug`` truncates its digest (GRAPH.md rule 8), so the id this
+        statement derives to is not proof the statement is the one already
+        recorded under it. Reusing an id whose statement disagrees would
+        silently bind the caller to different ground than the one they
+        asked for -- exactly the write ``add_node``'s collision guard
+        exists to refuse, so this checks the same thing before this
+        shortcut can bypass it.
+        """
         existing = self.graph.assumptions.get(slug(statement, "assumption"))
         if existing is not None:
+            if existing.statement != statement:
+                raise OntologyError(
+                    f"assumption id {existing.id!r} is already "
+                    f"{existing.statement!r}; refusing to treat {statement!r} "
+                    "as the same assumption"
+                )
             return existing
         return self.assumptions.assume(statement, created_by="runner")
 
