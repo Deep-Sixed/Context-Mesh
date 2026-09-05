@@ -24,6 +24,8 @@ import json
 import sys
 from typing import Any, Dict, List, Optional, Sequence
 
+from contextmesh.execute import TaskRegistry
+
 try:
     from mcp.server import MCPServer
 except ImportError as exc:  # pragma: no cover - depends on the optional extra
@@ -272,7 +274,11 @@ def resource_assumption(assumption_id: str) -> str:
     return resources.read(session(), f"contextmesh://assumption/{assumption_id}")
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(
+    argv: Optional[Sequence[str]] = None,
+    *,
+    registry: Optional[TaskRegistry] = None,
+) -> int:
     parser = add_source_arguments(
         argparse.ArgumentParser(
             prog="contextmesh-mcp",
@@ -289,7 +295,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        opened = open_session(args)
+        opened = open_session(args, registry=registry)
     except SessionError as exc:
         print(f"contextmesh-mcp: {exc}", file=sys.stderr)
         return 2
