@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+import tracemalloc
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List
@@ -30,6 +31,7 @@ from contextmesh.llm import (
     validate_schema_definition,
 )
 from contextmesh.model import AssumptionStatus, NodeType
+from contextmesh.llm import _bounded_json_bytes, _request_for
 
 
 OUTPUT_SCHEMA: Dict[str, Any] = {
@@ -455,6 +457,151 @@ class RequestSizeTest(unittest.TestCase):
         self.assertEqual(transport.requests, [])
         after = (len(runner.graph.nodes), len(runner.graph.edges), assumption.status)
         self.assertEqual(before, after)
+
+
+class RequestConstructionTest(unittest.TestCase):
+    def assert_bounded_refusal(self, operation):
+        # Inputs already exist before tracing. The limit is 1 KiB; permit
+        # generous interpreter overhead, but not a copy of the 8 MiB input.
+        tracemalloc.start()
+        try:
+            with self.assertRaises(LLMRequestTooLargeError):
+                operation()
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 256 * 1024)
+
+    def test_large_prompt_system_and_schema_are_refused_before_allocation(self):
+        huge = "x" * (8 * 1024 * 1024)
+        for provider in ("openai", "gemini", "anthropic", "openrouter"):
+            for field in ("prompt", "system", "schema"):
+                with self.subTest(provider=provider, field=field):
+                    transport = QueueTransport()
+                    client = _live(provider, transport, max_request_bytes=1024)
+                    prompt = huge if field == "prompt" else "work"
+                    system = huge if field == "system" else None
+                    schema = (
+                        {"type": "string", "enum": [huge]} if field == "schema" else OUTPUT_SCHEMA
+                    )
+                    self.assert_bounded_refusal(
+                        lambda: client.complete(prompt, schema, system=system)
+                    )
+                    # Exercise the final serializer independently of the
+                    # input preflight, so removing either bound fails a test.
+                    self.assert_bounded_refusal(
+                        lambda: _request_for(client.config, prompt, schema, "output", system)
+                    )
+                    self.assertEqual(transport.requests, [])
+
+    def test_wire_body_exact_byte_limit_and_one_byte_over_for_every_provider(self):
+        for provider in ("openai", "gemini", "anthropic", "openrouter"):
+            with self.subTest(provider=provider):
+                prompt = 'quotes " newline\n unicode \u00e9\U0001f600' * 8
+                first = QueueTransport(_structured(provider, '{"value":"ok","count":1}'))
+                _live(provider, first).complete(prompt, OUTPUT_SCHEMA)
+                expected = first.requests[0].body
+                transport = QueueTransport(_structured(provider, '{"value":"ok","count":1}'))
+                _live(provider, transport, max_request_bytes=len(expected)).complete(
+                    prompt, OUTPUT_SCHEMA
+                )
+                self.assertEqual(transport.requests[0].body, expected)
+                refused = QueueTransport()
+                with self.assertRaises(LLMRequestTooLargeError):
+                    _live(provider, refused, max_request_bytes=len(expected) - 1).complete(
+                        prompt, OUTPUT_SCHEMA
+                    )
+                self.assertEqual(refused.requests, [])
+
+    def test_json_escaping_and_types_keep_the_existing_wire_representation(self):
+        payloads = [
+            {"unicode": "\u00e9\U0001f600", "escape": '\\"\n\r\t\b\f\x00'},
+            {"array": [None, True, False, -100, 1.25, {}, (), []]},
+            {3: "integer key", 4.5: "float key", None: "null key", False: "bool key"},
+            {"chunk boundary": "x" * 1023 + '\\"\n\u00e9' * 1000},
+        ]
+        for payload in payloads:
+            expected = json.dumps(
+                payload, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+            ).encode("utf-8")
+            self.assertEqual(_bounded_json_bytes(payload, len(expected)), expected)
+            with self.assertRaises(LLMRequestTooLargeError):
+                _bounded_json_bytes(payload, len(expected) - 1)
+
+    def test_unrepresentable_and_circular_values_fail_closed(self):
+        cycle = []
+        cycle.append(cycle)
+        for value in (cycle, {"x": float("nan")}, {"x": object()}, {object(): 1}):
+            with self.assertRaises(LLMConfigurationError):
+                _bounded_json_bytes(value, 1024)
+
+    def test_worker_input_is_bounded_before_prompt_materialization(self):
+        huge = "x" * (8 * 1024 * 1024)
+        transport = QueueTransport()
+        client = _live("openai", transport, max_request_bytes=1024)
+        worker = make_worker(client, "inspect", OUTPUT_SCHEMA)
+        runner = Runner("bounded-worker")
+        task = runner.task("inspect", run=lambda ctx: {}, assumes="ground")
+        context = RunContext(
+            task=task, attempt=1, graph=runner.graph,
+            assumption=runner.graph.assumptions[task.assumption_id],
+            inputs={"upstream": {"data": huge}},
+        )
+        self.assert_bounded_refusal(lambda: worker(context))
+        self.assertEqual(transport.requests, [])
+        self.assertEqual(task.attempt, 0)
+
+    def test_audit_evidence_is_streamed_and_bounded_before_prompt_materialization(self):
+        runner = Runner("bounded-audit")
+        task = runner.task("inspect", run=lambda ctx: {}, assumes="ground")
+        huge = "x" * (8 * 1024 * 1024)
+        node = runner.graph.add_node(
+            NodeType.EVIDENCE, "observation", attrs={"kind": "test", "data": huge}
+        )
+
+        class EvidenceStream(dict):
+            def values(self):
+                yield node
+                raise AssertionError("audit enumerated evidence past an oversized record")
+
+        runner.graph.nodes = EvidenceStream(runner.graph.nodes)
+        context = AuditContext(
+            task=task, output={}, graph=runner.graph,
+            assumption=runner.graph.assumptions[task.assumption_id],
+        )
+        transport = QueueTransport()
+        client = _live("openai", transport, max_request_bytes=1024)
+        self.assert_bounded_refusal(
+            lambda: propose_audit(client, context, instruction="inspect")
+        )
+        self.assertEqual(transport.requests, [])
+        self.assertFalse(node.invalidated)
+
+
+    def test_many_small_evidence_records_stop_at_budget_without_enumerating_all(self):
+        runner = Runner("many-evidence")
+        task = runner.task("inspect", run=lambda ctx: {}, assumes="ground")
+        node = runner.graph.add_node(
+            NodeType.EVIDENCE, "observation", attrs={"kind": "test"}
+        )
+
+        class EvidenceStream(dict):
+            def values(self):
+                for _ in range(100):
+                    yield node
+                raise AssertionError("audit enumerated every record despite exhausting budget")
+
+        runner.graph.nodes = EvidenceStream(runner.graph.nodes)
+        context = AuditContext(
+            task=task, output={}, graph=runner.graph,
+            assumption=runner.graph.assumptions[task.assumption_id],
+        )
+        transport = QueueTransport()
+        client = _live("openai", transport, max_request_bytes=1024)
+        self.assert_bounded_refusal(
+            lambda: propose_audit(client, context, instruction="inspect")
+        )
+        self.assertEqual(transport.requests, [])
 
 
 class AuditAuthorityTest(unittest.TestCase):
