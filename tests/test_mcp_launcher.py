@@ -12,9 +12,9 @@ from contextmesh_mcp.session import (
     DEFAULT_CHECKPOINT,
     Session,
     SessionError,
-    main as session_main,
     open_session,
 )
+from contextmesh_mcp.session import main as session_main
 
 
 def deployment():
