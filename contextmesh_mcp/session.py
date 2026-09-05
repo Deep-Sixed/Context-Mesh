@@ -1203,14 +1203,16 @@ def add_source_arguments(parser: Any) -> Any:
     return parser
 
 
-def open_session(args: Any) -> Session:
+def open_session(
+    args: Any, *, registry: Optional[TaskRegistry] = None
+) -> Session:
     if args.session is not None:
         if args.rounds is not None:
             raise SessionError(
                 "--rounds builds a demo graph and has no meaning for --session; "
                 "a restored session carries the rounds it was built with"
             )
-        return Session.load(args.session)
+        return Session.load(args.session, registry=registry)
     if getattr(args, "checkpoint", DEFAULT_CHECKPOINT) != DEFAULT_CHECKPOINT:
         raise SessionError(
             "--checkpoint decides when a served session is written back and has "
@@ -1219,7 +1221,11 @@ def open_session(args: Any) -> Session:
     return Session.build(rounds=DEFAULT_ROUNDS if args.rounds is None else args.rounds)
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(
+    argv: Optional[Sequence[str]] = None,
+    *,
+    registry: Optional[TaskRegistry] = None,
+) -> int:
     import argparse
 
     parser = add_source_arguments(
@@ -1230,7 +1236,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
     try:
-        opened = open_session(args)
+        opened = open_session(args, registry=registry)
         if args.save is not None:
             target = opened.save(args.save)
             print(
