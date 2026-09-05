@@ -7,6 +7,7 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List
+from unittest.mock import patch
 
 from contextmesh.evidence import submit_evidence
 from contextmesh.execute import AuditContext, RunContext, Runner, Verdict
@@ -29,6 +30,7 @@ from contextmesh.llm import (
     validate_instance,
     validate_schema_definition,
 )
+from contextmesh.llm import _bounded_json_dumps, _check_json_value_bounds
 from contextmesh.model import AssumptionStatus, NodeType
 
 
@@ -414,14 +416,7 @@ class RequestSizeTest(unittest.TestCase):
         result = client.complete("work", OUTPUT_SCHEMA)
         self.assertEqual(result.data["value"], "ok")
 
-    def test_an_audit_with_too_much_evidence_is_refused_not_truncated(self) -> None:
-        """The exact scenario the missed bound left open: available_evidence
-        grows with everything ever submitted to the graph, so an audit built
-        from a graph with enough evidence in it could keep growing past any
-        provider's own request-size tolerance. Refusing it here, before a
-        request is sent, is the fail-closed answer -- silently dropping some
-        evidence so the request fits would change what the model is asked
-        to judge without telling anyone."""
+    def _audit_context(self, output: Dict[str, Any]) -> tuple:
         runner = Runner("llm-audit-request-size")
         task = runner.task(
             "inspect",
@@ -435,6 +430,21 @@ class RequestSizeTest(unittest.TestCase):
             "External observation source",
             attrs={"origin": "fixture", "retrieved_at": "fixture"},
         )
+        context = AuditContext(
+            task=task, output=output, assumption=assumption, graph=runner.graph
+        )
+        return runner, source, assumption, context
+
+    def test_many_small_items_summing_over_budget_are_refused_not_truncated(self) -> None:
+        """One side of the gap a naive post-hoc body-size check leaves open:
+        available_evidence grows with everything ever submitted to the
+        graph, so an audit built from a graph with enough evidence in it
+        could keep growing past any provider's own request-size tolerance
+        even though no single piece of it is large. Refusing it here,
+        before a request is sent, is the fail-closed answer -- silently
+        dropping some evidence so the request fits would change what the
+        model is asked to judge without telling anyone."""
+        runner, source, assumption, context = self._audit_context({"checked": True})
         for i in range(50):
             submit_evidence(
                 runner.graph,
@@ -442,9 +452,6 @@ class RequestSizeTest(unittest.TestCase):
                 source_id=source.id,
                 external_id=f"llm-test-evidence-{i}",
             )
-        context = AuditContext(
-            task=task, output={"checked": True}, assumption=assumption, graph=runner.graph
-        )
         transport = QueueTransport()
         client = _live("openai", transport, max_request_bytes=2048)
         before = (len(runner.graph.nodes), len(runner.graph.edges), assumption.status)
@@ -455,6 +462,76 @@ class RequestSizeTest(unittest.TestCase):
         self.assertEqual(transport.requests, [])
         after = (len(runner.graph.nodes), len(runner.graph.edges), assumption.status)
         self.assertEqual(before, after)
+
+    def test_a_single_oversized_value_is_refused_without_materializing_it_first(self) -> None:
+        """The other side of the gap: a worker's output is not subject to
+        evidence intake's own per-string size limit, so one huge value can
+        reach an audit's payload directly. A JSON encoder does not chunk a
+        single large scalar -- encoding one enormous string yields it back
+        as one contiguous piece -- so a check that only inspects the
+        *finished* body would have to hold that whole piece in memory
+        first. The bound has to reject a value this size before an encoder
+        ever runs on it, not just refuse to transmit the result afterward.
+        """
+        _runner, _source, _assumption, context = self._audit_context({"detail": "x" * 20_000_000})
+        transport = QueueTransport()
+        client = _live("openai", transport, max_request_bytes=4096)
+
+        with self.assertRaisesRegex(LLMRequestTooLargeError, "4096-byte limit"):
+            propose_audit(client, context, instruction="Check the assumption.")
+
+        self.assertEqual(transport.requests, [])
+
+    def test_a_single_oversized_worker_input_is_refused_without_materializing_it_first(
+        self,
+    ) -> None:
+        runner = Runner("llm-worker-request-size")
+        task = runner.task("draft", run=lambda _ctx: {}, assumes="Inputs are valid")
+        assert task.assumption_id is not None
+        assumption = runner.graph.assumptions[task.assumption_id]
+        run_context = RunContext(
+            task=task,
+            attempt=1,
+            graph=runner.graph,
+            assumption=assumption,
+            inputs={"upstream": {"blob": "x" * 20_000_000}},
+        )
+        transport = QueueTransport()
+        client = _live("openai", transport, max_request_bytes=4096)
+        worker = make_worker(client, "Produce the requested object.", OUTPUT_SCHEMA)
+
+        with self.assertRaisesRegex(LLMRequestTooLargeError, "4096-byte limit"):
+            worker(run_context)
+
+    def test_the_per_value_check_rejects_a_single_oversized_string_directly(self) -> None:
+        with self.assertRaises(LLMRequestTooLargeError):
+            _check_json_value_bounds({"detail": "x" * 20_000_000}, 4096, "test payload")
+
+    def test_bounded_dumps_never_hands_an_oversized_value_to_the_encoder(self) -> None:
+        """The property the end-to-end tests above cannot observe directly:
+        both the per-value check and the running-total check make
+        `propose_audit`/`worker()` raise correctly, so passing tests alone
+        do not prove the per-value check is what actually stopped the
+        encoder from ever touching the oversized string. Patching
+        `iterencode` makes that observable: if the per-value check runs
+        first, as it must, the encoder is never invoked at all."""
+        with patch.object(json.JSONEncoder, "iterencode") as mock_iterencode:
+            with self.assertRaises(LLMRequestTooLargeError):
+                _bounded_json_dumps({"detail": "x" * 20_000_000}, 4096, "test payload")
+            mock_iterencode.assert_not_called()
+
+    def test_bounded_dumps_itself_refuses_many_small_values_summing_over_budget(self) -> None:
+        """Isolates the running-total check from the per-value check: no
+        single string here is anywhere near the limit, so only summing the
+        real encoder chunks as they arrive can catch this -- and it has to
+        be `_bounded_json_dumps` doing the catching, not some caller one
+        layer up whose own embedding of the result happens to be one big
+        string by the time anyone looks at it."""
+        value = {"items": [f"item-{i}" for i in range(500)]}
+        with self.assertRaises(LLMRequestTooLargeError):
+            _bounded_json_dumps(value, 2048, "test payload")
+        # Sanity: no single item is anywhere close to the limit on its own.
+        _check_json_value_bounds(value, 2048, "test payload")
 
 
 class AuditAuthorityTest(unittest.TestCase):

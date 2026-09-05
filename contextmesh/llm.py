@@ -368,6 +368,91 @@ def _json_bytes(value: Any) -> bytes:
         raise LLMConfigurationError("request contains a value JSON cannot represent") from exc
 
 
+_MAX_JSON_DEPTH = 32
+
+
+def _check_json_value_bounds(
+    value: Any, max_bytes: int, label: str, *, path: str = "$", depth: int = 0
+) -> None:
+    """Refuse a value whose JSON encoding could exceed ``max_bytes`` before
+    any encoder ever runs on it.
+
+    ``json.JSONEncoder.iterencode`` does not chunk a single large scalar:
+    encoding one enormous string yields it back as one contiguous chunk (a
+    50 MB string is one 50 MB chunk), so checking a *running total* after
+    the fact -- as :func:`_bounded_json_dumps` does below for many small
+    values -- still means holding that whole chunk in memory first. This
+    walk closes that gap by bounding every individual string before
+    serialization ever starts, the same way
+    ``contextmesh.evidence._json_value`` bounds every metadata string during
+    intake. A worker's ``RunContext.inputs``/output or an audit's graph-
+    derived evidence is exactly this kind of caller-shaped structure: not
+    pre-bounded the way evidence intake's own text and metadata are.
+    """
+    if depth > _MAX_JSON_DEPTH:
+        raise LLMRequestTooLargeError(
+            f"{label}{path}: nests deeper than {_MAX_JSON_DEPTH} levels"
+        )
+    if value is None or isinstance(value, bool) or isinstance(value, (int, float)):
+        return
+    if isinstance(value, str):
+        # Character count first: never encode a string whose length alone
+        # already proves it is over budget.
+        if len(value) > max_bytes:
+            raise LLMRequestTooLargeError(
+                f"{label}{path}: string is over the {max_bytes}-byte limit"
+            )
+        size = len(value.encode("utf-8"))
+        if size > max_bytes:
+            raise LLMRequestTooLargeError(
+                f"{label}{path}: string is {size} bytes, over the "
+                f"{max_bytes}-byte limit"
+            )
+        return
+    if isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _check_json_value_bounds(
+                item, max_bytes, label, path=f"{path}[{index}]", depth=depth + 1
+            )
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _check_json_value_bounds(
+                item, max_bytes, label, path=f"{path}.{key}", depth=depth + 1
+            )
+        return
+    raise LLMConfigurationError(
+        f"{label}{path}: {type(value).__name__} is not JSON-serializable"
+    )
+
+
+def _bounded_json_dumps(value: Any, max_bytes: int, label: str) -> str:
+    """Serialize ``value`` to compact JSON, refusing before this call (or a
+    later encoding step downstream) ever holds more than ~``max_bytes`` of
+    it -- never silently truncating what gets built, only refusing to build
+    an oversized payload at all. Combines two checks because each closes a
+    gap the other leaves open: :func:`_check_json_value_bounds` bounds any
+    single oversized value, and the running total below bounds many
+    individually-small values that add up past the limit, which the
+    per-value walk alone would let through (each item passes on its own).
+    """
+    _check_json_value_bounds(value, max_bytes, label)
+    encoder = json.JSONEncoder(
+        sort_keys=True, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+    )
+    chunks: List[str] = []
+    size = 0
+    for chunk in encoder.iterencode(value):
+        size += len(chunk.encode("utf-8"))
+        if size > max_bytes:
+            raise LLMRequestTooLargeError(
+                f"{label} exceeds the {max_bytes}-byte limit; refusing to "
+                "build it in full"
+            )
+        chunks.append(chunk)
+    return "".join(chunks)
+
+
 def _type_list(schema: Mapping[str, Any], path: str) -> List[str]:
     declared = schema.get("type")
     if isinstance(declared, str):
@@ -774,11 +859,12 @@ def _request_for(
         }
         headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
 
+    body_text = _bounded_json_dumps(body, config.max_request_bytes, "request body")
     return HTTPRequest(
         method="POST",
         url=_ENDPOINTS[provider],
         headers=headers,
-        body=_json_bytes(body),
+        body=body_text.encode("utf-8"),
         timeout=float(config.timeout),
         max_response_bytes=config.max_response_bytes,
     )
@@ -870,14 +956,10 @@ class LLMClient:
                 ),
             )
 
+        # _request_for's own bounded encoding (see _bounded_json_dumps)
+        # already refuses to build an oversized body in the first place, so
+        # nothing further to check here -- and nothing further to send.
         request = _request_for(self.config, prompt, schema, schema_name, system)
-        if len(request.body) > self.config.max_request_bytes:
-            raise LLMRequestTooLargeError(
-                f"request body is {len(request.body)} bytes, over the "
-                f"{self.config.max_request_bytes}-byte limit; refusing to "
-                "send it -- a worker's inputs or an audit's available "
-                "evidence has grown too large for this client's own bound"
-            )
         response, attempts = self._send(request)
         envelope = _decode_body(response)
         text, usage, response_id = _EXTRACTORS[self.config.provider](envelope)
@@ -954,7 +1036,12 @@ def validate_audit_proposal(context: AuditContext, proposal: AuditProposal) -> A
     return proposal
 
 
-def _audit_prompt(context: AuditContext, instruction: str) -> str:
+def _audit_prompt(context: AuditContext, instruction: str, *, max_bytes: int) -> str:
+    """Build the audit prompt, refusing before the graph-derived input JSON
+    is ever fully materialized if it would exceed ``max_bytes`` -- available
+    evidence is every live evidence node in the graph, not something this
+    call bounds the count or size of itself.
+    """
     evidence = []
     for node in context.graph.nodes.values():
         if node.type is not NodeType.EVIDENCE or node.invalidated:
@@ -973,12 +1060,10 @@ def _audit_prompt(context: AuditContext, instruction: str) -> str:
         "output": context.output,
         "available_evidence": evidence,
     }
-    return instruction + "\n\nAudit input:\n" + json.dumps(
-        payload,
-        sort_keys=True,
-        ensure_ascii=False,
-        allow_nan=False,
-        separators=(",", ":"),
+    return (
+        instruction
+        + "\n\nAudit input:\n"
+        + _bounded_json_dumps(payload, max_bytes, "audit input")
     )
 
 
@@ -987,7 +1072,7 @@ def propose_audit(client: LLMClient, context: AuditContext, *, instruction: str)
     if not isinstance(instruction, str) or not instruction.strip():
         raise LLMConfigurationError("audit instruction must be a non-empty string")
     result = client.complete(
-        _audit_prompt(context, instruction),
+        _audit_prompt(context, instruction, max_bytes=client.config.max_request_bytes),
         AUDIT_PROPOSAL_SCHEMA,
         schema_name="contextmesh_audit_proposal",
         system=(
@@ -1046,12 +1131,8 @@ def make_worker(
             },
             "inputs": context.inputs,
         }
-        prompt = "Task input:\n" + json.dumps(
-            payload,
-            sort_keys=True,
-            ensure_ascii=False,
-            allow_nan=False,
-            separators=(",", ":"),
+        prompt = "Task input:\n" + _bounded_json_dumps(
+            payload, client.config.max_request_bytes, "worker input"
         )
         result = client.complete(
             prompt,
