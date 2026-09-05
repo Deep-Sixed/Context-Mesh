@@ -13,7 +13,13 @@ import unittest
 from contextmesh.assumptions import AssumptionLedger
 from contextmesh.decisions import DecisionLog
 from contextmesh.graph import ContextGraph, SnapshotError
-from contextmesh.model import EdgeType, NodeType, Provenance
+from contextmesh.model import (
+    EdgeType,
+    NodeType,
+    Provenance,
+    is_auto_minted_decision_id,
+    slug,
+)
 from contextmesh.ontology import OntologyError
 
 
@@ -523,7 +529,7 @@ class TamperedSnapshotIdentityMetadataFailsClosedTest(unittest.TestCase):
                 row["attrs"]["decision_identity"] = "explicit"
                 row["attrs"]["decision_payload_digest"] = "forged-to-claim-something-else"
 
-        with self.assertRaisesRegex(SnapshotError, "auto-minting could have produced"):
+        with self.assertRaisesRegex(SnapshotError, "auto-minted namespace"):
             ContextGraph.from_dict(payload)
 
     def test_flipping_an_auto_decision_to_explicit_with_the_correct_digest_is_still_refused(self):
@@ -546,7 +552,7 @@ class TamperedSnapshotIdentityMetadataFailsClosedTest(unittest.TestCase):
                 row["attrs"]["decision_identity"] = "explicit"
                 # decision_payload_digest is left exactly as decide() wrote it.
 
-        with self.assertRaisesRegex(SnapshotError, "auto-minting could have produced"):
+        with self.assertRaisesRegex(SnapshotError, "auto-minted namespace"):
             ContextGraph.from_dict(payload)
 
     def test_a_source_and_cite_swap_produces_a_different_fingerprint(self):
@@ -609,6 +615,38 @@ class ExplicitIdCannotClaimTheAutoMintedNamespaceTest(unittest.TestCase):
                 id=auto_id,
             )
         self.assertNotIn(auto_id, other_graph.nodes)
+
+    def test_the_reservation_is_a_stable_prefix_not_a_bound_tied_to_graph_size(self):
+        """Regression for the exact defect a bounded search had: an id that
+        merely *resembles* what the old auto-mint scheme produced, but does
+        not lie in the reserved `decision:auto:` namespace, is an ordinary
+        explicit id -- accepting it must not depend on how large the graph
+        happens to be, so it cannot later be rejected purely because the
+        graph grew (by this very write, or a snapshot round-trip of it)."""
+        graph, source = _graph_with_source()
+        candidate = slug("Use PostgreSQL|3", "decision")
+        self.assertFalse(is_auto_minted_decision_id(candidate))
+
+        first = DecisionLog(graph).decide(
+            "Use PostgreSQL",
+            "It fits our access patterns.",
+            source_id=source.id,
+            id=candidate,
+        )
+        self.assertEqual(first.id, candidate)
+
+        # The write itself grew the graph; an unstable, size-bound check
+        # would now see a different bound than it did a moment ago.
+        restored = ContextGraph.from_dict(graph.to_dict())
+        self.assertIn(candidate, restored.nodes)
+
+        again = DecisionLog(restored).decide(
+            "Use PostgreSQL",
+            "It fits our access patterns.",
+            source_id=source.id,
+            id=candidate,
+        )
+        self.assertEqual(again.id, candidate)
 
 
 class DecisionToDecisionDependsOnDoesNotPolluteIdentityTest(unittest.TestCase):

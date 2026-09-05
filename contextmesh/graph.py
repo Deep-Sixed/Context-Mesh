@@ -16,7 +16,7 @@ from .model import (
     NodeType,
     Provenance,
     decision_fingerprint,
-    decision_id_looks_auto_minted,
+    is_auto_minted_decision_id,
     slug,
 )
 from .ontology import ONTOLOGY, Ontology, OntologyError
@@ -233,40 +233,6 @@ class ContextGraph:
             },
             "supersedes": supersedes_edges[0].dst if supersedes_edges else None,
         }
-
-    def _decision_id_looks_auto_minted(self, node_id: str) -> bool:
-        """Whether ``node_id`` is a value ``DecisionLog._mint_fresh_id``
-        could have produced for this node's own title.
-
-        This is what makes a decision's auto/explicit mode structurally
-        checkable instead of merely trusted from its (editable)
-        ``decision_identity`` attr: a genuinely auto-minted id is, by
-        construction, `slug(f"{title}|{n}", "decision")` for some `n`.
-        Flipping a real auto-minted decision's `decision_identity` to
-        `"explicit"` in a tampered snapshot does not change its id, so this
-        still reports ``True`` for it regardless of what the attr claims --
-        which is exactly what lets that tamper be caught. The search is
-        bounded by this graph's own node count: the real minting loop can
-        never need more tries than there are existing ids to collide with.
-        """
-        node = self.nodes[node_id]
-        return decision_id_looks_auto_minted(
-            node.label, node_id, upper_bound=len(self.nodes) + 1
-        )
-
-    def _candidate_id_looks_auto_minted(self, title: str, candidate_id: str) -> bool:
-        """Whether `candidate_id` collides with the auto-minted namespace
-        for `title`, for a decision that does not exist in this graph yet.
-
-        Used to keep that namespace reserved going forward: `decide()`
-        refuses to mint a brand-new *explicit* decision under an id that
-        auto-minting could have produced for the same title, so the
-        structural check `_decision_id_looks_auto_minted` performs on
-        existing decisions never has to face a legitimate false positive.
-        """
-        return decision_id_looks_auto_minted(
-            title, candidate_id, upper_bound=len(self.nodes) + 1
-        )
 
     def node(self, node_id: str) -> Node:
         return self.nodes[node_id]
@@ -740,21 +706,21 @@ class ContextGraph:
         # auto-minted decision already carries a *correct* digest for its
         # real content, so flipping only ``decision_identity`` from
         # ``"auto"`` to ``"explicit"`` passes a digest check with nothing
-        # left to disagree with. What still gives it away is the id itself
-        # -- an auto-minted id is, by construction, one
-        # ``DecisionLog._mint_fresh_id`` could produce for this title, and
-        # that fact does not change no matter what the attrs claim.
+        # left to disagree with. What still gives it away is the id itself:
+        # every auto-minted id lies in the reserved ``decision:auto:``
+        # namespace, which no explicit id may ever use, so that fact does
+        # not change no matter what the attrs claim.
         for node in graph.nodes.values():
             if node.type is not NodeType.DECISION:
                 continue
             if node.attrs.get("decision_identity") != "explicit":
                 continue
-            if graph._decision_id_looks_auto_minted(node.id):
+            if is_auto_minted_decision_id(node.id):
                 raise SnapshotError(
                     f"decision {node.id!r} is marked decision_identity="
-                    "'explicit', but its id is one auto-minting could have "
-                    "produced for this title; this snapshot's decision-"
-                    "identity metadata has been tampered with or corrupted"
+                    "'explicit', but its id lies in the auto-minted "
+                    "namespace; this snapshot's decision-identity metadata "
+                    "has been tampered with or corrupted"
                 )
             stored = node.attrs.get("decision_payload_digest")
             actual = decision_fingerprint(**graph._decision_structure(node.id))

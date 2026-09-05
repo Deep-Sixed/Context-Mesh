@@ -11,7 +11,16 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional
 
 from .graph import ContextGraph
-from .model import EdgeType, Node, NodeType, Provenance, decision_fingerprint, slug
+from .model import (
+    DECISION_AUTO_MINT_PREFIX,
+    EdgeType,
+    Node,
+    NodeType,
+    Provenance,
+    decision_fingerprint,
+    is_auto_minted_decision_id,
+    slug,
+)
 from .ontology import OntologyError
 
 
@@ -57,10 +66,13 @@ class DecisionLog:
         a *previous* `DecisionLog` over this graph left off, so "always a
         fresh id" holds across that reconstruction too, not just within one
         object's lifetime.
+
+        Minted under `DECISION_AUTO_MINT_PREFIX`, a namespace `decide()`
+        never lets an explicit id claim -- see `is_auto_minted_decision_id`.
         """
         n = 1
         while True:
-            candidate = slug(f"{title}|{n}", "decision")
+            candidate = slug(f"{title}|{n}", DECISION_AUTO_MINT_PREFIX)
             if candidate not in self.graph.nodes:
                 return candidate
             n += 1
@@ -134,7 +146,7 @@ class DecisionLog:
                 if (
                     existing.type is not NodeType.DECISION
                     or existing.attrs.get("decision_identity") != "explicit"
-                    or self.graph._decision_id_looks_auto_minted(existing.id)
+                    or is_auto_minted_decision_id(existing.id)
                 ):
                     raise OntologyError(
                         f"decision id {id!r} already names a decision this "
@@ -151,10 +163,10 @@ class DecisionLog:
                         "the same decision"
                     )
                 return existing
-            if self.graph._candidate_id_looks_auto_minted(title, id):
+            if is_auto_minted_decision_id(id):
                 raise OntologyError(
-                    f"explicit decision id {id!r} collides with the "
-                    f"auto-minted namespace for title {title!r}; choose a "
+                    f"explicit decision id {id!r} lies in the auto-minted "
+                    f"namespace ({DECISION_AUTO_MINT_PREFIX!r}); choose a "
                     "different id -- this namespace is reserved so an "
                     "auto-minted decision's id always structurally proves "
                     "it, regardless of what its attrs claim"

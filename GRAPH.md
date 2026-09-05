@@ -133,19 +133,25 @@ An explicit `id` naming an existing node is an idempotent retry only when
 that node is a decision minted with an explicit id of its own — naming an
 auto-minted decision, or any non-decision node, is refused, because it is
 not this call's event to retry. That check does not stop at reading the
-`decision_identity` attr, either: an auto-minted decision's id is, by
-construction, one `DecisionLog._mint_fresh_id` could produce for its title,
-and that stays true no matter what a tampered `decision_identity` claims —
-so a decision whose id could have been auto-minted for its own title is
-never accepted as an explicit retry target, even when it is labeled
-`"explicit"`. This is what closes the gap a digest check alone cannot: an
-auto-minted decision's stored digest is already correct for its real
-content, so flipping only its mode label leaves nothing for a digest
-comparison to disagree with. The same structural check runs in the other
-direction when minting: `decide` refuses to hand out a brand-new explicit
-id that collides with the auto-minted namespace for that title, so the
-namespace stays reserved and a legitimate explicit id never trips the
-check above by coincidence. Once identity agrees, the retry check compares
+`decision_identity` attr, either: every auto-minted id lands in a reserved
+namespace (the `decision:auto:` slug prefix) that no explicit id may ever
+use, and `decide` refuses up front to hand out a brand-new explicit id that
+collides with it — so membership in that namespace is a permanent fact
+about an id string, settled the moment it is minted, never re-derived and
+never dependent on anything else in the graph. A decision whose id lands in
+that namespace is never accepted as an explicit retry target, even when its
+`decision_identity` attr is tampered to say `"explicit"`. This is what
+closes the gap a digest check alone cannot: an auto-minted decision's
+stored digest is already correct for its real content, so flipping only its
+mode label leaves nothing for a digest comparison to disagree with. It is
+also why the namespace test cannot be a search bounded by the graph's
+current size — an early version of this tried exactly that (recomputing
+`slug(f"{title}|{n}", "decision")` for `n` up to the node count), and a
+bound that changes as the graph grows is not stable: an explicit id one
+write legitimately accepted could fail the identical check moments later,
+once that very write (or a snapshot round-trip of it) changed the bound,
+with no tampering involved. A plain prefix has no such bound to drift.
+Once identity agrees, the retry check compares
 the incoming call against the fingerprint of the *existing node's actual
 provenance and edges*, not against whatever its attrs claim. The same `id`
 with content that produces the same fingerprint is a true no-op that

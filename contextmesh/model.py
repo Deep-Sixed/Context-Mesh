@@ -158,27 +158,31 @@ def slug(text: str, prefix: str = "") -> str:
     return f"{prefix}:{stem}" if prefix else stem
 
 
-def decision_id_looks_auto_minted(title: str, candidate_id: str, *, upper_bound: int) -> bool:
-    """Whether `candidate_id` is a value `DecisionLog._mint_fresh_id(title)`
-    could have produced -- i.e. `slug(f"{title}|{n}", "decision")` for some
-    `n` in `[1, upper_bound]`.
+#: The slug prefix `DecisionLog._mint_fresh_id` mints every auto id under.
+#: Reserved: no explicit `decide(id=...)` call may name an id in this
+#: namespace (`decide` refuses it before writing anything), which is what
+#: makes membership in it a permanent, structural fact about an id rather
+#: than something that has to be re-derived and can drift.
+DECISION_AUTO_MINT_PREFIX = "decision:auto"
 
-    A pure function of `title` and `candidate_id` alone, so it answers two
-    different questions the same way: whether an *existing* decision's id
-    was genuinely auto-minted for its own title (making its
-    `decision_identity` attr checkable against reality instead of merely
-    trusted), and whether a *new* explicit id a caller is about to choose
-    would collide with the auto-minted namespace for that title (so
-    `decide()` can refuse it up front and keep that namespace reserved).
-    `upper_bound` should be at least the number of ids this title could ever
-    have collided with while auto-minting -- the caller's node count is
-    always enough, since the real minting loop can never need more tries
-    than there are existing ids to collide with.
+
+def is_auto_minted_decision_id(candidate_id: str) -> bool:
+    """Whether `candidate_id` lies in the auto-minted decision namespace.
+
+    A plain prefix check, not a search: an earlier version of this
+    recognized an auto-minted id by re-deriving `slug(f"{title}|{n}",
+    "decision")` for `n` up to some bound, but any finite bound has to be
+    tied to something that changes as the graph grows (its node count) to
+    stay sound against arbitrarily large `n` -- and a bound that changes
+    with the graph is not stable: an explicit id one write legitimately
+    accepted (checked against a smaller graph) could fail this same check
+    later (checked against a larger one, e.g. after that very write, or
+    after a snapshot round-trip), with no tampering involved. Minting every
+    auto id into a namespace no explicit id may ever use makes membership a
+    fact about the id string alone, true forever once decided, with no
+    graph state involved in checking it.
     """
-    for n in range(1, upper_bound + 1):
-        if slug(f"{title}|{n}", "decision") == candidate_id:
-            return True
-    return False
+    return candidate_id.startswith(DECISION_AUTO_MINT_PREFIX + ":")
 
 
 def decision_fingerprint(
