@@ -173,6 +173,23 @@ class SessionError(ValueError):
     """
 
 
+def _same_session_directory(left: Path, right: Path) -> bool:
+    """Return whether two spellings name the same existing session directory.
+
+    ``Path.__eq__`` is lexical, so ``session`` and ``session/../session`` are
+    different values even though the filesystem sends both to the same place.
+    The stale-writer CAS is a statement about that place, not its spelling.
+    Prefer the filesystem's own identity comparison and keep a realpath/normcase
+    fallback for races where one spelling disappears between checks.
+    """
+    try:
+        return os.path.samefile(left, right)
+    except OSError:
+        left_real = os.path.normcase(os.path.realpath(os.fspath(left)))
+        right_real = os.path.normcase(os.path.realpath(os.fspath(right)))
+        return left_real == right_real
+
+
 def _no_session_constants(value: str) -> float:
     raise SessionError(f"session.json contains the non-JSON constant {value!r}")
 
@@ -810,7 +827,11 @@ class Session:
 
     def _commit(self, target: Path) -> Path:
         live = self._live_generation(target)
-        if self.path is not None and target == self.path and live != self.generation:
+        if (
+            self.path is not None
+            and _same_session_directory(target, self.path)
+            and live != self.generation
+        ):
             raise SessionError(
                 f"{target} is at generation {live} but this session last "
                 f"committed generation {self.generation}; another writer has "
