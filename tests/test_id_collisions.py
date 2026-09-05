@@ -10,12 +10,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from contextmesh.assumptions import AssumptionLedger
 from contextmesh.demo import run as demo_run
+from contextmesh.execute import Runner, TaskRegistry, TaskState
 from contextmesh.graph import ContextGraph, SnapshotError
 from contextmesh.model import EdgeType, NodeType, Provenance
 from contextmesh.ontology import OntologyError
 from contextmesh_mcp.session import Checkpointer, Session
-from contextmesh_mcp.writes import commit_mutation
+from contextmesh_mcp.writes import commit_mutation, mesh_repair
 
 # Two distinct texts that happen to share both the 40-char slug() prefix and
 # the truncated SHA1 digest -- a real collision under contextmesh.model.slug,
@@ -135,6 +137,85 @@ class EdgeCollisionTest(unittest.TestCase):
         self.assertIs(again, self.first)
         self.assertEqual(len(self.graph.edges), 1)
         self.assertEqual(again.weight, 2.0)
+
+
+class AssumptionRecordCollisionTest(unittest.TestCase):
+    """ContextGraph.add_assumption must not record the new Assumption before
+    add_node's collision check has had a chance to refuse it -- otherwise a
+    rejected collision still leaves graph.assumptions and graph.nodes
+    disagreeing about which statement this id names.
+    """
+
+    def setUp(self):
+        self.graph = _graph_with_source()
+        self.ledger = AssumptionLedger(self.graph)
+        self.first = self.ledger.assume(COLLIDING_TEXT_A)
+
+    def test_a_colliding_assumption_is_refused(self):
+        with self.assertRaises(OntologyError):
+            self.ledger.assume(COLLIDING_TEXT_B)
+
+    def test_both_the_record_and_the_node_are_unchanged_after_refusal(self):
+        with self.assertRaises(OntologyError):
+            self.ledger.assume(COLLIDING_TEXT_B)
+        self.assertIs(self.graph.assumptions[self.first.id], self.first)
+        self.assertEqual(self.graph.assumptions[self.first.id].statement, COLLIDING_TEXT_A)
+        self.assertEqual(self.graph.node(self.first.id).label, COLLIDING_TEXT_A)
+
+
+class RunnerAssumeCollisionTest(unittest.TestCase):
+    """Runner._assume has its own id-based lookup ahead of add_assumption,
+    used by task()/repair(); it must not reuse an existing assumption whose
+    statement disagrees with the one just asked for, and mesh_repair -- the
+    real controlled-write path that reaches it -- must refuse the same way
+    without ever reaching the checkpoint.
+    """
+
+    def _repairable_session(self, tmp_path):
+        registry = TaskRegistry()
+        registry.register_worker("w1", lambda ctx: {"ok": True})
+        base = Session.build(rounds=2)
+        runner = Runner("demo", graph=base.graph, registry=registry)
+        runner.task("t1", worker_key="w1", assumes=COLLIDING_TEXT_A)
+        runner.run()
+        base.runner = runner
+        base.save(tmp_path)
+        return Session.load(tmp_path, registry=registry)
+
+    def test_runner_assume_refuses_a_colliding_statement(self):
+        registry = TaskRegistry()
+        registry.register_worker("w1", lambda ctx: {"ok": True})
+        graph = _graph_with_source()
+        runner = Runner("demo", graph=graph, registry=registry)
+        runner.task("t1", worker_key="w1", assumes=COLLIDING_TEXT_A)
+        runner.run()
+
+        with self.assertRaises(OntologyError):
+            runner._assume(COLLIDING_TEXT_B)
+        self.assertEqual(
+            graph.assumptions[runner["t1"].assumption_id].statement, COLLIDING_TEXT_A
+        )
+
+    def test_mesh_repair_refuses_a_colliding_assumes_before_the_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "session"
+            session = self._repairable_session(root)
+            checkpointer = Checkpointer(session)
+            session.runner["t1"].state = TaskState.STALE
+            generation = session.generation
+
+            with self.assertRaises(OntologyError):
+                mesh_repair(
+                    session,
+                    checkpointer,
+                    task="t1",
+                    worker_key="w1",
+                    assumes=COLLIDING_TEXT_B,
+                )
+
+            self.assertEqual(session.generation, generation)
+            self.assertEqual(session.runner["t1"].assumes, COLLIDING_TEXT_A)
+            self.assertEqual(session.runner["t1"].state, TaskState.STALE)
 
 
 class ControlledWriteCollisionTest(unittest.TestCase):

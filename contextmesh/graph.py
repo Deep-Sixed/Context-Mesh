@@ -297,13 +297,24 @@ class ContextGraph:
 
     # ── assumptions ──────────────────────────────────────────────────────
     def add_assumption(self, assumption: Assumption) -> Assumption:
-        self.assumptions[assumption.id] = assumption
+        """Add an assumption record and its mirroring node.
+
+        ``add_node`` runs first and does the collision check (rule 8): if
+        ``assumption.id`` already names a node with a different label, it
+        raises before either this method or ``add_node`` writes anything.
+        Recording ``assumption`` into ``self.assumptions`` only after
+        ``add_node`` returns means a refused collision leaves both
+        ``self.assumptions`` and ``self.nodes`` exactly as they were --
+        recording it first would let a rejected write still overwrite the
+        existing record even though the node write it mirrors was refused.
+        """
         self.add_node(
             NodeType.ASSUMPTION,
             assumption.statement,
             id=assumption.id,
             attrs={"status": assumption.status.value, "version": assumption.version},
         )
+        self.assumptions[assumption.id] = assumption
         return assumption
 
     def sync_assumption(self, assumption: Assumption) -> Node:
