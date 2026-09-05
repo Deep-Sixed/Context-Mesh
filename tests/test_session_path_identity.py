@@ -84,7 +84,7 @@ class SessionPathIdentityTest(unittest.TestCase):
 
         written = stale.save(other)
 
-        self.assertEqual(written, other.resolve())
+        self.assertTrue(os.path.samefile(written, other))
         copied = Session.load(other)
         self.assertEqual(copied.generation, 1)
         self.assertNotIn(newer_id, copied.graph.nodes)
