@@ -292,10 +292,29 @@ def cmd_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def _json_for_html(payload: Dict[str, Any]) -> str:
+    """Serialize JSON so HTML parsing cannot terminate its script-data block.
+
+    ``type=application/json`` changes how JavaScript treats the contents, not
+    how the HTML parser finds ``</script>``. Any graph-derived string can
+    therefore close the element if a raw ``<`` is emitted. Escaping the three
+    HTML-significant ASCII characters as JSON unicode escapes preserves the
+    value returned by ``JSON.parse`` while making a tag opener impossible.
+    ``json.dumps`` keeps its default ``ensure_ascii=True``, so U+2028/U+2029
+    and other non-ASCII characters stay escaped exactly as before.
+    """
+    blob = json.dumps(payload, separators=(",", ":"))
+    return (
+        blob.replace("&", "\\u0026")
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+    )
+
+
 def _inline(html_path: Path, payload: Dict[str, Any]) -> None:
     """Replace the dashboard's embedded snapshot so it works from file://."""
     html = html_path.read_text(encoding="utf-8")
-    blob = json.dumps(payload, separators=(",", ":"))
+    blob = _json_for_html(payload)
     pattern = re.compile(
         r'(<script id="mesh-data" type="application/json">)(.*?)(</script>)',
         re.S,
