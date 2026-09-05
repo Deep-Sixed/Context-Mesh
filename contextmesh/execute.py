@@ -55,6 +55,10 @@ class ExecutionError(Exception):
     """Raised when a plan cannot be scheduled, or an auditor misbehaves."""
 
 
+class _AuditorRaised(ExecutionError):
+    """Internal wrapper for an exception raised by an auditor callback."""
+
+
 class LedgerIntegrityError(ExecutionError):
     """Raised when a serialised ledger is not the history it claims to be.
 
@@ -1643,7 +1647,22 @@ class Runner:
             assumption = self.graph.assumptions.get(task.assumption_id or "")
             if assumption is None or assumption.status is not AssumptionStatus.ACTIVE:
                 continue
-            verdict = self._audit(task, task.output, assumption)
+            try:
+                verdict = self._audit(task, task.output, assumption)
+            except _AuditorRaised as exc:
+                # One broken auditor must not abort independent rechecks.
+                # An exception proves no assumption false, so fail only
+                # this task and keep its ground standing.
+                task.state = TaskState.FAILED
+                self.ledger.record(
+                    self.round,
+                    Event.FAILED,
+                    name,
+                    f"auditor error: {exc}",
+                    node_id=task.node_id,
+                    assumption_id=assumption.id,
+                )
+                continue
             self.ledger.record(
                 self.round,
                 Event.AUDITED,
@@ -2101,13 +2120,17 @@ class Runner:
     def _audit(self, task: Task, output: Dict[str, Any], assumption: Assumption) -> Verdict:
         if task.audit is None:
             return Verdict(True, "no auditor declared")
-        return _coerce(
-            task.audit(
-                AuditContext(
-                    task=task, output=output, assumption=assumption, graph=self.graph
-                )
-            )
+        context = AuditContext(
+            task=task, output=output, assumption=assumption, graph=self.graph
         )
+        try:
+            result = task.audit(context)
+        except Exception as exc:
+            # Callback failures are operational task failures. Keep
+            # _coerce outside this boundary so a bad return type is
+            # still an auditor contract error, not a retryable outage.
+            raise _AuditorRaised(f"{type(exc).__name__}: {exc}") from exc
+        return _coerce(result)
 
     def _execute(self, task: Task) -> Optional[InvalidationReport]:
         assumption = self.graph.assumptions[task.assumption_id]
@@ -2135,7 +2158,21 @@ class Runner:
         task.attempt += 1
         task.output = dict(output or {})
 
-        verdict = self._audit(task, task.output, assumption)
+        try:
+            verdict = self._audit(task, task.output, assumption)
+        except _AuditorRaised as exc:
+            # The worker completed, so its attempt/output remain. The
+            # task cannot become DONE without an audit verdict, but the
+            # callback exception must not tear down the scheduler.
+            task.state = TaskState.FAILED
+            self.ledger.record(
+                self.round,
+                Event.FAILED,
+                task.name,
+                f"auditor error: {exc}",
+                assumption_id=assumption.id,
+            )
+            return None
         self.ledger.record(
             self.round,
             Event.AUDITED,
