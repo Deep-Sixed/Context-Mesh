@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from contextmesh.decisions import DecisionLog
 from contextmesh.graph import ContextGraph
 from contextmesh.model import EdgeType, NodeType, Provenance
 from contextmesh.ontology import ONTOLOGY, ONTOLOGY_FILE, OntologyError, load
@@ -107,13 +108,9 @@ class InvalidationDirectionTest(unittest.TestCase):
         source = graph.add_node(
             NodeType.SOURCE, "Doc", attrs={"origin": "x", "retrieved_at": "x"}
         )
-        decision = graph.add_node(
-            NodeType.DECISION,
-            "Rebuild the index",
-            attrs={"rationale": "x"},
-            provenance=Provenance(source_id=source.id),
+        decision = DecisionLog(graph).decide(
+            "Rebuild the index", "x", source_id=source.id, assumptions=[assumption.id]
         )
-        graph.add_edge(decision.id, EdgeType.DEPENDS_ON, assumption.id)
 
         radius = ledger.blast_radius(assumption.id)
         self.assertNotIn(decision.id, radius)

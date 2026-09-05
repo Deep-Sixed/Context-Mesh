@@ -25,6 +25,7 @@ import unittest
 from pathlib import Path
 
 from contextmesh.assumptions import AssumptionLedger
+from contextmesh.decisions import DecisionLog
 from contextmesh.demo import questions, run
 from contextmesh.graph import (
     SNAPSHOT_SCHEMA,
@@ -268,14 +269,13 @@ class IntegrityTest(unittest.TestCase):
         graph.add_edge(claim.id, EdgeType.DERIVED_FROM, source.id)
         ledger = AssumptionLedger(graph)
         assumption = ledger.assume("Shards stay under four gigabytes")
-        decision = graph.add_node(
-            NodeType.DECISION,
+        DecisionLog(graph).decide(
             "Rebuild in partitions",
-            attrs={"rationale": "bounded memory"},
-            provenance=Provenance(source_id=source.id),
+            "bounded memory",
+            source_id=source.id,
+            assumptions=[assumption.id],
+            produces=[entity.id],
         )
-        graph.add_edge(decision.id, EdgeType.DEPENDS_ON, assumption.id)
-        graph.add_edge(decision.id, EdgeType.PRODUCES, entity.id)
         self.graph = graph
         self.assumption_id = assumption.id
         self.good = graph.to_dict()

@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from contextmesh.decisions import DecisionLog
 from contextmesh.evidence import (
     MAX_COLLECTION_LENGTH,
     MAX_METADATA_BYTES,
@@ -50,12 +51,8 @@ class EvidenceIntakeTest(unittest.TestCase):
                 recorded_at_build=0,
             ),
         )
-        self.decision = self.graph.add_node(
-            NodeType.DECISION,
-            "Use Argon2id",
-            id="decision:argon",
-            attrs={"rationale": "fixture", "at_build": 0},
-            provenance=Provenance(source_id=self.source.id),
+        self.decision = DecisionLog(self.graph).decide(
+            "Use Argon2id", "fixture", source_id=self.source.id, id="decision:argon"
         )
 
     def submit(self, **overrides):

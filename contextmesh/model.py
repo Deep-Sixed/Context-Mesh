@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, NoReturn, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, NoReturn, Optional, Sequence, Tuple
 
 
 class NodeType(str, Enum):
@@ -155,6 +156,43 @@ def slug(text: str, prefix: str = "") -> str:
     digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:6]
     stem = f"{body}-{digest}" if body else digest
     return f"{prefix}:{stem}" if prefix else stem
+
+
+def decision_fingerprint(
+    *,
+    title: str,
+    rationale: str,
+    cites: Iterable[str],
+    derived_from: Iterable[str],
+    depends_on: Iterable[str],
+    produces: Iterable[str],
+    supersedes: Optional[str],
+) -> str:
+    """A fingerprint of a decision's immutable graph-visible content.
+
+    Defined purely over the *outcome* a `decide()` call produces -- title,
+    rationale, and the target-id sets of the edge types it creates -- never
+    over the raw call arguments a caller happened to pass. That makes it
+    computable identically two ways: from a live call's arguments before
+    anything is written, and from an existing node's actual edges after a
+    snapshot restores it -- which is what lets a stored fingerprint be
+    cross-checked against reality instead of trusted outright. Order never
+    carries meaning (citing the same claims in a different order is the
+    same decision), so every collection is deduplicated and sorted before
+    hashing.
+    """
+    canonical = {
+        "title": title,
+        "rationale": rationale,
+        "cites": sorted(set(cites)),
+        "derived_from": sorted(set(derived_from)),
+        "depends_on": sorted(set(depends_on)),
+        "produces": sorted(set(produces)),
+        "supersedes": supersedes,
+    }
+    return hashlib.sha256(
+        json.dumps(canonical, sort_keys=True).encode("utf-8")
+    ).hexdigest()
 
 
 @dataclass

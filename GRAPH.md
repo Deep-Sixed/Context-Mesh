@@ -115,17 +115,21 @@ An explicit `id` means something narrower: not "this is the decision this
 content names" but "this exact call may have already happened — tell me if
 it did." The decision node itself carries this call's evidence, in two attrs
 that ride along with `rationale`: `decision_identity` (`"auto"` or
-`"explicit"`) and `decision_payload_digest`, a digest of the full immutable
-payload (`title`, `rationale`, `source_id`, `supported_by`, `cites`,
-`assumptions`, `produces`, `supersedes`). This is graph state, not a
+`"explicit"`) and `decision_payload_digest`, a fingerprint of the node's
+graph-visible content — `title`, `rationale`, and the deduplicated,
+order-independent target sets of the edges `decide` creates (citation,
+support, dependency, production, supersession). This is graph state, not a
 `DecisionLog`-local table, so it survives a snapshot round-trip and a fresh
 `DecisionLog` the same way the id-freshness check does. An explicit `id`
 naming an existing node is an idempotent retry only when that node is a
 decision minted with an explicit id of its own — naming an auto-minted
 decision, or any non-decision node, is refused, because it is not this
-call's event to retry. Once that much agrees, the same `id` with the exact
-same payload digest is a true no-op that returns the existing node
-untouched, and the same `id` with any different digest is refused with
+call's event to retry. Once that much agrees, the retry check does not stop
+at comparing digests: it recomputes the fingerprint of the *existing node's
+actual edges* and compares the incoming call against that, not against
+whatever the node's attrs claim. The same `id` with content that produces
+the same fingerprint is a true no-op that returns the existing node
+untouched, and the same `id` with any different content is refused with
 `OntologyError` before a single node or edge is written — the id is not
 free to start meaning something else partway through a run, or after a
 restart. This is an idempotency key, not a stronger identity scheme: it
@@ -134,14 +138,24 @@ only protects a caller who reuses one id on purpose, the same way
 and the two checks answer different questions (one caller-declared, one
 derived) that can both apply to the same write.
 
-A decision's immutability does not stop at `DecisionLog`: `add_node` itself
-refuses a second call for an existing decision id even when type and label
-match, unlike a claim or entity, which legitimately merge new attrs on a
-repeat observation. A decision has no such second sighting — every id
-`decide` ever asks `add_node` to create is one it has already established is
-fresh — so reaching that collision as a decision means some other caller is
+A decision's immutability does not stop at `DecisionLog`, and neither does
+the trust boundary around its identity metadata. `add_node` refuses to mint
+a brand-new decision node at all — only `DecisionLog.decide` and the
+snapshot-restoration path in `from_dict` may create one — so `attrs` like
+`decision_identity` and `decision_payload_digest` can never be handed to a
+node that did not genuinely come from `decide`; a caller with only the
+public API cannot forge a decision that a later retry would mistake for a
+prior event. `add_node` also refuses a second call for an *existing*
+decision id even when type and label match, unlike a claim or entity, which
+legitimately merge new attrs on a repeat observation — a decision has no
+such second sighting, so reaching that collision means some other caller is
 trying to rewrite a decision's rationale through the generic merge path, and
-that is refused rather than silently allowed to succeed.
+that is refused rather than silently allowed to succeed. And because a
+snapshot is untrusted input regardless of what created it, `from_dict`
+independently recomputes every `"explicit"` decision's fingerprint from its
+restored edges and refuses to load a file where the stored digest disagrees
+with reality — a hand-edited snapshot cannot claim a decision holds content
+its actual edges do not support.
 
 `decide` is atomic under either path: a decision and its edges (citation,
 support, dependency, production, supersession) either all land or none do,

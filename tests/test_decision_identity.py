@@ -12,7 +12,7 @@ import unittest
 
 from contextmesh.assumptions import AssumptionLedger
 from contextmesh.decisions import DecisionLog
-from contextmesh.graph import ContextGraph
+from contextmesh.graph import ContextGraph, SnapshotError
 from contextmesh.model import EdgeType, NodeType, Provenance
 from contextmesh.ontology import OntologyError
 
@@ -430,6 +430,139 @@ class DecisionNodeIsNeverMergedThroughAddNodeTest(unittest.TestCase):
             graph.node(decision.id).attrs["rationale"],
             "It fits our access patterns.",
         )
+
+
+class DecisionMintingIsRestrictedToDecideTest(unittest.TestCase):
+    """GRAPH.md: only `DecisionLog.decide()` (and `from_dict`'s restoration
+    path) may mint a brand-new decision node. Without this, a caller could
+    create a decision directly through `add_node` with hand-picked
+    `decision_identity`/`decision_payload_digest` attrs and have a later
+    `decide()` call trust it as a legitimate prior event -- exactly the
+    forgery the second independent review found."""
+
+    def test_add_node_cannot_mint_a_fresh_decision_at_all(self):
+        graph, source = _graph_with_source()
+        with self.assertRaises(OntologyError):
+            graph.add_node(
+                NodeType.DECISION,
+                "Use PostgreSQL",
+                id="decision:forged",
+                attrs={
+                    "rationale": "forged",
+                    "decision_identity": "explicit",
+                    "decision_payload_digest": "whatever",
+                },
+                provenance=Provenance(source_id=source.id),
+            )
+        self.assertNotIn("decision:forged", graph.nodes)
+
+    def test_a_forgery_attempt_cannot_later_be_accepted_as_a_retry(self):
+        """Granting for a moment that a forged node existed under this id
+        (it cannot, per the test above): the end-to-end claim the review
+        raised -- that `decide()` would later accept it as a retry -- is
+        closed because the id was never actually claimed. `decide()` sees
+        no existing node and mints a genuine decision instead of returning
+        a forged stand-in."""
+        graph, source = _graph_with_source()
+        with self.assertRaises(OntologyError):
+            graph.add_node(
+                NodeType.DECISION,
+                "Use PostgreSQL",
+                id="decision:forged",
+                attrs={
+                    "rationale": "totally different content",
+                    "decision_identity": "explicit",
+                    "decision_payload_digest": "forged-digest",
+                },
+                provenance=Provenance(source_id=source.id),
+            )
+        real = DecisionLog(graph).decide(
+            "Use PostgreSQL",
+            "It fits our access patterns.",
+            source_id=source.id,
+            id="decision:forged",
+        )
+        self.assertEqual(real.attrs["rationale"], "It fits our access patterns.")
+
+
+class TamperedSnapshotIdentityMetadataFailsClosedTest(unittest.TestCase):
+    """A snapshot is untrusted input: `from_dict` must not simply believe a
+    decision's `decision_identity`/`decision_payload_digest` attrs, or a
+    hand-edited file could make one decision masquerade as another for a
+    future explicit-id retry."""
+
+    def test_a_digest_that_disagrees_with_the_nodes_real_content_is_refused(self):
+        graph, source = _graph_with_source()
+        DecisionLog(graph).decide(
+            "Rebuild the index",
+            "Bounded memory beats build time.",
+            source_id=source.id,
+            id="decision:step-1",
+        )
+        payload = graph.to_dict()
+        for row in payload["nodes"]:
+            if row["id"] == "decision:step-1":
+                row["attrs"]["decision_payload_digest"] = "not-the-real-digest"
+
+        with self.assertRaisesRegex(SnapshotError, "does not match"):
+            ContextGraph.from_dict(payload)
+
+    def test_flipping_an_auto_decision_to_explicit_with_a_forged_digest_is_refused(self):
+        """The other half of the auto-to-explicit takeover: even at snapshot
+        load time, relabeling an auto-minted decision as an explicit one is
+        only as good as its digest -- a fabricated digest that does not
+        match the node's real rationale/edges is caught on load, not
+        trusted until a later `decide()` call is fooled by it."""
+        graph, source = _graph_with_source()
+        auto = DecisionLog(graph).decide(
+            "Use PostgreSQL", "It fits our access patterns.", source_id=source.id
+        )
+        payload = graph.to_dict()
+        for row in payload["nodes"]:
+            if row["id"] == auto.id:
+                row["attrs"]["decision_identity"] = "explicit"
+                row["attrs"]["decision_payload_digest"] = "forged-to-claim-something-else"
+
+        with self.assertRaisesRegex(SnapshotError, "does not match"):
+            ContextGraph.from_dict(payload)
+
+
+class DecisionToDecisionDependsOnDoesNotPolluteIdentityTest(unittest.TestCase):
+    """GRAPH.md's ontology legalizes `depends_on` for both
+    decision->assumption (`decide()`'s own `assumptions` parameter) and
+    decision->decision (task dependencies, wired directly through
+    `add_edge` after `decide()` returns -- see `Runner._execute_task`). A
+    decision's fingerprint must track only the former, or wiring an
+    ordinary task dependency onto a decision would make its own recorded
+    identity disagree with its real content."""
+
+    def test_a_decision_to_decision_dependency_survives_a_snapshot_round_trip(self):
+        graph, source = _graph_with_source()
+        decisions = DecisionLog(graph)
+        upstream = decisions.decide(
+            "Provision the cluster", "Needed first.", source_id=source.id
+        )
+        downstream = decisions.decide(
+            "Load the dataset",
+            "Needs the cluster.",
+            source_id=source.id,
+            id="decision:load-dataset",
+        )
+        graph.add_edge(downstream.id, EdgeType.DEPENDS_ON, upstream.id)
+
+        restored = ContextGraph.from_dict(graph.to_dict())
+        self.assertEqual(len(restored.nodes), len(graph.nodes))
+        self.assertEqual(len(restored.edges), len(graph.edges))
+
+        # An exact-content retry against the now-dependency-bearing decision
+        # is still recognized as the same decision.
+        again = DecisionLog(restored).decide(
+            "Load the dataset",
+            "Needs the cluster.",
+            source_id=source.id,
+            id="decision:load-dataset",
+        )
+        self.assertEqual(again.id, downstream.id)
 
 
 if __name__ == "__main__":

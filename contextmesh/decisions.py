@@ -7,29 +7,12 @@ change our mind" is answerable by walking, not by reading a changelog.
 
 from __future__ import annotations
 
-import hashlib
-import json
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional
 
 from .graph import ContextGraph
-from .model import EdgeType, Node, NodeType, Provenance, slug
+from .model import EdgeType, Node, NodeType, Provenance, decision_fingerprint, slug
 from .ontology import OntologyError
-
-
-def _payload_digest(payload: Dict[str, Any]) -> str:
-    """A stable fingerprint of a decision's immutable content, durable
-    enough to survive a snapshot round-trip: unlike an in-memory dict keyed
-    by id, this is meant to be stored *on the node* so a fresh `DecisionLog`
-    over a restored graph can still tell an idempotent retry from a
-    collision."""
-    canonical = {
-        key: (list(value) if isinstance(value, tuple) else value)
-        for key, value in payload.items()
-    }
-    return hashlib.sha256(
-        json.dumps(canonical, sort_keys=True).encode("utf-8")
-    ).hexdigest()
 
 
 @dataclass
@@ -106,17 +89,20 @@ class DecisionLog:
 
         An explicit `id` is purely an idempotency key, not a content
         address: calling again with the same `id` and the exact same
-        immutable payload (title, rationale, source_id, supported_by, cites,
-        assumptions, produces, supersedes) is a true no-op that returns the
-        existing node untouched; calling again with the same `id` and any
-        different payload is refused with `OntologyError` before anything is
-        written, rather than silently rewriting what that id already means.
-        This check is backed by identity metadata stored on the decision
-        node itself, not by an in-memory table local to this object, so it
-        survives a snapshot round-trip and a fresh `DecisionLog`. An
-        explicit `id` that names a decision minted *without* one (or any
-        non-decision node) is refused the same way: it is not this call's
-        event to retry.
+        immutable content (title, rationale, and the sets of sources,
+        claims, assumptions, entities and predecessor it references) is a
+        true no-op that returns the existing node untouched; calling again
+        with the same `id` and any different content is refused with
+        `OntologyError` before anything is written, rather than silently
+        rewriting what that id already means. This check compares against
+        the *existing node's own edges* -- not a digest trusted from its
+        attrs -- so a decision node that did not genuinely go through
+        `decide()` (which `add_node` refuses to create in the first place)
+        or a snapshot whose stored digest disagrees with the node's real
+        content (which loading a snapshot independently rejects) cannot be
+        mistaken for a legitimate retry target. An explicit `id` that names
+        a decision minted *without* one (or any non-decision node) is
+        refused the same way: it is not this call's event to retry.
 
         The write is atomic: if any referenced id is invalid partway through
         (a bad source, claim, assumption, entity, or supersedes target), the
@@ -127,17 +113,15 @@ class DecisionLog:
         cites = tuple(cites)
         assumptions = tuple(assumptions)
         produces = tuple(produces)
-        payload: Dict[str, Any] = {
-            "title": title,
-            "rationale": rationale,
-            "source_id": source_id,
-            "supported_by": supported_by,
-            "cites": cites,
-            "assumptions": assumptions,
-            "produces": produces,
-            "supersedes": supersedes,
-        }
-        digest = _payload_digest(payload)
+        fingerprint = decision_fingerprint(
+            title=title,
+            rationale=rationale,
+            cites=set(cites) | {source_id},
+            derived_from=supported_by,
+            depends_on=assumptions,
+            produces=produces,
+            supersedes=supersedes,
+        )
 
         if id is not None:
             existing = self.graph.get(id)
@@ -151,7 +135,10 @@ class DecisionLog:
                         "call did not mint (or a non-decision node); "
                         "refusing to treat this as an idempotent retry"
                     )
-                if existing.attrs.get("decision_payload_digest") != digest:
+                existing_fingerprint = decision_fingerprint(
+                    **self.graph._decision_structure(existing.id)
+                )
+                if existing_fingerprint != fingerprint:
                     raise OntologyError(
                         f"decision id {id!r} is already recorded with "
                         "different content; refusing to treat this call as "
@@ -171,7 +158,7 @@ class DecisionLog:
             attrs={
                 "rationale": rationale,
                 "decision_identity": identity_mode,
-                "decision_payload_digest": digest,
+                "decision_payload_digest": fingerprint,
             },
             provenance=Provenance(
                 source_id=source_id,
@@ -179,6 +166,7 @@ class DecisionLog:
                 checks=["rationale-present", "provenance-present"],
                 recorded_at_build=self.graph.build,
             ),
+            _decision_mint_authorized=True,
         )
 
         created_edge_ids: List[str] = []

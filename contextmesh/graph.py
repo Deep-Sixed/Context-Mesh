@@ -15,6 +15,7 @@ from .model import (
     Node,
     NodeType,
     Provenance,
+    decision_fingerprint,
     slug,
 )
 from .ontology import ONTOLOGY, Ontology, OntologyError
@@ -104,6 +105,7 @@ class ContextGraph:
         attrs: Optional[Dict[str, Any]] = None,
         provenance: Optional[Provenance] = None,
         embedding: Optional[Sequence[float]] = None,
+        _decision_mint_authorized: bool = False,
     ) -> Node:
         """Add or re-observe a node. Raises OntologyError if the pair is not
         legal, or if the id collides with a different node.
@@ -117,6 +119,15 @@ class ContextGraph:
         label mismatch under a shared id is a collision, not an update, and
         is refused rather than silently substituted -- see GRAPH.md's "What
         a node/edge id collision means".
+
+        ``_decision_mint_authorized`` is not part of the public contract: a
+        brand-new ``decision`` node can only be minted by ``DecisionLog.decide()``
+        and by :meth:`from_dict`'s restoration path, both of which pass it.
+        Without that restriction, any caller could mint a decision node
+        directly with hand-picked ``attrs`` -- including a forged
+        ``decision_identity``/``decision_payload_digest`` -- and have
+        ``decide()`` later trust it as a legitimate prior event. See GRAPH.md's
+        "What a decision's identity is".
         """
         self.ontology.check_node(type.value)
         node_id = id or slug(label, type.value)
@@ -153,6 +164,12 @@ class ContextGraph:
             if embedding is not None:
                 existing.embedding = embedding
             return existing
+        if type is NodeType.DECISION and not _decision_mint_authorized:
+            raise OntologyError(
+                f"decision node {node_id!r} cannot be minted through "
+                "add_node; call DecisionLog.decide(), which enforces "
+                "identity and provenance (GRAPH.md rule 9)"
+            )
         node = Node(
             id=node_id,
             type=type,
@@ -165,6 +182,44 @@ class ContextGraph:
         _check_must_carry(node, self.ontology)
         self.nodes[node_id] = node
         return node
+
+    def _decision_structure(self, node_id: str) -> Dict[str, Any]:
+        """The graph-visible content behind a decision node's fingerprint,
+        read from its actual edges rather than trusted from attrs.
+
+        Shared ground truth for two checks: ``DecisionLog.decide()``'s
+        idempotency check (an explicit-id retry must match this, not just
+        agree with a stored digest) and :meth:`from_dict`'s restoration
+        validation (a persisted digest must match this, or the snapshot's
+        decision-identity metadata has been tampered with or corrupted).
+
+        ``depends_on`` is filtered to assumption targets only: GRAPH.md's
+        ontology legalizes it for both decision->assumption (what `decide`'s
+        own ``assumptions`` parameter creates) and decision->decision (task
+        dependencies, wired directly by ``Runner`` after `decide` returns).
+        Counting the latter here would make a decision's fingerprint drift
+        the moment an unrelated task dependency is added to it, so only
+        edges into an actual ``assumption`` node count as `decide`'s own.
+        """
+        node = self.nodes[node_id]
+        supersedes_edges = self.out_edges(node_id, [EdgeType.SUPERSEDES], live_only=False)
+        return {
+            "title": node.label,
+            "rationale": node.attrs.get("rationale"),
+            "cites": {e.dst for e in self.out_edges(node_id, [EdgeType.CITES], live_only=False)},
+            "derived_from": {
+                e.dst for e in self.out_edges(node_id, [EdgeType.DERIVED_FROM], live_only=False)
+            },
+            "depends_on": {
+                e.dst
+                for e in self.out_edges(node_id, [EdgeType.DEPENDS_ON], live_only=False)
+                if self.nodes[e.dst].type is NodeType.ASSUMPTION
+            },
+            "produces": {
+                e.dst for e in self.out_edges(node_id, [EdgeType.PRODUCES], live_only=False)
+            },
+            "supersedes": supersedes_edges[0].dst if supersedes_edges else None,
+        }
 
     def node(self, node_id: str) -> Node:
         return self.nodes[node_id]
@@ -465,6 +520,7 @@ class ContextGraph:
                 attrs=node.attrs,
                 provenance=node.provenance,
                 embedding=node.embedding,
+                _decision_mint_authorized=True,
             )
             # State add_node does not take, because a live write never sets it.
             restored.build = node.build
@@ -621,6 +677,32 @@ class ContextGraph:
                     raise SnapshotError(
                         f"edge {edge.id!r}: evidence {evidence_id!r} is not a node"
                     )
+
+        # ── decision identity metadata, checked against reality ───────────
+        # A snapshot is untrusted input: ``decision_identity``/
+        # ``decision_payload_digest`` are plain attrs in the file, so nothing
+        # stops a hand-edited snapshot from claiming a decision is a valid
+        # explicit-id retry target for content it does not actually hold.
+        # Recomputing the fingerprint from the node's real edges (the same
+        # ground truth ``DecisionLog.decide()`` compares a live retry
+        # against) and rejecting a mismatch here means that forgery is
+        # caught on load, not silently trusted until some later ``decide()``
+        # call is fooled by it.
+        for node in graph.nodes.values():
+            if node.type is not NodeType.DECISION:
+                continue
+            if node.attrs.get("decision_identity") != "explicit":
+                continue
+            stored = node.attrs.get("decision_payload_digest")
+            actual = decision_fingerprint(**graph._decision_structure(node.id))
+            if stored != actual:
+                raise SnapshotError(
+                    f"decision {node.id!r} is marked decision_identity="
+                    "'explicit' with decision_payload_digest "
+                    f"{stored!r}, which does not match its actual rationale "
+                    "and edges; this snapshot's decision-identity metadata "
+                    "has been tampered with or corrupted"
+                )
 
         graph.build = build
         return graph
