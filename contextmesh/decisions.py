@@ -89,20 +89,24 @@ class DecisionLog:
 
         An explicit `id` is purely an idempotency key, not a content
         address: calling again with the same `id` and the exact same
-        immutable content (title, rationale, and the sets of sources,
-        claims, assumptions, entities and predecessor it references) is a
-        true no-op that returns the existing node untouched; calling again
-        with the same `id` and any different content is refused with
-        `OntologyError` before anything is written, rather than silently
-        rewriting what that id already means. This check compares against
-        the *existing node's own edges* -- not a digest trusted from its
-        attrs -- so a decision node that did not genuinely go through
-        `decide()` (which `add_node` refuses to create in the first place)
-        or a snapshot whose stored digest disagrees with the node's real
-        content (which loading a snapshot independently rejects) cannot be
-        mistaken for a legitimate retry target. An explicit `id` that names
-        a decision minted *without* one (or any non-decision node) is
-        refused the same way: it is not this call's event to retry.
+        immutable content (title, rationale, source, and the sets of
+        additional citations, claims, assumptions, entities and predecessor
+        it references) is a true no-op that returns the existing node
+        untouched; calling again with the same `id` and any different
+        content is refused with `OntologyError` before anything is written,
+        rather than silently rewriting what that id already means. This
+        check compares against the *existing node's own provenance and
+        edges* -- not a digest trusted from its attrs -- so a decision node
+        that did not genuinely go through `decide()` (which `add_node`
+        refuses to create in the first place) or a snapshot whose stored
+        digest disagrees with the node's real content (which loading a
+        snapshot independently rejects) cannot be mistaken for a legitimate
+        retry target. An explicit `id` that names a decision minted
+        *without* one (or any non-decision node) is refused the same way:
+        it is not this call's event to retry, and this holds even if only
+        the node's `decision_identity` attr, not its id, claims otherwise --
+        an id `_mint_fresh_id` could have produced for this title is never
+        accepted as an explicit target, no matter what its attrs say.
 
         The write is atomic: if any referenced id is invalid partway through
         (a bad source, claim, assumption, entity, or supersedes target), the
@@ -116,7 +120,8 @@ class DecisionLog:
         fingerprint = decision_fingerprint(
             title=title,
             rationale=rationale,
-            cites=set(cites) | {source_id},
+            source_id=source_id,
+            cites=set(cites) - {source_id},
             derived_from=supported_by,
             depends_on=assumptions,
             produces=produces,
@@ -129,6 +134,7 @@ class DecisionLog:
                 if (
                     existing.type is not NodeType.DECISION
                     or existing.attrs.get("decision_identity") != "explicit"
+                    or self.graph._decision_id_looks_auto_minted(existing.id)
                 ):
                     raise OntologyError(
                         f"decision id {id!r} already names a decision this "
@@ -145,6 +151,14 @@ class DecisionLog:
                         "the same decision"
                     )
                 return existing
+            if self.graph._candidate_id_looks_auto_minted(title, id):
+                raise OntologyError(
+                    f"explicit decision id {id!r} collides with the "
+                    f"auto-minted namespace for title {title!r}; choose a "
+                    "different id -- this namespace is reserved so an "
+                    "auto-minted decision's id always structurally proves "
+                    "it, regardless of what its attrs claim"
+                )
             node_id = id
             identity_mode = "explicit"
         else:

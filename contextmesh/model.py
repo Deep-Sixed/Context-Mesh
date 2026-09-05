@@ -158,10 +158,34 @@ def slug(text: str, prefix: str = "") -> str:
     return f"{prefix}:{stem}" if prefix else stem
 
 
+def decision_id_looks_auto_minted(title: str, candidate_id: str, *, upper_bound: int) -> bool:
+    """Whether `candidate_id` is a value `DecisionLog._mint_fresh_id(title)`
+    could have produced -- i.e. `slug(f"{title}|{n}", "decision")` for some
+    `n` in `[1, upper_bound]`.
+
+    A pure function of `title` and `candidate_id` alone, so it answers two
+    different questions the same way: whether an *existing* decision's id
+    was genuinely auto-minted for its own title (making its
+    `decision_identity` attr checkable against reality instead of merely
+    trusted), and whether a *new* explicit id a caller is about to choose
+    would collide with the auto-minted namespace for that title (so
+    `decide()` can refuse it up front and keep that namespace reserved).
+    `upper_bound` should be at least the number of ids this title could ever
+    have collided with while auto-minting -- the caller's node count is
+    always enough, since the real minting loop can never need more tries
+    than there are existing ids to collide with.
+    """
+    for n in range(1, upper_bound + 1):
+        if slug(f"{title}|{n}", "decision") == candidate_id:
+            return True
+    return False
+
+
 def decision_fingerprint(
     *,
     title: str,
     rationale: str,
+    source_id: Optional[str],
     cites: Iterable[str],
     derived_from: Iterable[str],
     depends_on: Iterable[str],
@@ -171,19 +195,27 @@ def decision_fingerprint(
     """A fingerprint of a decision's immutable graph-visible content.
 
     Defined purely over the *outcome* a `decide()` call produces -- title,
-    rationale, and the target-id sets of the edge types it creates -- never
-    over the raw call arguments a caller happened to pass. That makes it
-    computable identically two ways: from a live call's arguments before
-    anything is written, and from an existing node's actual edges after a
-    snapshot restores it -- which is what lets a stored fingerprint be
-    cross-checked against reality instead of trusted outright. Order never
-    carries meaning (citing the same claims in a different order is the
-    same decision), so every collection is deduplicated and sorted before
-    hashing.
+    rationale, the provenance source, and the target-id sets of the edge
+    types it creates -- never over the raw call arguments a caller happened
+    to pass. That makes it computable identically two ways: from a live
+    call's arguments before anything is written, and from an existing
+    node's actual provenance/edges after a snapshot restores it -- which is
+    what lets a stored fingerprint be cross-checked against reality instead
+    of trusted outright. Order never carries meaning (citing the same
+    claims in a different order is the same decision), so every collection
+    is deduplicated and sorted before hashing.
+
+    `source_id` is its own field, kept out of `cites`: a decision's
+    provenance is a distinct fact from what it additionally cites, and a
+    fingerprint that folded both into one `cites` set could not tell a
+    decision whose primary source and an additional cite were swapped
+    (same combined set, different provenance) from one whose content
+    genuinely never changed.
     """
     canonical = {
         "title": title,
         "rationale": rationale,
+        "source_id": source_id,
         "cites": sorted(set(cites)),
         "derived_from": sorted(set(derived_from)),
         "depends_on": sorted(set(depends_on)),

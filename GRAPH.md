@@ -116,27 +116,47 @@ content names" but "this exact call may have already happened — tell me if
 it did." The decision node itself carries this call's evidence, in two attrs
 that ride along with `rationale`: `decision_identity` (`"auto"` or
 `"explicit"`) and `decision_payload_digest`, a fingerprint of the node's
-graph-visible content — `title`, `rationale`, and the deduplicated,
-order-independent target sets of the edges `decide` creates (citation,
-support, dependency, production, supersession). This is graph state, not a
-`DecisionLog`-local table, so it survives a snapshot round-trip and a fresh
-`DecisionLog` the same way the id-freshness check does. An explicit `id`
-naming an existing node is an idempotent retry only when that node is a
-decision minted with an explicit id of its own — naming an auto-minted
-decision, or any non-decision node, is refused, because it is not this
-call's event to retry. Once that much agrees, the retry check does not stop
-at comparing digests: it recomputes the fingerprint of the *existing node's
-actual edges* and compares the incoming call against that, not against
-whatever the node's attrs claim. The same `id` with content that produces
-the same fingerprint is a true no-op that returns the existing node
-untouched, and the same `id` with any different content is refused with
-`OntologyError` before a single node or edge is written — the id is not
-free to start meaning something else partway through a run, or after a
-restart. This is an idempotency key, not a stronger identity scheme: it
-only protects a caller who reuses one id on purpose, the same way
-`add_node`'s type/label check only protects against `slug`'s truncation,
-and the two checks answer different questions (one caller-declared, one
-derived) that can both apply to the same write.
+graph-visible content — `title`, `rationale`, the provenance `source_id`
+kept as its own field, and the deduplicated, order-independent target sets
+of the edges `decide` creates beyond that source (citation, support,
+dependency, production, supersession). Keeping `source_id` separate from
+the additional-citation set matters: reconstructing both as one combined
+set from a node's out-edges cannot tell "the edge that is the provenance
+source" from "the edge that is an additional cite to the same target", so
+a primary source and an additional cite could otherwise be swapped without
+the fingerprint noticing — a different agreed payload producing the same
+digest. This is graph state, not a `DecisionLog`-local table, so it
+survives a snapshot round-trip and a fresh `DecisionLog` the same way the
+id-freshness check does.
+
+An explicit `id` naming an existing node is an idempotent retry only when
+that node is a decision minted with an explicit id of its own — naming an
+auto-minted decision, or any non-decision node, is refused, because it is
+not this call's event to retry. That check does not stop at reading the
+`decision_identity` attr, either: an auto-minted decision's id is, by
+construction, one `DecisionLog._mint_fresh_id` could produce for its title,
+and that stays true no matter what a tampered `decision_identity` claims —
+so a decision whose id could have been auto-minted for its own title is
+never accepted as an explicit retry target, even when it is labeled
+`"explicit"`. This is what closes the gap a digest check alone cannot: an
+auto-minted decision's stored digest is already correct for its real
+content, so flipping only its mode label leaves nothing for a digest
+comparison to disagree with. The same structural check runs in the other
+direction when minting: `decide` refuses to hand out a brand-new explicit
+id that collides with the auto-minted namespace for that title, so the
+namespace stays reserved and a legitimate explicit id never trips the
+check above by coincidence. Once identity agrees, the retry check compares
+the incoming call against the fingerprint of the *existing node's actual
+provenance and edges*, not against whatever its attrs claim. The same `id`
+with content that produces the same fingerprint is a true no-op that
+returns the existing node untouched, and the same `id` with any different
+content is refused with `OntologyError` before a single node or edge is
+written — the id is not free to start meaning something else partway
+through a run, or after a restart. This is an idempotency key, not a
+stronger identity scheme: it only protects a caller who reuses one id on
+purpose, the same way `add_node`'s type/label check only protects against
+`slug`'s truncation, and the two checks answer different questions (one
+caller-declared, one derived) that can both apply to the same write.
 
 A decision's immutability does not stop at `DecisionLog`, and neither does
 the trust boundary around its identity metadata. `add_node` refuses to mint
@@ -153,9 +173,12 @@ trying to rewrite a decision's rationale through the generic merge path, and
 that is refused rather than silently allowed to succeed. And because a
 snapshot is untrusted input regardless of what created it, `from_dict`
 independently recomputes every `"explicit"` decision's fingerprint from its
-restored edges and refuses to load a file where the stored digest disagrees
-with reality — a hand-edited snapshot cannot claim a decision holds content
-its actual edges do not support.
+restored provenance/edges and refuses to load a file where the stored digest
+disagrees with reality, and separately refuses to load one where an
+`"explicit"`-labeled decision's id could have been auto-minted for its own
+title — a hand-edited snapshot cannot claim a decision holds content its
+actual edges do not support, nor turn a real auto-minted event into an
+explicit one by editing a single attr.
 
 `decide` is atomic under either path: a decision and its edges (citation,
 support, dependency, production, supersession) either all land or none do,

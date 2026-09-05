@@ -523,8 +523,92 @@ class TamperedSnapshotIdentityMetadataFailsClosedTest(unittest.TestCase):
                 row["attrs"]["decision_identity"] = "explicit"
                 row["attrs"]["decision_payload_digest"] = "forged-to-claim-something-else"
 
-        with self.assertRaisesRegex(SnapshotError, "does not match"):
+        with self.assertRaisesRegex(SnapshotError, "auto-minting could have produced"):
             ContextGraph.from_dict(payload)
+
+    def test_flipping_an_auto_decision_to_explicit_with_the_correct_digest_is_still_refused(self):
+        """The sharper form of the takeover: an auto-minted decision's
+        stored digest is already *correct* for its real content, so tamper
+        that leaves the digest untouched and only flips
+        `decision_identity` to `"explicit"` cannot be caught by a digest
+        comparison at all -- there is nothing wrong for it to disagree with.
+        What still gives it away is that the id itself was never something
+        `decide()` could have handed out as an explicit id: it is exactly
+        what auto-minting produces for this title."""
+        graph, source = _graph_with_source()
+        auto = DecisionLog(graph).decide(
+            "Use PostgreSQL", "It fits our access patterns.", source_id=source.id
+        )
+        payload = graph.to_dict()
+        for row in payload["nodes"]:
+            if row["id"] == auto.id:
+                self.assertEqual(row["attrs"]["decision_identity"], "auto")
+                row["attrs"]["decision_identity"] = "explicit"
+                # decision_payload_digest is left exactly as decide() wrote it.
+
+        with self.assertRaisesRegex(SnapshotError, "auto-minting could have produced"):
+            ContextGraph.from_dict(payload)
+
+    def test_a_source_and_cite_swap_produces_a_different_fingerprint(self):
+        """source_id is a decision's provenance, not just another citation.
+        Swapping which id is the primary source and which is an additional
+        cite changes the real, agreed-upon payload -- the node's actual
+        provenance still names the original source -- so it must not
+        fingerprint identically to the unswapped call."""
+        graph = ContextGraph()
+        graph.build = 1
+        source_a = graph.add_node(
+            NodeType.SOURCE, "Source A", attrs={"origin": "fixture", "retrieved_at": "fixture"}
+        )
+        source_b = graph.add_node(
+            NodeType.SOURCE, "Source B", attrs={"origin": "fixture", "retrieved_at": "fixture"}
+        )
+        DecisionLog(graph).decide(
+            "Use PostgreSQL",
+            "It fits our access patterns.",
+            source_id=source_a.id,
+            cites=[source_b.id],
+            id="decision:step-1",
+        )
+        node_count = len(graph.nodes)
+        edge_count = len(graph.edges)
+
+        with self.assertRaises(OntologyError):
+            DecisionLog(graph).decide(
+                "Use PostgreSQL",
+                "It fits our access patterns.",
+                source_id=source_b.id,
+                cites=[source_a.id],
+                id="decision:step-1",
+            )
+
+        self.assertEqual(len(graph.nodes), node_count)
+        self.assertEqual(len(graph.edges), edge_count)
+        self.assertEqual(graph.node("decision:step-1").provenance.source_id, source_a.id)
+
+
+class ExplicitIdCannotClaimTheAutoMintedNamespaceTest(unittest.TestCase):
+    """Reserving the auto-minted namespace prospectively: `decide()` must
+    refuse a brand-new explicit id that collides with what auto-minting
+    could have produced for the same title, or the structural check that
+    protects an *existing* auto-minted decision from a mode-flip would have
+    to tolerate a legitimate false positive."""
+
+    def test_an_explicit_id_matching_the_auto_pattern_for_its_title_is_refused(self):
+        graph, source = _graph_with_source()
+        auto_id = DecisionLog(graph).decide(
+            "Use PostgreSQL", "It fits our access patterns.", source_id=source.id
+        ).id
+
+        other_graph, other_source = _graph_with_source()
+        with self.assertRaises(OntologyError):
+            DecisionLog(other_graph).decide(
+                "Use PostgreSQL",
+                "A different rationale.",
+                source_id=other_source.id,
+                id=auto_id,
+            )
+        self.assertNotIn(auto_id, other_graph.nodes)
 
 
 class DecisionToDecisionDependsOnDoesNotPolluteIdentityTest(unittest.TestCase):
