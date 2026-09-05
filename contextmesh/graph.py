@@ -240,6 +240,32 @@ class ContextGraph:
         self._in[dst].append(edge_id)
         return edge
 
+    def _discard_edge(self, edge_id: str) -> None:
+        """Undo one ``add_edge`` call, for a caller rolling back a write that
+        must not partially commit (a multi-edge operation where a later edge
+        failed). Only sound when ``edge_id`` was created by that same call
+        and nothing else has read or extended it since -- this is not a
+        general "delete an edge" operation, and must never be exposed as one.
+        """
+        edge = self.edges.pop(edge_id, None)
+        if edge is None:
+            return
+        key = (edge.src, edge.type.value, edge.dst)
+        if self._edge_key.get(key) == edge_id:
+            del self._edge_key[key]
+        if edge_id in self._out.get(edge.src, ()):
+            self._out[edge.src].remove(edge_id)
+        if edge_id in self._in.get(edge.dst, ()):
+            self._in[edge.dst].remove(edge_id)
+
+    def _discard_node(self, node_id: str) -> None:
+        """Undo one ``add_node`` call, for the same kind of rollback as
+        ``_discard_edge``. Only sound when the node was freshly created by
+        the call being rolled back -- never call this on a node any other
+        write might already depend on.
+        """
+        self.nodes.pop(node_id, None)
+
     def out_edges(
         self,
         node_id: str,

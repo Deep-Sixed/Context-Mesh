@@ -11,7 +11,8 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional
 
 from .graph import ContextGraph
-from .model import EdgeType, Node, NodeType, Provenance
+from .model import EdgeType, Node, NodeType, Provenance, slug
+from .ontology import OntologyError
 
 
 @dataclass
@@ -44,6 +45,10 @@ class DecisionLog:
     def __init__(self, graph: ContextGraph) -> None:
         self.graph = graph
         self.records: List[DecisionRecord] = []
+        # Keyed by an explicit `id=` a caller has already used once, so a
+        # retry with that id can be told apart from a genuine collision --
+        # see `decide`'s docstring.
+        self._payloads: Dict[str, Dict[str, Any]] = {}
 
     def decide(
         self,
@@ -58,14 +63,59 @@ class DecisionLog:
         produces: Iterable[str] = (),
         supersedes: Optional[str] = None,
     ) -> Node:
+        """Record a decision. Every call without an explicit id mints a new,
+        never-reused decision, even if the content is byte-identical to a
+        prior one -- a decision is an immutable event, not content-addressed,
+        so "the same title again" is a second decision, not an update. Use
+        `supersedes` to link it to the one it replaces.
+
+        An explicit `id` is purely an idempotency key, not a content
+        address: calling again with the same `id` and the exact same
+        immutable payload (title, rationale, source_id, supported_by, cites,
+        assumptions, produces, supersedes) is a true no-op that returns the
+        existing node untouched; calling again with the same `id` and any
+        different payload is refused with `OntologyError` before anything is
+        written, rather than silently rewriting what that id already means.
+
+        The write is atomic: if any referenced id is invalid partway through
+        (a bad source, claim, assumption, entity, or supersedes target), the
+        decision and edges this call would have created are rolled back
+        rather than left standing incomplete.
+        """
+        supported_by = tuple(supported_by)
+        cites = tuple(cites)
+        assumptions = tuple(assumptions)
+        produces = tuple(produces)
+        payload: Dict[str, Any] = {
+            "title": title,
+            "rationale": rationale,
+            "source_id": source_id,
+            "supported_by": supported_by,
+            "cites": cites,
+            "assumptions": assumptions,
+            "produces": produces,
+            "supersedes": supersedes,
+        }
+
+        if id is not None:
+            existing_payload = self._payloads.get(id)
+            if existing_payload is not None:
+                if existing_payload != payload:
+                    raise OntologyError(
+                        f"decision id {id!r} is already recorded with "
+                        "different content; refusing to treat this call as "
+                        "the same decision"
+                    )
+                return self.graph.node(id)
+
+        node_id = id if id is not None else slug(
+            f"{title}|{len(self.records) + 1}", "decision"
+        )
+        node_already_existed = node_id in self.graph.nodes
         node = self.graph.add_node(
             NodeType.DECISION,
             title,
-            # A re-run appends a *new* decision that supersedes the old one, and
-            # two runs of the same step share a title. Without an explicit id the
-            # content slug would return the invalidated node instead of a
-            # successor, and the history would silently stop being append-only.
-            id=id,
+            id=node_id,
             attrs={"rationale": rationale},
             provenance=Provenance(
                 source_id=source_id,
@@ -74,19 +124,36 @@ class DecisionLog:
                 recorded_at_build=self.graph.build,
             ),
         )
-        self.graph.add_edge(node.id, EdgeType.CITES, source_id)
-        for claim_id in supported_by:
-            self.graph.add_edge(claim_id, EdgeType.SUPPORTS, node.id)
-            self.graph.add_edge(node.id, EdgeType.DERIVED_FROM, claim_id)
-        for src in cites:
-            self.graph.add_edge(node.id, EdgeType.CITES, src)
-        for assumption_id in assumptions:
-            self.graph.add_edge(node.id, EdgeType.DEPENDS_ON, assumption_id)
-        for entity_id in produces:
-            self.graph.add_edge(node.id, EdgeType.PRODUCES, entity_id)
-        if supersedes:
-            self.graph.add_edge(node.id, EdgeType.SUPERSEDES, supersedes)
-            self.graph.node(supersedes).attrs["superseded_by"] = node.id
+
+        created_edge_ids: List[str] = []
+
+        def _tracked_edge(src: str, etype: EdgeType, dst: str) -> None:
+            key = (src, etype.value, dst)
+            already = key in self.graph._edge_key
+            edge = self.graph.add_edge(src, etype, dst)
+            if not already:
+                created_edge_ids.append(edge.id)
+
+        try:
+            _tracked_edge(node.id, EdgeType.CITES, source_id)
+            for claim_id in supported_by:
+                _tracked_edge(claim_id, EdgeType.SUPPORTS, node.id)
+                _tracked_edge(node.id, EdgeType.DERIVED_FROM, claim_id)
+            for src in cites:
+                _tracked_edge(node.id, EdgeType.CITES, src)
+            for assumption_id in assumptions:
+                _tracked_edge(node.id, EdgeType.DEPENDS_ON, assumption_id)
+            for entity_id in produces:
+                _tracked_edge(node.id, EdgeType.PRODUCES, entity_id)
+            if supersedes:
+                _tracked_edge(node.id, EdgeType.SUPERSEDES, supersedes)
+                self.graph.node(supersedes).attrs["superseded_by"] = node.id
+        except Exception:
+            for edge_id in created_edge_ids:
+                self.graph._discard_edge(edge_id)
+            if not node_already_existed:
+                self.graph._discard_node(node.id)
+            raise
 
         self.records.append(
             DecisionRecord(
@@ -100,6 +167,8 @@ class DecisionLog:
                 cites=list(cites),
             )
         )
+        if id is not None:
+            self._payloads[id] = payload
         return node
 
     def history_of(self, decision_id: str) -> List[DecisionRecord]:

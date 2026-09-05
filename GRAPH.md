@@ -95,6 +95,31 @@ collision *detection*, not a stronger id scheme: `slug`'s truncation is
 unchanged, and a caller that keeps minting distinct content into the same
 id space will eventually have a write refused rather than silently lose one.
 
+**What a decision's identity is.** A `decision` node is an immutable event,
+never a content address: two calls to `DecisionLog.decide` with byte-identical
+`title` and `rationale` are two decisions, not one being re-observed, because
+"we chose this again" and "we never stopped choosing this" are different
+facts and only the first is `supersedes`'s job to record. A call made without
+an explicit `id` therefore always mints a fresh id, discriminated by how many
+decisions this log has already recorded, so a repeated title can never
+collide with its own predecessor. An explicit `id` means something narrower:
+not "this is the decision this content names" but "this exact call may have
+already happened — tell me if it did." `DecisionLog` remembers the full
+payload (`title`, `rationale`, `source_id`, `supported_by`, `cites`,
+`assumptions`, `produces`, `supersedes`) an `id` was first used with; the
+same `id` with that exact payload again is a true no-op that returns the
+existing node untouched, and the same `id` with any different payload is
+refused with `OntologyError` before a single node or edge is written — the
+id is not free to start meaning something else partway through a run. This
+is an idempotency key, not a stronger identity scheme: it only protects a
+caller who reuses one id on purpose, the same way `add_node`'s type/label
+check only protects against `slug`'s truncation, and the two checks answer
+different questions (one caller-declared, one derived) that can both apply
+to the same write. `decide` is atomic under either path: a decision and its
+edges (citation, support, dependency, production, supersession) either all
+land or none do, rolled back the same way `AssumptionLedger.assume` rolls
+back a partially-justified assumption.
+
 **Code is evidence, not authority.** A behaviour may be written into this file
 when the implementation *structurally guarantees* it — when no caller can make
 it false without changing the implementation's own contract. A behaviour that is
@@ -163,6 +188,10 @@ disagree.
 8. A node or edge id names one semantic identity. A derived id that would
    collide with a different node or edge is refused, never silently merged
    into it — see *What a node/edge id collision means*.
+9. A `decision` is never content-addressed. Two decisions with the same
+   title and rationale are two events, not one; an explicit `id` on
+   `decide` is an idempotency key for one call, not a way to name a
+   decision by its content — see *What a decision's identity is*.
 
 ## Declared, not yet realized
 
