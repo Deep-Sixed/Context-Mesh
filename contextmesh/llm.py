@@ -469,7 +469,10 @@ def _bounded_prompt(prefix: str, payload: Any, limit: int) -> str:
     prefix_bytes = prefix.encode("utf-8")
     if len(prefix_bytes) > limit:
         raise LLMRequestTooLargeError(f"request exceeds the {limit}-byte limit")
-    body = _bounded_json_bytes(payload, limit - len(prefix_bytes), sort_keys=True)
+    try:
+        body = _bounded_json_bytes(payload, limit - len(prefix_bytes), sort_keys=True)
+    except LLMRequestTooLargeError:
+        raise LLMRequestTooLargeError(f"request exceeds the {limit}-byte limit") from None
     return prefix + body.decode("utf-8")
 
 
