@@ -42,6 +42,19 @@ class LLMTransportError(LLMError):
     """No HTTP response was obtained from the configured provider."""
 
 
+class LLMRequestTooLargeError(LLMError):
+    """The assembled request body exceeds this client's own outbound limit.
+
+    Raised before the request is ever sent: nothing here truncates a prompt
+    to fit, because a worker's ``inputs`` or an audit's ``available_evidence``
+    are graph content a caller reasons about, and silently dropping some of
+    it would change what the model is actually asked without telling anyone.
+    The one honest response to an oversized request is to refuse it and say
+    so, the same way :func:`_bounded_read` refuses an oversized response
+    rather than truncating what a provider sends back.
+    """
+
+
 class LLMProviderError(LLMError):
     """The configured provider returned a failure."""
 
@@ -167,6 +180,7 @@ class LLMConfig:
     base_delay: float = 0.25
     max_tokens: int = 1024
     max_response_bytes: int = 1_048_576
+    max_request_bytes: int = 1_048_576
 
     def __post_init__(self) -> None:
         if not isinstance(self.provider, str) or not self.provider:
@@ -197,6 +211,12 @@ class LLMConfig:
             raise LLMConfigurationError("max_response_bytes must be a positive integer")
         if self.max_response_bytes < 1:
             raise LLMConfigurationError("max_response_bytes must be a positive integer")
+        if isinstance(self.max_request_bytes, bool) or not isinstance(
+            self.max_request_bytes, int
+        ):
+            raise LLMConfigurationError("max_request_bytes must be a positive integer")
+        if self.max_request_bytes < 1:
+            raise LLMConfigurationError("max_request_bytes must be a positive integer")
 
         if self.mode == "live":
             if self.provider not in LIVE_PROVIDERS:
@@ -851,6 +871,13 @@ class LLMClient:
             )
 
         request = _request_for(self.config, prompt, schema, schema_name, system)
+        if len(request.body) > self.config.max_request_bytes:
+            raise LLMRequestTooLargeError(
+                f"request body is {len(request.body)} bytes, over the "
+                f"{self.config.max_request_bytes}-byte limit; refusing to "
+                "send it -- a worker's inputs or an audit's available "
+                "evidence has grown too large for this client's own bound"
+            )
         response, attempts = self._send(request)
         envelope = _decode_body(response)
         text, usage, response_id = _EXTRACTORS[self.config.provider](envelope)
@@ -1050,6 +1077,7 @@ __all__ = [
     "LLMError",
     "LLMProviderError",
     "LLMProvenance",
+    "LLMRequestTooLargeError",
     "LLMResponseError",
     "LLMResult",
     "LLMSchemaError",

@@ -18,6 +18,7 @@ from contextmesh.llm import (
     LLMConfig,
     LLMConfigurationError,
     LLMProviderError,
+    LLMRequestTooLargeError,
     LLMResponseError,
     LLMSchemaError,
     LLMTransportError,
@@ -179,6 +180,8 @@ class ConfigurationTest(unittest.TestCase):
             ("max_tokens", 0),
             ("max_response_bytes", 0),
             ("max_response_bytes", True),
+            ("max_request_bytes", 0),
+            ("max_request_bytes", True),
         ):
             with self.subTest(field=field, value=value):
                 args = {field: value}
@@ -388,6 +391,70 @@ class RetryAndResponseTest(unittest.TestCase):
         client = _live("openai", QueueTransport(response))
         with self.assertRaisesRegex(LLMResponseError, "duplicate key"):
             client.complete("work", OUTPUT_SCHEMA)
+
+
+class RequestSizeTest(unittest.TestCase):
+    """A worker's inputs or an audit's available evidence come from the
+    graph, not from a bounded intake boundary like evidence submission --
+    nothing capped how large the assembled request could grow before it was
+    handed to a provider. The fix refuses to send an oversized request
+    rather than silently trimming it, mirroring how ``_bounded_read``
+    refuses an oversized response instead of truncating it."""
+
+    def test_an_oversized_prompt_is_refused_before_anything_is_sent(self) -> None:
+        transport = QueueTransport()
+        client = _live("openai", transport, max_request_bytes=1024)
+        with self.assertRaisesRegex(LLMRequestTooLargeError, "1024-byte limit"):
+            client.complete("x" * 4096, OUTPUT_SCHEMA)
+        self.assertEqual(transport.requests, [])
+
+    def test_a_prompt_within_budget_is_unaffected(self) -> None:
+        transport = QueueTransport(_structured("openai", json.dumps({"value": "ok", "count": 1})))
+        client = _live("openai", transport, max_request_bytes=1024)
+        result = client.complete("work", OUTPUT_SCHEMA)
+        self.assertEqual(result.data["value"], "ok")
+
+    def test_an_audit_with_too_much_evidence_is_refused_not_truncated(self) -> None:
+        """The exact scenario the missed bound left open: available_evidence
+        grows with everything ever submitted to the graph, so an audit built
+        from a graph with enough evidence in it could keep growing past any
+        provider's own request-size tolerance. Refusing it here, before a
+        request is sent, is the fail-closed answer -- silently dropping some
+        evidence so the request fits would change what the model is asked
+        to judge without telling anyone."""
+        runner = Runner("llm-audit-request-size")
+        task = runner.task(
+            "inspect",
+            run=lambda _ctx: {"checked": True},
+            assumes="The observed condition still holds",
+        )
+        assert task.assumption_id is not None
+        assumption = runner.graph.assumptions[task.assumption_id]
+        source = runner.graph.add_node(
+            NodeType.SOURCE,
+            "External observation source",
+            attrs={"origin": "fixture", "retrieved_at": "fixture"},
+        )
+        for i in range(50):
+            submit_evidence(
+                runner.graph,
+                text=f"Observation number {i}, padded: {'x' * 200}",
+                source_id=source.id,
+                external_id=f"llm-test-evidence-{i}",
+            )
+        context = AuditContext(
+            task=task, output={"checked": True}, assumption=assumption, graph=runner.graph
+        )
+        transport = QueueTransport()
+        client = _live("openai", transport, max_request_bytes=2048)
+        before = (len(runner.graph.nodes), len(runner.graph.edges), assumption.status)
+
+        with self.assertRaises(LLMRequestTooLargeError):
+            propose_audit(client, context, instruction="Check the assumption.")
+
+        self.assertEqual(transport.requests, [])
+        after = (len(runner.graph.nodes), len(runner.graph.edges), assumption.status)
+        self.assertEqual(before, after)
 
 
 class AuditAuthorityTest(unittest.TestCase):
