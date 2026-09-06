@@ -129,24 +129,28 @@ class SessionPathIdentityTest(unittest.TestCase):
             self.skipTest(f"directory symlink creation unavailable: {exc}")
         self._assert_alias_refuses_stale_writer(alias)
 
-    @unittest.skipUnless(os.name == "nt", "Windows directory junction")
-    def test_junction_alias_refuses_a_stale_writer_on_windows(self) -> None:
-        alias = self.root / "session-junction"
-        completed = subprocess.run(
-            ["cmd", "/c", "mklink", "/J", str(alias), str(self.directory)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if completed.returncode != 0:
-            self.skipTest(f"directory junction creation unavailable: {completed.stderr}")
-        try:
-            self._assert_alias_refuses_stale_writer(alias)
-        finally:
+    if os.name == "nt":
+
+        def test_junction_alias_refuses_a_stale_writer_on_windows(self) -> None:
+            alias = self.root / "session-junction"
+            completed = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(alias), str(self.directory)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(
+                completed.returncode,
+                0,
+                f"directory junction creation failed: {completed.stderr}",
+            )
             try:
-                alias.rmdir()
-            except OSError:
-                pass
+                self._assert_alias_refuses_stale_writer(alias)
+            finally:
+                try:
+                    alias.rmdir()
+                except OSError:
+                    pass
 
     def test_a_genuinely_different_directory_remains_a_save_as(self) -> None:
         current, stale = self._readers()
