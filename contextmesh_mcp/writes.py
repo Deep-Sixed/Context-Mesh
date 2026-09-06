@@ -82,6 +82,7 @@ def _clone_session(source: Session) -> Session:
         rounds=source.rounds,
         source=source.source,
         path=source.path,
+        _checkpoint_path=source._checkpoint_path,
         generation=source.generation,
         runner=runner,
     )

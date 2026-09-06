@@ -8,7 +8,8 @@ import unittest
 from pathlib import Path
 
 from contextmesh.model import NodeType
-from contextmesh_mcp.session import Session, SessionError
+from contextmesh_mcp.session import Checkpointer, Session, SessionError
+from contextmesh_mcp.writes import mesh_submit_evidence
 
 
 class SessionPathIdentityTest(unittest.TestCase):
@@ -151,6 +152,112 @@ class SessionPathIdentityTest(unittest.TestCase):
                     alias.rmdir()
                 except OSError:
                     pass
+
+    def _make_retargetable_alias(self, alias: Path, target: Path) -> None:
+        if os.name == "nt":
+            completed = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(alias), str(target)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(
+                completed.returncode,
+                0,
+                f"directory junction creation failed: {completed.stderr}",
+            )
+        else:
+            alias.symlink_to(target, target_is_directory=True)
+
+    def _remove_retargetable_alias(self, alias: Path) -> None:
+        if os.name == "nt":
+            alias.rmdir()
+        else:
+            alias.unlink()
+
+    def test_checkpoint_stays_on_original_target_after_alias_is_retargeted(self) -> None:
+        first = self.directory
+        second = self.root / "second"
+        Session.build(rounds=1).save(second)
+        alias = self.root / "retargetable-session"
+        self._make_retargetable_alias(alias, first)
+        loaded = Session.load(alias)
+        self.assertEqual(loaded.path, alias.absolute())
+
+        self._remove_retargetable_alias(alias)
+        self._make_retargetable_alias(alias, second)
+        node = loaded.graph.add_node(
+            NodeType.SOURCE,
+            "pinned target observation",
+            attrs={"origin": "fixture", "retrieved_at": "fixture"},
+        )
+        try:
+            loaded.checkpoint()
+        finally:
+            self._remove_retargetable_alias(alias)
+
+        original = Session.load(first)
+        redirected = Session.load(second)
+        self.assertEqual(original.generation, 2)
+        self.assertIn(node.id, original.graph.nodes)
+        self.assertEqual(redirected.generation, 1)
+        self.assertNotIn(node.id, redirected.graph.nodes)
+
+    def test_retargeting_alias_cannot_disable_stale_writer_cas(self) -> None:
+        first = self.directory
+        second = self.root / "second"
+        Session.build(rounds=1).save(second)
+        alias = self.root / "retargetable-session"
+        self._make_retargetable_alias(alias, first)
+        stale = Session.load(alias)
+        current = Session.load(first)
+        newer_id = self._advance(current)
+
+        self._remove_retargetable_alias(alias)
+        self._make_retargetable_alias(alias, second)
+        try:
+            with self.assertRaisesRegex(SessionError, "another writer has committed"):
+                stale.save(first)
+        finally:
+            self._remove_retargetable_alias(alias)
+
+        original = Session.load(first)
+        self.assertEqual(original.generation, 2)
+        self.assertIn(newer_id, original.graph.nodes)
+        self.assertEqual(Session.load(second).generation, 1)
+
+    def test_controlled_write_clone_keeps_the_pinned_target(self) -> None:
+        first = self.directory
+        second = self.root / "second"
+        Session.build(rounds=1).save(second)
+        alias = self.root / "retargetable-session"
+        self._make_retargetable_alias(alias, first)
+        loaded = Session.load(alias)
+        source = next(
+            node for node in loaded.graph.nodes.values() if node.type is NodeType.SOURCE
+        )
+        checkpointer = Checkpointer(loaded)
+
+        self._remove_retargetable_alias(alias)
+        self._make_retargetable_alias(alias, second)
+        try:
+            result = mesh_submit_evidence(
+                loaded,
+                checkpointer,
+                text="controlled write stays on original target",
+                source_id=source.id,
+                external_id="pinned-target-probe",
+            )
+        finally:
+            self._remove_retargetable_alias(alias)
+
+        evidence_id = result.payload["evidence_id"]
+        original = Session.load(first)
+        redirected = Session.load(second)
+        self.assertEqual(original.generation, 2)
+        self.assertIn(evidence_id, original.graph.nodes)
+        self.assertEqual(redirected.generation, 1)
+        self.assertNotIn(evidence_id, redirected.graph.nodes)
 
     def test_a_genuinely_different_directory_remains_a_save_as(self) -> None:
         current, stale = self._readers()
