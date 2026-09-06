@@ -21,9 +21,9 @@ dependencies = []
 mcp = ["mcp>=2"]
 
 [project.urls]
-Homepage = "https://github.com/Deep-Sixed/Context-Mesh"
-Repository = "https://github.com/Deep-Sixed/Context-Mesh"
-Issues = "https://github.com/Deep-Sixed/Context-Mesh/issues"
+Homepage = "https://github.com/Deep-Sixed/ContextMesh"
+Repository = "https://github.com/Deep-Sixed/ContextMesh"
+Issues = "https://github.com/Deep-Sixed/ContextMesh/issues"
 
 [project.scripts]
 contextmesh = "contextmesh.cli:main"
