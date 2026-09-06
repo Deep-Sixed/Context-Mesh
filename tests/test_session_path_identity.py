@@ -2,6 +2,7 @@
 
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -69,6 +70,57 @@ class SessionPathIdentityTest(unittest.TestCase):
         finally:
             os.chdir(previous)
 
+    def test_relative_load_keeps_stale_writer_identity_after_chdir(self) -> None:
+        previous = Path.cwd()
+        try:
+            os.chdir(self.root)
+            stale = Session.load("session")
+        finally:
+            os.chdir(previous)
+
+        current = Session.load(self.directory)
+        newer_id = self._advance(current)
+        before = self._json_state()
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        try:
+            os.chdir(elsewhere)
+            with self.assertRaisesRegex(SessionError, "another writer has committed"):
+                stale.save(self.directory)
+        finally:
+            os.chdir(previous)
+
+        self.assertEqual(self._json_state(), before)
+        restored = Session.load(self.directory)
+        self.assertEqual(restored.generation, 2)
+        self.assertIn(newer_id, restored.graph.nodes)
+
+    def test_relative_load_checkpoint_stays_bound_after_chdir(self) -> None:
+        previous = Path.cwd()
+        try:
+            os.chdir(self.root)
+            restored = Session.load("session")
+        finally:
+            os.chdir(previous)
+
+        node = restored.graph.add_node(
+            NodeType.SOURCE,
+            "checkpoint after chdir",
+            attrs={"origin": "fixture", "retrieved_at": "fixture"},
+        )
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        try:
+            os.chdir(elsewhere)
+            restored.checkpoint()
+        finally:
+            os.chdir(previous)
+
+        self.assertFalse((elsewhere / "session").exists())
+        loaded = Session.load(self.directory)
+        self.assertEqual(loaded.generation, 2)
+        self.assertIn(node.id, loaded.graph.nodes)
+
     def test_symlink_alias_refuses_a_stale_writer_where_supported(self) -> None:
         alias = self.root / "session-link"
         try:
@@ -76,6 +128,29 @@ class SessionPathIdentityTest(unittest.TestCase):
         except (OSError, NotImplementedError) as exc:
             self.skipTest(f"directory symlink creation unavailable: {exc}")
         self._assert_alias_refuses_stale_writer(alias)
+
+    if os.name == "nt":
+
+        def test_junction_alias_refuses_a_stale_writer_on_windows(self) -> None:
+            alias = self.root / "session-junction"
+            completed = subprocess.run(
+                ["cmd", "/c", "mklink", "/J", str(alias), str(self.directory)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(
+                completed.returncode,
+                0,
+                f"directory junction creation failed: {completed.stderr}",
+            )
+            try:
+                self._assert_alias_refuses_stale_writer(alias)
+            finally:
+                try:
+                    alias.rmdir()
+                except OSError:
+                    pass
 
     def test_a_genuinely_different_directory_remains_a_save_as(self) -> None:
         current, stale = self._readers()
