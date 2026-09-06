@@ -898,6 +898,11 @@ class Session:
         target = Path(directory)
         if not target.is_dir():
             raise SessionError(f"{target} is not a session directory")
+        # Anchor the directory while the caller's current working directory still
+        # gives a relative spelling its intended meaning. Session.path is durable
+        # process state: keeping a relative Path here would let a later chdir make
+        # the stale-writer CAS compare against an entirely different directory.
+        target = target.absolute()
         for attempt in range(LOAD_ATTEMPTS):
             before = cls._live_generation(target)
             try:
