@@ -764,6 +764,12 @@ class Session:
     rounds: int = DEFAULT_ROUNDS
     source: str = "bundled demo corpus"
     path: Optional[Path] = field(default=None, repr=False)
+    # Stable filesystem target captured at load time. ``path`` keeps the caller's
+    # absolute spelling for diagnostics/compatibility; this one is where the
+    # loaded session actually lives, even if a symlink/junction is retargeted.
+    _checkpoint_path: Optional[Path] = field(
+        default=None, repr=False, compare=False
+    )
     generation: int = 0
     runner: Optional[Runner] = None
 
@@ -827,9 +833,10 @@ class Session:
 
     def _commit(self, target: Path) -> Path:
         live = self._live_generation(target)
+        identity_path = self._checkpoint_path or self.path
         if (
-            self.path is not None
-            and _same_session_directory(target, self.path)
+            identity_path is not None
+            and _same_session_directory(target, identity_path)
             and live != self.generation
         ):
             raise SessionError(
@@ -883,13 +890,17 @@ class Session:
                     pass
 
     def checkpoint(self) -> Path:
-        if self.path is None:
+        target = self._checkpoint_path or self.path
+        if target is None:
             raise SessionError(
                 "this session was built rather than loaded, so it has no "
                 "directory to check point into — save it somewhere first, then "
                 "load it from there"
             )
-        return self.save(self.path)
+        self.save(target)
+        # Keep the established caller-visible return contract even when I/O is
+        # pinned to a resolved symlink, junction or Windows short-path target.
+        return self.path or target
 
     @classmethod
     def load(
@@ -898,15 +909,19 @@ class Session:
         target = Path(directory)
         if not target.is_dir():
             raise SessionError(f"{target} is not a session directory")
-        # Anchor the directory while the caller's current working directory still
-        # gives a relative spelling its intended meaning. Session.path is durable
-        # process state: keeping a relative Path here would let a later chdir make
-        # the stale-writer CAS compare against an entirely different directory.
-        target = target.absolute()
+        # Keep the caller-visible absolute spelling, but pin I/O to the directory
+        # it names *now*. A symlink/junction can be retargeted later just as CWD
+        # can change later; neither may redirect a restored session's checkpoint.
+        display_target = target.absolute()
+        target = display_target.resolve()
         for attempt in range(LOAD_ATTEMPTS):
             before = cls._live_generation(target)
             try:
-                return cls._load_once(target, registry)
+                loaded = cls._load_once(target, registry)
+                loaded.path = display_target
+                loaded._checkpoint_path = target
+                loaded.source = f"session directory {display_target}"
+                return loaded
             except _Swept as swept:
                 if cls._live_generation(target) == before:
                     raise SessionError(
