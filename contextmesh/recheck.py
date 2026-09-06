@@ -175,8 +175,8 @@ def recheck(
         if assumption is None or assumption.status is not AssumptionStatus.ACTIVE:
             continue
 
-        verdict = _coerce(
-            task.audit(
+        try:
+            result = task.audit(
                 EvidenceAuditContext(
                     task=task,
                     output=task.output,
@@ -184,7 +184,20 @@ def recheck(
                     graph=runner.graph,
                 )
             )
-        )
+        except Exception as exc:
+            # Match Runner.recheck(): an unavailable auditor is a task failure,
+            # never a disproof, and must not prevent independent rechecks.
+            task.state = TaskState.FAILED
+            runner.ledger.record(
+                runner.round,
+                Event.FAILED,
+                task.name,
+                f"auditor error: {type(exc).__name__}: {exc}",
+                node_id=task.node_id,
+                assumption_id=assumption.id,
+            )
+            continue
+        verdict = _coerce(result)
 
         # Resolve the evidence before writing the audit receipt or touching the
         # assumption.  MCP applies this whole function to a staged Session, so
