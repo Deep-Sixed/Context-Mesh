@@ -329,13 +329,20 @@ class EvidenceIntake:
                 f"source_id {source_id!r} names a {source.type.value}, not a source"
             )
         if external_id is not None:
-            if not isinstance(external_id, str) or not external_id.strip():
+            if not isinstance(external_id, str):
+                raise EvidenceIntakeError(
+                    "external_id must be null or a non-empty string"
+                )
+            # Bound untrusted input before strip()/normalization can allocate a
+            # proportional temporary string. After this check, strip() is capped
+            # at MAX_EXTERNAL_ID_BYTES worth of caller-controlled text.
+            _check_string_bytes(external_id, MAX_EXTERNAL_ID_BYTES, "external_id")
+            if not external_id.strip():
                 raise EvidenceIntakeError(
                     "external_id must be null or a non-empty string"
                 )
             if not external_id.isprintable():
                 raise EvidenceIntakeError("external_id contains a control character")
-            _check_string_bytes(external_id, MAX_EXTERNAL_ID_BYTES, "external_id")
 
         clean_metadata = validate_metadata(metadata)
         canonical = canonical_payload(
