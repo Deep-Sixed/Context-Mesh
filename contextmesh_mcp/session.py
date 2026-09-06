@@ -897,7 +897,10 @@ class Session:
                 "directory to check point into — save it somewhere first, then "
                 "load it from there"
             )
-        return self.save(target)
+        self.save(target)
+        # Keep the established caller-visible return contract even when I/O is
+        # pinned to a resolved symlink, junction or Windows short-path target.
+        return self.path or target
 
     @classmethod
     def load(

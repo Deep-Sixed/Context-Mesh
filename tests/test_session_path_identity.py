@@ -192,10 +192,11 @@ class SessionPathIdentityTest(unittest.TestCase):
             attrs={"origin": "fixture", "retrieved_at": "fixture"},
         )
         try:
-            loaded.checkpoint()
+            written = loaded.checkpoint()
         finally:
             self._remove_retargetable_alias(alias)
 
+        self.assertEqual(written, alias.absolute())
         original = Session.load(first)
         redirected = Session.load(second)
         self.assertEqual(original.generation, 2)
