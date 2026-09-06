@@ -1,0 +1,24 @@
+name: Release branding temporary
+
+on:
+  push:
+    branches:
+      - docs/standardize-contextmesh-branding
+
+permissions:
+  contents: write
+
+jobs:
+  update-release:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Update v0.1.0 release branding
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit v0.1.0 \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "ContextMesh v0.1.0" \
+            --notes-file RELEASE_NOTES.md
