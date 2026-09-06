@@ -1,12 +1,12 @@
-# Context Mesh
+# ContextMesh
 
 > One graph · six node types · every answer walks a path you can read
 
-Context Mesh is a typed context graph for long-running agents. It keeps not only
+ContextMesh is a typed context graph for long-running agents. It keeps not only
 *what* is connected, but *why* — where a claim came from, what a decision rested
 on, and what stops being true when an assumption fails.
 
-![The Context Mesh dashboard: build path, the live typed graph, hop budget, edge
+![The ContextMesh dashboard: build path, the live typed graph, hop budget, edge
 ledger, walk-vs-flat token cost, the traversal grid and the dead-end ledger](docs/img/dashboard.png)
 
 Every panel above is a query against the graph — the node counts, the hop
@@ -23,8 +23,8 @@ Windows, `open dashboard/index.html` on macOS, or
 `xdg-open dashboard/index.html` on Linux.
 
 ```bash
-git clone https://github.com/Deep-Sixed/Context-Mesh
-cd Context-Mesh
+git clone https://github.com/Deep-Sixed/ContextMesh
+cd ContextMesh
 
 python -m contextmesh demo            # build, walk, break an assumption, report
 python -m contextmesh ask "Why did the Index Builder run out of memory?"
@@ -700,7 +700,7 @@ crash after publication            ->  the new generation is named, and complete
 
 Superseded files are swept after the commit, so an interrupted save costs disk
 rather than correctness. The guarantee is reader-visible and tested as such: a
-Context Mesh reader holding the old committed manifest open across a save still
+ContextMesh reader holding the old committed manifest open across a save still
 reads the previous generation whole while another process publishes the next one.
 
 **Generations are atomic against a crash. They do nothing against a second
@@ -905,7 +905,7 @@ state and the client supplies none; `mesh_repair` can select only
 deployment-owned `TaskRegistry` keys already registered — no callable, module
 path or import string crosses MCP; `mesh_resume` delegates to the native
 selective scheduler, rerunning only pending or stale work. Submitting evidence
-and letting Context Mesh decide is the different thing a rejection tool would
+and letting ContextMesh decide is the different thing a rejection tool would
 not have been.
 
 Each write commits through `writes.commit_mutation`: the mutation runs against
@@ -1027,8 +1027,8 @@ case. An address that is not listed and not a no-reply still fails.
 
 ## Where it fits
 
-Context Mesh complements retrieval and agent memory rather than replacing them.
-Retrieval supplies the source material; memory supplies history; Context Mesh
+ContextMesh complements retrieval and agent memory rather than replacing them.
+Retrieval supplies the source material; memory supplies history; ContextMesh
 supplies the typed relations and the provenance that make an answer auditable —
 and, on this corpus, does it for about 0.7% of the tokens flat top-k would
 spend, because it sends the nodes on the path instead of the top forty chunks.

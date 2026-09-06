@@ -1,6 +1,6 @@
-# Context Mesh v0.1.0
+# ContextMesh v0.1.0
 
-`v0.1.0` is the first public technical release of Context Mesh. It is intentionally not
+`v0.1.0` is the first public technical release of ContextMesh. It is intentionally not
 a 1.0 stability claim.
 
 ## Included
@@ -20,5 +20,4 @@ extra requires Python 3.10+ and is installed with `contextmesh[mcp]`. The stdio 
 server is a single-session-per-process deployment model, not a shared multi-tenant
 service.
 
-The release tag and any package publication are separate explicit gates after the
-release-candidate audit passes.
+Package publication remains a separate explicit gate.
