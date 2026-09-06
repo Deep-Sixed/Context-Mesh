@@ -83,6 +83,7 @@ def _clone_session(source: Session) -> Session:
         source=source.source,
         path=source.path,
         _checkpoint_path=source._checkpoint_path,
+        _checkpoint_identity=source._checkpoint_identity,
         generation=source.generation,
         runner=runner,
     )
@@ -170,7 +171,13 @@ def _live_commit_is_staged(
     assert staged.path is not None
     registry = staged.runner.registry if staged.runner is not None else None
     try:
-        committed = Session.load(staged.path, registry=registry)
+        target = staged._checkpoint_target()
+        committed = Session.load(target, registry=registry)
+        if (
+            staged._checkpoint_identity is not None
+            and committed._checkpoint_identity != staged._checkpoint_identity
+        ):
+            return False
         if committed.generation != expected_generation:
             return False
         return _durable_digest(committed, expected_generation) == _durable_digest(
