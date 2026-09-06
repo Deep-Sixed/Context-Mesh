@@ -190,6 +190,25 @@ def _same_session_directory(left: Path, right: Path) -> bool:
         return left_real == right_real
 
 
+def _directory_identity(path: Path) -> Tuple[int, int]:
+    """Stable in-process identity of one existing directory object.
+
+    A resolved pathname is not an identity: the directory can be renamed and a
+    different directory can be created at the same spelling. ``stat`` gives us
+    the filesystem object's device/inode identity on the supported Windows and
+    POSIX filesystems, which remains stable across a rename.
+    """
+    try:
+        info = path.stat()
+    except OSError as exc:
+        raise SessionError(
+            f"the loaded session directory {path} is no longer available: {exc}"
+        ) from None
+    if not stat.S_ISDIR(info.st_mode):
+        raise SessionError(f"the loaded session target {path} is no longer a directory")
+    return int(info.st_dev), int(info.st_ino)
+
+
 def _no_session_constants(value: str) -> float:
     raise SessionError(f"session.json contains the non-JSON constant {value!r}")
 
@@ -770,6 +789,11 @@ class Session:
     _checkpoint_path: Optional[Path] = field(
         default=None, repr=False, compare=False
     )
+    # Device/inode identity of the directory object restored at load time.
+    # The path can later be rebound to a different directory; this cannot.
+    _checkpoint_identity: Optional[Tuple[int, int]] = field(
+        default=None, repr=False, compare=False
+    )
     generation: int = 0
     runner: Optional[Runner] = None
 
@@ -825,20 +849,61 @@ class Session:
             return 0
         return max(generation, 0)
 
+    @staticmethod
+    def _path_spelling(path: Path) -> str:
+        return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+    def _is_loaded_home(self, target: Path) -> bool:
+        """Whether ``target`` is an attempt to write this restored session home."""
+        candidates = [p for p in (self.path, self._checkpoint_path) if p is not None]
+        spelling = self._path_spelling(target)
+        if any(self._path_spelling(candidate) == spelling for candidate in candidates):
+            return True
+        if self._checkpoint_identity is not None:
+            try:
+                return _directory_identity(target) == self._checkpoint_identity
+            except SessionError:
+                return False
+        return any(_same_session_directory(target, candidate) for candidate in candidates)
+
+    def _assert_loaded_home_identity(self, target: Path) -> None:
+        if self._checkpoint_identity is None:
+            return
+        current = _directory_identity(target)
+        if current != self._checkpoint_identity:
+            raise SessionError(
+                f"{target} no longer names the directory this session restored; "
+                "refusing to checkpoint into a replacement filesystem object"
+            )
+
+    def _checkpoint_target(self) -> Path:
+        target = self._checkpoint_path or self.path
+        if target is None:
+            raise SessionError(
+                "this session was built rather than loaded, so it has no "
+                "directory to check point into — save it somewhere first, then "
+                "load it from there"
+            )
+        self._assert_loaded_home_identity(target)
+        return target
+
     def save(self, directory: Any) -> Path:
         target = Path(directory)
+        # Refuse a replaced/missing loaded home before mkdir or lock metadata can
+        # create anything at the replacement spelling. Re-check under the writer
+        # lock in _commit to narrow the remaining name-to-object race.
+        if self._is_loaded_home(target):
+            self._assert_loaded_home_identity(target)
         target.mkdir(parents=True, exist_ok=True)
         with writer_lock(target):
             return self._commit(target)
 
     def _commit(self, target: Path) -> Path:
+        is_home = self._is_loaded_home(target)
+        if is_home:
+            self._assert_loaded_home_identity(target)
         live = self._live_generation(target)
-        identity_path = self._checkpoint_path or self.path
-        if (
-            identity_path is not None
-            and _same_session_directory(target, identity_path)
-            and live != self.generation
-        ):
+        if is_home and live != self.generation:
             raise SessionError(
                 f"{target} is at generation {live} but this session last "
                 f"committed generation {self.generation}; another writer has "
@@ -890,13 +955,7 @@ class Session:
                     pass
 
     def checkpoint(self) -> Path:
-        target = self._checkpoint_path or self.path
-        if target is None:
-            raise SessionError(
-                "this session was built rather than loaded, so it has no "
-                "directory to check point into — save it somewhere first, then "
-                "load it from there"
-            )
+        target = self._checkpoint_target()
         self.save(target)
         # Keep the established caller-visible return contract even when I/O is
         # pinned to a resolved symlink, junction or Windows short-path target.
@@ -915,11 +974,19 @@ class Session:
         display_target = target.absolute()
         target = display_target.resolve()
         for attempt in range(LOAD_ATTEMPTS):
+            identity_before = _directory_identity(target)
             before = cls._live_generation(target)
             try:
                 loaded = cls._load_once(target, registry)
+                identity_after = _directory_identity(target)
+                if identity_after != identity_before:
+                    raise SessionError(
+                        f"{target} was replaced while this session was loading; "
+                        "refusing a mixed filesystem identity"
+                    )
                 loaded.path = display_target
                 loaded._checkpoint_path = target
+                loaded._checkpoint_identity = identity_before
                 loaded.source = f"session directory {display_target}"
                 return loaded
             except _Swept as swept:

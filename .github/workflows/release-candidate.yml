@@ -1,0 +1,101 @@
+name: Release candidate gate
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheel and sdist
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build twine
+          python -m build
+          python -m twine check dist/*
+          python - <<'PY'
+          from pathlib import Path
+          wheels = list(Path("dist").glob("*.whl"))
+          sdists = list(Path("dist").glob("*.tar.gz"))
+          assert len(wheels) == 1, wheels
+          assert len(sdists) == 1, sdists
+          print(wheels[0])
+          print(sdists[0])
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: contextmesh-dist
+          path: dist/*
+
+  core-wheel:
+    needs: build
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: contextmesh-dist
+          path: dist
+      - name: Install wheel only
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess, sys
+          wheel = next(Path("dist").glob("*.whl"))
+          subprocess.check_call([sys.executable, "-m", "pip", "install", str(wheel)])
+          PY
+      - name: Core has no MCP dependency
+        run: python -c "import importlib.util; assert importlib.util.find_spec('mcp') is None"
+      - name: Exercise installed CLI
+        run: contextmesh --help
+      - name: Persist in one process
+        run: python -c "from contextmesh_mcp.session import Session; Session.build(rounds=1).save('restart-session')"
+      - name: Restore in a fresh process
+        run: python -c "from contextmesh_mcp.session import Session; s=Session.load('restart-session'); assert s.generation == 1 and s.describe()['persistent']; print('restart ok')"
+
+  mcp-wheel:
+    needs: build
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: contextmesh-dist
+          path: dist
+      - name: Install wheel with MCP extra
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import subprocess, sys
+          wheel = next(Path("dist").glob("*.whl")).resolve()
+          spec = f"contextmesh[mcp] @ {wheel.as_uri()}"
+          subprocess.check_call([sys.executable, "-m", "pip", "install", spec])
+          PY
+      - name: Exercise installed MCP entry point
+        run: contextmesh-mcp --help
+      - name: Verify MCP SDK and launcher import
+        run: python -c "import mcp, contextmesh_mcp.server; print('mcp extra ok')"
+      - name: Build a session through installed MCP launcher
+        run: contextmesh-mcp --demo --rounds 1 --save mcp-session
+      - name: Restore launcher-created session in a fresh process
+        run: contextmesh-mcp --session mcp-session --save restored-session

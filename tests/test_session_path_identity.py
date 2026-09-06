@@ -260,6 +260,38 @@ class SessionPathIdentityTest(unittest.TestCase):
         self.assertEqual(redirected.generation, 1)
         self.assertNotIn(evidence_id, redirected.graph.nodes)
 
+    def test_replacing_canonical_directory_refuses_checkpoint(self) -> None:
+        loaded = Session.load(self.directory)
+        stale_node = loaded.graph.add_node(
+            NodeType.SOURCE,
+            "must stay only in stale memory",
+            attrs={"origin": "fixture", "retrieved_at": "fixture"},
+        )
+        moved = self.root / "original-moved"
+        self.directory.rename(moved)
+
+        Session.build(rounds=1).save(self.directory)
+        replacement = Session.load(self.directory)
+        replacement_node = replacement.graph.add_node(
+            NodeType.SOURCE,
+            "replacement directory state",
+            attrs={"origin": "fixture", "retrieved_at": "fixture"},
+        )
+        replacement.checkpoint()
+        before = {p.name: p.read_bytes() for p in self.directory.glob("*.json")}
+
+        with self.assertRaisesRegex(SessionError, "replacement filesystem object"):
+            loaded.checkpoint()
+
+        self.assertEqual(
+            {p.name: p.read_bytes() for p in self.directory.glob("*.json")}, before
+        )
+        current = Session.load(self.directory)
+        self.assertIn(replacement_node.id, current.graph.nodes)
+        self.assertNotIn(stale_node.id, current.graph.nodes)
+        original = Session.load(moved)
+        self.assertNotIn(stale_node.id, original.graph.nodes)
+
     def test_a_genuinely_different_directory_remains_a_save_as(self) -> None:
         current, stale = self._readers()
         newer_id = self._advance(current)
